@@ -2,10 +2,3 @@ Defaults:lg_cs_cont timestamp_timeout=0
 lg_cs_cont ALL=(root) PASSWD: /usr/sbin/reboot
 lg_cs_cont ALL=(root) PASSWD: /usr/sbin/poweroff
 lg_cs_cont ALL=(root) PASSWD: /usr/sbin/shutdown
-
-# LGHS controller-safe remote operations. These commands are deliberately
-# narrow so the classroom account cannot use sudo for arbitrary commands.
-lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-report *
-lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-update
-lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-check
-lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-enforce
