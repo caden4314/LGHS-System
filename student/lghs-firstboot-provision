@@ -17,6 +17,7 @@ for candidate in /boot/firmware /boot;do
 done
 [[ -n "$BOOT_DIR" ]] || { log "No LGHS provisioning files found; leaving service ready for next boot.";exit 0; }
 PUBLIC_CONF="$BOOT_DIR/lghs-provision.conf";SECRET_CONF="$BOOT_DIR/lghs-provision-secrets.conf"
+FLEET_PUBLIC="$BOOT_DIR/lghs-controller-key.pub";FLEET_PRIVATE="$BOOT_DIR/lghs-controller-key"
 [[ -f "$PUBLIC_CONF" ]] || { log "Missing $PUBLIC_CONF";exit 1; };[[ -f "$SECRET_CONF" ]] || { log "Missing $SECRET_CONF";exit 1; }
 
 read_value(){ local key="$1" file="$2";awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"; }
@@ -57,11 +58,28 @@ ARCH=arm64
 EOF
 chmod 0644 /etc/lghs/device.conf;printf '%s\n' "$ROLE">/etc/lghs/role
 
-# Apply the role only after the final account and role are known.
+# The Windows Imager creates one deployment-specific Ed25519 fleet key. Public
+# images contain no reusable fleet secret. Student cards receive only the
+# public key; the Control card receives the private key as well.
+if [[ -f "$FLEET_PUBLIC" ]]; then
+  grep -q '^ssh-ed25519 ' "$FLEET_PUBLIC" || { log 'Invalid fleet public key';exit 1; }
+  install -m 0644 "$FLEET_PUBLIC" /etc/lghs/controller_ed25519.pub
+  if [[ "$ROLE" == "student" ]]; then
+    install -d -m 0700 -o "$ADMIN_USER" -g "$ADMIN_USER" "/home/$ADMIN_USER/.ssh"
+    install -m 0600 -o "$ADMIN_USER" -g "$ADMIN_USER" "$FLEET_PUBLIC" "/home/$ADMIN_USER/.ssh/authorized_keys"
+  else
+    [[ -f "$FLEET_PRIVATE" ]] || { log 'Controller card is missing deployment fleet private key';exit 1; }
+    install -d -m 0700 /etc/lghs/secrets
+    install -m 0600 "$FLEET_PRIVATE" /etc/lghs/secrets/controller_ed25519
+    install -m 0644 "$FLEET_PUBLIC" /etc/lghs/secrets/controller_ed25519.pub
+  fi
+fi
+
 if [[ -x /usr/local/sbin/lghs-autologin-apply ]];then /usr/local/sbin/lghs-autologin-apply;fi
 if [[ "$ROLE" == "student" && -x /usr/local/sbin/lghs-dev-setup ]];then /usr/local/sbin/lghs-dev-setup || true;fi
+if command -v sshd >/dev/null 2>&1;then sshd -t;systemctl try-restart ssh.service >/dev/null 2>&1 || true;fi
 
 install -m 0600 "$PUBLIC_CONF" "$STATE_DIR/provisioned.conf";printf '%s\n' "$(date -u +%FT%TZ)">$STAMP;chmod 0600 "$STAMP"
 if command -v shred >/dev/null 2>&1;then shred -u -z -n 2 "$SECRET_CONF" 2>/dev/null || rm -f "$SECRET_CONF";else size="$(stat -c %s "$SECRET_CONF" 2>/dev/null||echo 0)";if [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]];then dd if=/dev/zero of="$SECRET_CONF" bs=1 count="$size" conv=notrunc status=none 2>/dev/null||true;sync;fi;rm -f "$SECRET_CONF";fi
-rm -f "$PUBLIC_CONF";sync;unset USER_PASSWORD ADMIN_PASSWORD ROOT_PASSWORD
-log "Provisioning complete for $DEVICE_ID ($ROLE); desktop autologin configured."
+rm -f "$PUBLIC_CONF" "$FLEET_PUBLIC" "$FLEET_PRIVATE";sync;unset USER_PASSWORD ADMIN_PASSWORD ROOT_PASSWORD
+log "Provisioning complete for $DEVICE_ID ($ROLE); desktop autologin and deployment fleet identity configured."
