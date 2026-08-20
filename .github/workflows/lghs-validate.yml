@@ -18,6 +18,7 @@ jobs:
             controller/lghs-console \
             controller/lghsctl \
             controller/lghs-audit-sync \
+            updater/lghs-netqueue \
             student/lghs-sudo-broker \
             student/lghs-approved-exec \
             student/lghs-sudo-admin \
@@ -32,6 +33,8 @@ jobs:
           bash -n updater/lghs-autologin-apply
           bash -n updater/lghs-reconcile
           bash -n updater/lghs-access-enforce
+          bash -n controller/lghsctl-wrapper
+          bash -n systemd/90-lghs-netqueue
           bash -n student/lghs-enforce
           bash -n student/lghs-check
           bash -n student/lghs-agent
