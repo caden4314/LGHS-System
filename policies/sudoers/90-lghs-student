@@ -1,11 +1,11 @@
 Defaults:lg_cs_cont timestamp_timeout=0,rootpw
 
-# Fleet approval helpers never require a password. They create/query an exact
-# request and execute only that exact controller-approved request once.
-lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-broker *
-lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-approved-exec *
-
 # Local fallback: a teacher who knows the Root password can authorize any sudo
 # command directly at the Student Pi. The student's own password is not valid
 # because this account uses sudo's rootpw policy.
 lg_cs_cont ALL=(ALL:ALL) PASSWD: ALL
+
+# These more-specific rules come last so they remain NOPASSWD even though the
+# broad local Root-password fallback above also matches them.
+lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-broker *
+lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-approved-exec *
