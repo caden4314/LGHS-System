@@ -2,88 +2,115 @@
 import curses
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-SERVICE='_lghs._tcp'; SSH_USER='cs_admin'
-KEY_FILE='/etc/lghs/secrets/controller_ed25519'; KNOWN_HOSTS='/var/lib/lghs/ssh_known_hosts'; CONTROL_DIR='/run/lghs-ssh'
-FLEET_LOG_DIR=Path('/var/log/lghs-fleet'); REFRESH_SECONDS=2.0; DISCOVERY_SECONDS=15.0
+SERVICE = "_lghs._tcp"
+SSH_USER = "cs_admin"
+KEY_FILE = "/etc/lghs/secrets/controller_ed25519"
+KNOWN_HOSTS = "/var/lib/lghs/ssh_known_hosts"
+CONTROL_DIR = "/run/lghs-ssh"
+LOG_BASE = Path("/var/log/lghs-fleet")
+REFRESH_SECONDS = 2.0
+DISCOVERY_SECONDS = 15.0
 
 
-def run(cmd): return subprocess.run(cmd,text=True,capture_output=True)
+def run(cmd): return subprocess.run(cmd, text=True, capture_output=True)
+
+def ensure_root():
+    if os.geteuid() != 0: raise SystemExit("Run LGHS Console with: sudo lghs-console")
 
 def ensure_dirs():
-    os.makedirs(os.path.dirname(KNOWN_HOSTS),exist_ok=True); os.makedirs(CONTROL_DIR,exist_ok=True)
-    if not os.path.exists(KNOWN_HOSTS): open(KNOWN_HOSTS,'a').close()
+    os.makedirs(os.path.dirname(KNOWN_HOSTS), exist_ok=True); os.makedirs(CONTROL_DIR, exist_ok=True)
+    if not os.path.exists(KNOWN_HOSTS): open(KNOWN_HOSTS, "a").close()
 
 def discover_devices():
-    if not shutil.which('avahi-browse'): return []
-    p=run(['avahi-browse','-rtp',SERVICE]); out=[]; seen=set()
+    if not shutil.which("avahi-browse"): return []
+    p=run(["avahi-browse","-rtp",SERVICE]); devices=[]; seen=set()
     for line in p.stdout.splitlines():
-        if not line.startswith('='): continue
-        f=line.split(';')
+        if not line.startswith("="): continue
+        f=line.split(";")
         if len(f)<9 or f[4]!=SERVICE or f[7] in seen: continue
-        seen.add(f[7]); out.append({'name':f[3],'host':f[6],'addr':f[7],'port':f[8]})
-    return out
+        seen.add(f[7]); devices.append({"name":f[3],"host":f[6],"addr":f[7],"port":f[8]})
+    return devices
 
-def enrolled(addr): ensure_dirs(); return run(['ssh-keygen','-F',addr,'-f',KNOWN_HOSTS]).returncode==0
-
-def ssh_args(addr,batch=True):
-    ensure_dirs(); a=['ssh','-i',KEY_FILE,'-o','IdentitiesOnly=yes','-o',f'UserKnownHostsFile={KNOWN_HOSTS}','-o','StrictHostKeyChecking=yes','-o','PasswordAuthentication=no','-o','KbdInteractiveAuthentication=no','-o','ForwardAgent=no','-o','ForwardX11=no','-o','ClearAllForwardings=yes','-o','ConnectTimeout=2','-o','ControlMaster=auto','-o','ControlPersist=90','-o',f'ControlPath={CONTROL_DIR}/%C']
-    if batch:a+=['-o','BatchMode=yes']
-    a.append(f'{SSH_USER}@{addr}'); return a
+def enrolled(addr): ensure_dirs(); return run(["ssh-keygen","-F",addr,"-f",KNOWN_HOSTS]).returncode==0
 
 def enroll(addr):
     if enrolled(addr): return True
-    p=run(['ssh-keyscan','-T','3','-t','ed25519',addr])
-    if p.returncode or not p.stdout.strip(): return False
-    with open(KNOWN_HOSTS,'a',encoding='utf-8') as f:f.write(p.stdout)
-    t=run(ssh_args(addr)+['true'])
-    if t.returncode==0:return True
-    run(['ssh-keygen','-R',addr,'-f',KNOWN_HOSTS]);return False
+    p=run(["ssh-keyscan","-T","3","-t","ed25519",addr])
+    if p.returncode!=0 or not p.stdout.strip(): return False
+    with open(KNOWN_HOSTS,"a",encoding="utf-8") as f:f.write(p.stdout)
+    test=ssh_capture(addr,"true",auto_enroll=False)
+    if test.returncode==0:return True
+    run(["ssh-keygen","-R",addr,"-f",KNOWN_HOSTS]);return False
+
+def ssh_args(addr,batch=True):
+    ensure_dirs();a=["ssh","-i",KEY_FILE,"-o","IdentitiesOnly=yes","-o",f"UserKnownHostsFile={KNOWN_HOSTS}","-o","StrictHostKeyChecking=yes","-o","PasswordAuthentication=no","-o","KbdInteractiveAuthentication=no","-o","ForwardAgent=no","-o","ForwardX11=no","-o","ClearAllForwardings=yes","-o","ConnectTimeout=2","-o","ServerAliveInterval=15","-o","ServerAliveCountMax=2","-o","ControlMaster=auto","-o","ControlPersist=90","-o",f"ControlPath={CONTROL_DIR}/%C"]
+    if batch:a += ["-o","BatchMode=yes"]
+    a.append(f"{SSH_USER}@{addr}");return a
 
 def ssh_capture(addr,remote,auto_enroll=True):
-    if auto_enroll and not enrolled(addr) and not enroll(addr): return subprocess.CompletedProcess([],255,'','SSH enrollment failed')
+    if auto_enroll and not enrolled(addr) and not enroll(addr): return subprocess.CompletedProcess([],255,"","SSH enrollment failed")
     return run(ssh_args(addr)+[remote])
 
 def parse_kv(text):
     d={}
     for line in text.splitlines():
-        if '=' in line:
-            k,v=line.split('=',1);d[k.strip()]=v.strip()
+        if "=" in line:k,v=line.split("=",1);d[k.strip()]=v.strip()
     return d
 
 def fetch_one(device):
-    d=dict(device);d['sudo_requests']=[]
-    p=ssh_capture(d['addr'],'sudo -n /usr/local/sbin/lghs-report summary');d['online']=p.returncode==0
-    if d['online']:
+    d=dict(device);d["sudo_requests"]=[];p=ssh_capture(d["addr"],"sudo -n /usr/local/sbin/lghs-report summary");d["online"]=p.returncode==0
+    if d["online"]:
         d.update(parse_kv(p.stdout))
-        if d.get('role')=='student':
-            q=ssh_capture(d['addr'],'sudo -n /usr/local/sbin/lghs-sudo-admin list --json')
+        if d.get("role")=="student":
+            q=ssh_capture(d["addr"],"sudo -n /usr/local/sbin/lghs-sudo-admin list --json")
             if q.returncode==0:
-                try:d['sudo_requests']=json.loads(q.stdout or '[]')
-                except Exception:pass
+                try:d["sudo_requests"]=json.loads(q.stdout or "[]")
+                except Exception:d["sudo_requests"]=[]
     return d
 
-def refresh_fleet(devices):
-    if not devices:return []
+def refresh_fleet(discovered):
+    if not discovered:return []
     out=[]
-    with ThreadPoolExecutor(max_workers=min(8,len(devices))) as pool:
-        fs={pool.submit(fetch_one,d):d for d in devices}
+    with ThreadPoolExecutor(max_workers=min(8,len(discovered))) as pool:
+        fs={pool.submit(fetch_one,d):d for d in discovered}
         for f in as_completed(fs):
             try:out.append(f.result())
             except Exception:
-                d=dict(fs[f]);d['online']=False;d['sudo_requests']=[];out.append(d)
-    return sorted(out,key=lambda d:(d.get('hostname') or d.get('host') or d.get('addr','')).lower())
+                d=dict(fs[f]);d["online"]=False;d["sudo_requests"]=[];out.append(d)
+    return sorted(out,key=lambda d:(not d.get("online",False),(d.get("hostname") or d.get("host") or d.get("addr","")).lower()))
+
+def cpu_value(d):
+    try:return float(d.get("cpu_pct",0))
+    except Exception:return 0.0
+
+def telemetry_sort(devices):return sorted(devices,key=lambda d:(not d.get("online",False),-cpu_value(d),(d.get("hostname") or "").lower()))
+
+def pending_requests(devices):
+    q=[]
+    for d in devices:
+        for r in d.get("sudo_requests",[]):q.append((d,r))
+    return sorted(q,key=lambda p:float(p[1].get("requested_epoch",0)))
 
 def health(d):
-    if not d.get('online'):return 'OFFLINE'
-    vals=[d.get('update_timer'),d.get('reconcile_timer')]
-    if d.get('role')=='student':vals += [d.get('agent'),d.get('policy'),d.get('ssh')]
-    return 'OK' if all(v=='active' for v in vals if v is not None) else 'CHECK'
+    if not d.get("online"):return "OFFLINE"
+    vals=[d.get("update_timer"),d.get("reconcile_timer")]
+    if d.get("role")=="student":vals += [d.get("agent"),d.get("policy"),d.get("ssh")]
+    return "OK" if all(v=="active" for v in vals if v is not None) else "CHECK"
+
+def fmt_bytes(value):
+    try:n=float(value)
+    except Exception:return "?"
+    for u in ("B","K","M","G","T"):
+        if n<1024:return f"{n:.0f}{u}"
+        n/=1024
+    return f"{n:.0f}P"
 
 def safe_add(win,y,x,text,attr=0):
     h,w=win.getmaxyx()
@@ -91,121 +118,259 @@ def safe_add(win,y,x,text,attr=0):
         try:win.addnstr(y,x,str(text),max(0,w-x-1),attr)
         except curses.error:pass
 
-def fmt_bytes(n):
-    try:n=float(n)
-    except:return '?'
-    for u in ('B','K','M','G','T'):
-        if n<1024:return f'{n:.0f}{u}'
-        n/=1024
-    return f'{n:.0f}P'
+def header(stdscr,title,subtitle=""):
+    stdscr.erase();h,_=stdscr.getmaxyx();safe_add(stdscr,0,0,f" LGHS CONTROL | {title} ",curses.A_REVERSE|curses.A_BOLD)
+    if subtitle:safe_add(stdscr,1,1,subtitle)
+    safe_add(stdscr,h-2,1,"F1 Help  F2 Fleet  F3 Telemetry  F4 Sudo  F5 Updates  F6 Logs  F10 Quit",curses.A_DIM)
+    safe_add(stdscr,h-1,1,"Arrows move | Enter select | 1-9 quick select | Esc back | R refresh",curses.A_DIM)
 
-def popup(stdscr,title,body):
-    lines=body.splitlines() or [''];h,w=stdscr.getmaxyx();ph=min(max(8,h-4),max(8,len(lines)+4));pw=min(max(50,w-4),118);y=max(1,(h-ph)//2);x=max(1,(w-pw)//2);win=curses.newwin(ph,pw,y,x);win.keypad(True);off=0
+def popup(stdscr,title,text,footer="Enter/Esc close"):
+    lines=str(text).splitlines() or [""];h,w=stdscr.getmaxyx();ph=min(max(8,len(lines)+5),max(8,h-4));pw=min(max(50,max((len(x) for x in lines),default=1)+6),max(50,w-4));win=curses.newwin(ph,pw,max(1,(h-ph)//2),max(1,(w-pw)//2));win.keypad(True);off=0
     while True:
-        win.erase();win.box();safe_add(win,0,2,f' {title} ',curses.A_BOLD);vis=ph-3
+        win.erase();win.box();safe_add(win,0,2,f" {title} ",curses.A_BOLD);vis=ph-4
         for i,line in enumerate(lines[off:off+vis],1):safe_add(win,i,2,line)
-        safe_add(win,ph-2,2,'Up/Down scroll   q/Esc/Enter close',curses.A_DIM);win.refresh();k=win.getch()
-        if k in (ord('q'),27,10,13):break
+        safe_add(win,ph-2,2,footer,curses.A_DIM);win.refresh();k=win.getch()
+        if k in (10,13,27,curses.KEY_BACKSPACE,127):return
         if k in (curses.KEY_DOWN,ord('j')):off=min(max(0,len(lines)-vis),off+1)
         elif k in (curses.KEY_UP,ord('k')):off=max(0,off-1)
         elif k==curses.KEY_NPAGE:off=min(max(0,len(lines)-vis),off+vis)
         elif k==curses.KEY_PPAGE:off=max(0,off-vis)
 
-def confirm(stdscr,msg):
-    h,w=stdscr.getmaxyx();text=f'{msg} [y/N]';stdscr.erase();safe_add(stdscr,h//2,max(0,(w-len(text))//2),text,curses.A_BOLD);stdscr.refresh();return stdscr.getch() in (ord('y'),ord('Y'))
+def confirm(stdscr,text):
+    h,w=stdscr.getmaxyx();ph=8;pw=min(max(54,len(text)+8),max(54,w-4));win=curses.newwin(ph,pw,max(1,(h-ph)//2),max(1,(w-pw)//2));win.keypad(True)
+    while True:
+        win.erase();win.box();safe_add(win,0,2," CONFIRM ",curses.A_BOLD);safe_add(win,2,3,text,curses.A_BOLD);safe_add(win,5,3,"Y Yes     N No",curses.A_BOLD);win.refresh();k=win.getch()
+        if k in (ord('y'),ord('Y')):return True
+        if k in (ord('n'),ord('N'),27):return False
 
-def action(addr,title,remote):
-    p=ssh_capture(addr,remote);body=(p.stdout or '')+(('\n'+p.stderr) if p.stderr else '');return title,body.strip() or f'Exit code {p.returncode}'
+def help_popup(stdscr):
+    popup(stdscr,"Keyboard help","""Global
+F1 Help        F2 Fleet        F3 Telemetry
+F4 Sudo        F5 Updates      F6 Logs        F10 Quit
 
-def pending_requests(devices):
-    out=[]
-    for d in devices:
-        for r in d.get('sudo_requests',[]):out.append((d,r))
-    return sorted(out,key=lambda p:float(p[1].get('requested_epoch',0)))
+Lists
+Up/Down moves selection. Enter opens. 1-9 selects a visible row directly.
+Esc returns. R forces a refresh.
+
+Sudo popup
+Y approves the exact request once. N denies it. F1 shows full request details.
+Esc leaves the request pending.
+
+Per-Pi menu
+Number keys 1-9 run the action shown beside that number.""")
+
+def global_key(k):
+    if k==curses.KEY_F1:return "help"
+    if k==curses.KEY_F10:return "quit"
+    return {curses.KEY_F2:"fleet",curses.KEY_F3:"telemetry",curses.KEY_F4:"sudo",curses.KEY_F5:"updates",curses.KEY_F6:"logs"}.get(k)
+
+def request_details(d,r):
+    argv=r.get("argv",[]);host=d.get("hostname") or d.get("host") or d.get("addr")
+    return "\n".join([f"Device:       {host}",f"Address:      {d.get('addr','?')}",f"Request ID:   {r.get('id','?')}",f"Requester:    {r.get('requester','?')}",f"Requested:    {r.get('requested_at','?')}",f"Working dir:  {r.get('cwd','?')}",f"Command:      {r.get('command',shlex.join(argv) if argv else '?')}","","Arguments:",*[f"  [{i}] {a}" for i,a in enumerate(argv)]])
 
 def resolve_sudo(addr,rid,decision):
-    if not rid or any(c not in '0123456789abcdef' for c in rid.lower()):return False,'Invalid request ID'
-    p=ssh_capture(addr,f'sudo -n /usr/local/sbin/lghs-sudo-admin {decision} {rid}');return p.returncode==0,(p.stdout or p.stderr).strip()
+    if not rid or any(c not in "0123456789abcdef" for c in rid.lower()):return False,"Invalid request ID"
+    p=ssh_capture(addr,f"sudo -n /usr/local/sbin/lghs-sudo-admin {decision} {rid}");return p.returncode==0,(p.stdout or p.stderr).strip()
 
-def sudo_prompt(stdscr,d,r):
-    h,w=stdscr.getmaxyx();ph=min(max(14,h-4),20);pw=min(max(64,w-4),112);win=curses.newwin(ph,pw,max(1,(h-ph)//2),max(1,(w-pw)//2));win.keypad(True);host=d.get('hostname') or d.get('host') or d.get('addr');rid=r.get('id','')
+def sudo_decision_popup(stdscr,d,r):
+    h,w=stdscr.getmaxyx();ph=13;pw=min(100,max(60,w-8));win=curses.newwin(ph,pw,max(1,(h-ph)//2),max(1,(w-pw)//2));win.keypad(True);host=d.get("hostname") or d.get("host") or d.get("addr")
     while True:
-        win.erase();win.box();safe_add(win,0,2,' SUDO APPROVAL ',curses.A_BOLD|curses.A_REVERSE);safe_add(win,2,3,f'{host} has requested sudo:',curses.A_BOLD);safe_add(win,4,3,r.get('command',''),curses.A_BOLD);safe_add(win,7,3,f"User: {r.get('requester','?')}");safe_add(win,8,3,f"Working directory: {r.get('cwd','')}");safe_add(win,ph-3,3,'Y Approve once     N Deny     L Later',curses.A_BOLD);safe_add(win,ph-2,3,'Exact-command one-time approval; requests expire automatically.',curses.A_DIM);win.refresh();k=win.getch()
-        if k in (ord('y'),ord('Y')):ok,msg=resolve_sudo(d['addr'],rid,'approve');return ('approved' if ok else 'error'),msg
-        if k in (ord('n'),ord('N')):ok,msg=resolve_sudo(d['addr'],rid,'deny');return ('denied' if ok else 'error'),msg
-        if k in (ord('l'),ord('L'),27):return 'later',''
+        win.erase();win.box();safe_add(win,0,2," SUDO REQUEST ",curses.A_REVERSE|curses.A_BOLD);safe_add(win,2,3,f"{host} has requested sudo:",curses.A_BOLD);safe_add(win,4,3,r.get("command",""),curses.A_BOLD);safe_add(win,7,3,"Y  Approve once",curses.A_BOLD);safe_add(win,8,3,"N  Deny",curses.A_BOLD);safe_add(win,9,3,"F1 Request details",curses.A_BOLD);safe_add(win,11,3,"Esc leaves this request pending.",curses.A_DIM);win.refresh();k=win.getch()
+        if k==curses.KEY_F1:popup(stdscr,f"Sudo details - {host}",request_details(d,r));continue
+        if k in (ord('y'),ord('Y')):return resolve_sudo(d["addr"],r.get("id",""),"approve")
+        if k in (ord('n'),ord('N')):return resolve_sudo(d["addr"],r.get("id",""),"deny")
+        if k==27:return None,"pending"
 
-def central_logs():
-    parts=[]
-    for title,name in [('LGHS UPDATES','update.log'),('OS UPDATES','os-update.log'),('SUDO','sudo.log'),('AUDIT','audit.jsonl')]:
-        p=FLEET_LOG_DIR/name
-        if p.exists():
-            try:lines=p.read_text(encoding='utf-8',errors='replace').splitlines()[-60:]
-            except Exception:lines=[]
-            parts += [f'===== {title} =====']+lines+['']
-    return '\n'.join(parts) if parts else 'No centralized fleet logs collected yet.'
+def run_remote_action(stdscr,d,title,command):
+    p=ssh_capture(d["addr"],command);body=(p.stdout or "")+(("\n"+p.stderr) if p.stderr else "");popup(stdscr,title,body.strip() or f"Exit code {p.returncode}");return p.returncode==0
+
+def list_select_key(k,sel,count,start,rows):
+    if k in (curses.KEY_DOWN,ord('j')) and count:return min(count-1,sel+1),None
+    if k in (curses.KEY_UP,ord('k')) and count:return max(0,sel-1),None
+    if ord('1')<=k<=ord('9'):
+        idx=start+(k-ord('1'))
+        if idx<min(count,start+rows):return idx,"open"
+    if k in (10,13) and count:return sel,"open"
+    return sel,None
+
+def refresh_state(state,force=False):
+    now=time.time()
+    if force or not state.get("discovered") or now-state.get("last_discovery",0)>=DISCOVERY_SECONDS:state["discovered"]=discover_devices();state["last_discovery"]=now
+    if force or now-state.get("last_refresh",0)>=REFRESH_SECONDS:
+        state["devices"]=refresh_fleet(state.get("discovered",[]));state["last_refresh"]=time.time()
+        if state["devices"]:state["selected"]=min(state.get("selected",0),len(state["devices"])-1)
+
+def maybe_popup_new_sudo(stdscr,state):
+    for d,r in pending_requests(state["devices"]):
+        key=f"{d.get('addr')}:{r.get('id')}"
+        if key not in state["seen_sudo"]:
+            state["seen_sudo"].add(key);sudo_decision_popup(stdscr,d,r);state["force_refresh"]=True;return
+
+def refresh_and_alert(stdscr,state):refresh_state(state,state.pop("force_refresh",False));maybe_popup_new_sudo(stdscr,state)
+
+def main_menu(stdscr,state):
+    items=[("Fleet overview","fleet"),("Telemetry","telemetry"),("Sudo requests","sudo"),("Updates","updates"),("Audit & logs","logs"),("Controller status","controller")];sel=0
+    while True:
+        refresh_and_alert(stdscr,state);fleet=state["devices"];online=sum(1 for d in fleet if d.get("online"));pending=len(pending_requests(fleet));header(stdscr,"Main menu",f"{online}/{len(fleet)} Pis online | {pending} pending sudo request(s)")
+        for i,(name,_) in enumerate(items):safe_add(stdscr,4+i,4,f"{i+1}. {name}",(curses.A_REVERSE|curses.A_BOLD) if i==sel else 0)
+        stdscr.refresh();k=stdscr.getch();g=global_key(k)
+        if g:return g
+        if k in (ord('q'),ord('Q')):return "quit"
+        if k in (curses.KEY_DOWN,ord('j')):sel=min(len(items)-1,sel+1)
+        elif k in (curses.KEY_UP,ord('k')):sel=max(0,sel-1)
+        elif ord('1')<=k<=ord('6'):return items[k-ord('1')][1]
+        elif k in (10,13):return items[sel][1]
+
+def fleet_screen(stdscr,state):
+    sel=min(state.get("selected",0),max(0,len(state["devices"])-1))
+    while True:
+        refresh_and_alert(stdscr,state);devices=state["devices"];sel=min(sel,max(0,len(devices)-1));header(stdscr,"Fleet","Enter opens a focused menu for the selected Pi.");h,_=stdscr.getmaxyx();safe_add(stdscr,3,1,"#  DEVICE           IP              VER     CPU    RAM    TEMP    STATE",curses.A_BOLD|curses.A_UNDERLINE);rows=max(1,h-7);start=max(0,sel-rows+1) if sel>=rows else 0
+        for pos,d in enumerate(devices[start:start+rows]):
+            idx=start+pos;num=pos+1 if pos<9 else 0;host=d.get("hostname") or d.get("host") or "?";line=f"{num if num else ' ':>1}  {host[:16]:16} {d.get('addr','?')[:15]:15} {d.get('version','?')[:7]:7} {d.get('cpu_pct','?')+'%':6} {d.get('mem_pct','?')+'%':6} {d.get('temp_c','?')+'C':7} {health(d):8}";safe_add(stdscr,4+pos,1,line,curses.A_REVERSE if idx==sel else 0)
+        if not devices:safe_add(stdscr,5,3,"No LGHS Pis discovered.")
+        stdscr.refresh();k=stdscr.getch();g=global_key(k)
+        if g:state["selected"]=sel;return g
+        if k in (27,curses.KEY_BACKSPACE,127):state["selected"]=sel;return "main"
+        if k in (ord('r'),ord('R')):state["force_refresh"]=True;continue
+        sel,act=list_select_key(k,sel,len(devices),start,rows)
+        if act=="open" and devices:
+            state["selected"]=sel;nxt=device_menu(stdscr,state,devices[sel])
+            if nxt!="fleet":return nxt
+
+def device_menu(stdscr,state,d):
+    host=d.get("hostname") or d.get("host") or d.get("addr");actions=["Summary / services","Telemetry snapshot","Pending sudo requests","Logs","Force LGHS update","Force Raspberry Pi OS update","Validate + re-apply policy","Open SSH session","Reboot Pi"];sel=0
+    while True:
+        refresh_state(state);header(stdscr,f"Pi menu - {host}",f"{d.get('addr','?')} | {health(d)} | LGHS {d.get('version','?')}")
+        for i,name in enumerate(actions):safe_add(stdscr,3+i,4,f"{i+1}. {name}",curses.A_REVERSE if i==sel else 0)
+        stdscr.refresh();k=stdscr.getch();g=global_key(k)
+        if g:return g
+        if k in (27,curses.KEY_BACKSPACE,127):return "fleet"
+        if k in (curses.KEY_DOWN,ord('j')):sel=min(8,sel+1)
+        elif k in (curses.KEY_UP,ord('k')):sel=max(0,sel-1)
+        elif ord('1')<=k<=ord('9'):sel=k-ord('1');k=10
+        if k in (10,13):
+            n=sel+1
+            if n==1:run_remote_action(stdscr,d,f"Summary - {host}","sudo -n /usr/local/sbin/lghs-report summary && echo && sudo -n /usr/local/sbin/lghs-report services")
+            elif n==2:run_remote_action(stdscr,d,f"Telemetry - {host}","sudo -n /usr/local/sbin/lghs-report stats")
+            elif n==3:
+                reqs=d.get("sudo_requests",[])
+                if not reqs:popup(stdscr,"Sudo","No pending requests for this Pi.")
+                for req in reqs:sudo_decision_popup(stdscr,d,req)
+            elif n==4:run_remote_action(stdscr,d,f"Logs - {host}","sudo -n /usr/local/sbin/lghs-report logs all")
+            elif n==5 and confirm(stdscr,f"Force LGHS update on {host}?"):run_remote_action(stdscr,d,f"LGHS update - {host}","sudo -n /usr/local/sbin/lghs-update")
+            elif n==6 and confirm(stdscr,f"Run Raspberry Pi OS full-upgrade on {host}?"):run_remote_action(stdscr,d,f"OS update - {host}","sudo -n /usr/local/sbin/lghs-os-update")
+            elif n==7:run_remote_action(stdscr,d,f"Validation - {host}","sudo -n /usr/local/sbin/lghs-enforce && sudo -n /usr/local/sbin/lghs-check")
+            elif n==8:curses.endwin();subprocess.call(ssh_args(d["addr"],batch=False));stdscr.refresh();curses.curs_set(0)
+            elif n==9 and confirm(stdscr,f"Reboot {host}?"):ssh_capture(d["addr"],"sudo -n /usr/sbin/reboot");return "fleet"
+            state["force_refresh"]=True
+
+def telemetry_screen(stdscr,state):
+    sel=0
+    while True:
+        refresh_and_alert(stdscr,state);devices=telemetry_sort(state["devices"]);sel=min(sel,max(0,len(devices)-1));header(stdscr,"Telemetry","Sorted online first, then highest CPU usage. Auto-refresh: 2 seconds.");h,_=stdscr.getmaxyx();safe_add(stdscr,3,1,"#  DEVICE           STATE    CPU     RAM     DISK    TEMP    RX       TX       UPTIME",curses.A_BOLD|curses.A_UNDERLINE);rows=max(1,h-7);start=max(0,sel-rows+1) if sel>=rows else 0
+        for pos,d in enumerate(devices[start:start+rows]):
+            idx=start+pos;num=pos+1 if pos<9 else 0;host=d.get("hostname") or d.get("host") or "?";line=f"{num if num else ' ':>1}  {host[:16]:16} {health(d):8} {d.get('cpu_pct','?')+'%':7} {d.get('mem_pct','?')+'%':7} {d.get('disk_pct','?')+'%':7} {d.get('temp_c','?')+'C':7} {fmt_bytes(d.get('rx_bytes')):8} {fmt_bytes(d.get('tx_bytes')):8} {d.get('uptime','?')[:20]}";safe_add(stdscr,4+pos,1,line,curses.A_REVERSE if idx==sel else 0)
+        stdscr.refresh();k=stdscr.getch();g=global_key(k)
+        if g:return g
+        if k in (27,curses.KEY_BACKSPACE,127):return "main"
+        if k in (ord('r'),ord('R')):state["force_refresh"]=True;continue
+        sel,act=list_select_key(k,sel,len(devices),start,rows)
+        if act=="open" and devices:
+            dev=devices[sel]
+            for i,x in enumerate(state["devices"]):
+                if x.get("addr")==dev.get("addr"):state["selected"]=i;break
+            nxt=device_menu(stdscr,state,dev)
+            if nxt!="fleet":return nxt
+
+def sudo_screen(stdscr,state):
+    sel=0
+    while True:
+        refresh_state(state,state.pop("force_refresh",False));queue=pending_requests(state["devices"]);sel=min(sel,max(0,len(queue)-1));header(stdscr,"Sudo requests",f"{len(queue)} waiting. Enter opens the Y/N approval popup.");h,_=stdscr.getmaxyx();rows=max(1,h-7);start=max(0,sel-rows+1) if sel>=rows else 0;safe_add(stdscr,3,1,"#  DEVICE           USER          COMMAND",curses.A_BOLD|curses.A_UNDERLINE)
+        for pos,(d,r) in enumerate(queue[start:start+rows]):
+            idx=start+pos;num=pos+1 if pos<9 else 0;host=d.get("hostname") or d.get("host") or "?";safe_add(stdscr,4+pos,1,f"{num if num else ' ':>1}  {host[:16]:16} {r.get('requester','?')[:12]:12} {r.get('command','')[:80]}",curses.A_REVERSE if idx==sel else 0)
+        if not queue:safe_add(stdscr,5,3,"No pending sudo requests.")
+        stdscr.refresh();k=stdscr.getch();g=global_key(k)
+        if g:return g
+        if k in (27,curses.KEY_BACKSPACE,127):return "main"
+        if k in (ord('r'),ord('R')):state["force_refresh"]=True;continue
+        sel,act=list_select_key(k,sel,len(queue),start,rows)
+        if act=="open" and queue:sudo_decision_popup(stdscr,*queue[sel]);state["force_refresh"]=True
 
 def fleet_command(devices,remote):
-    with ThreadPoolExecutor(max_workers=min(8,max(1,len(devices)))) as pool:
-        fs={pool.submit(ssh_capture,d['addr'],remote):d for d in devices};results=[]
+    if not devices:return "No eligible online Pis."
+    results=[]
+    with ThreadPoolExecutor(max_workers=min(8,len(devices))) as pool:
+        fs={pool.submit(ssh_capture,d["addr"],remote):d for d in devices}
         for f in as_completed(fs):
-            d=fs[f];p=f.result();host=d.get('hostname') or d.get('addr');results.append(f"{host}: {'OK' if p.returncode==0 else 'FAILED'}\n{p.stdout}{p.stderr}")
-    return '\n\n'.join(results)
+            d=fs[f];p=f.result();host=d.get("hostname") or d.get("host") or d.get("addr");results.append(f"{host}: {'OK' if p.returncode==0 else 'FAILED'}\n{p.stdout}{p.stderr}")
+    return "\n\n".join(results)
 
-def draw(stdscr,devices,sel,last,msg=''):
-    stdscr.erase();h,w=stdscr.getmaxyx();compact=w<105 or h<24;online=sum(1 for d in devices if d.get('online'));checks=sum(1 for d in devices if health(d)=='CHECK');pending=len(pending_requests(devices))
-    safe_add(stdscr,0,0,' LGHS FLEET LIVE ',curses.A_REVERSE|curses.A_BOLD);safe_add(stdscr,1,1,f"Controller {subprocess.getoutput('hostname')}   {online}/{len(devices)} online   alerts {checks}   sudo {pending}   {last}")
-    safe_add(stdscr,2,1,'Up/Down select | P sudo | U LGHS | A LGHS-all | O OS | X OS-all | G fleet-logs | L logs | C check | E enforce | S ssh | B reboot | R refresh | Q quit',curses.A_DIM)
-    if msg:safe_add(stdscr,3,1,msg,curses.A_BOLD)
-    hy=5;headers=[('HOST',16),('IP',15),('CPU',6),('RAM',6),('TEMP',7),('SUDO',5),('STATE',8)] if compact else [('HOST',16),('IP',15),('VER',8),('CPU',6),('RAM',6),('DISK',6),('TEMP',7),('RX',7),('TX',7),('SUDO',5),('COMMIT',12),('STATE',8)]
-    x=1
-    for n,ww in headers:safe_add(stdscr,hy,x,n.ljust(ww),curses.A_BOLD|curses.A_UNDERLINE);x+=ww+1
-    rows=max(0,h-hy-6);start=max(0,sel-rows+1) if rows and sel>=rows else 0
-    for ry,d in enumerate(devices[start:start+rows],hy+1):
-        idx=start+ry-hy-1;attr=curses.A_REVERSE if idx==sel else 0;sc=str(len(d.get('sudo_requests',[])))
-        vals=[d.get('hostname') or d.get('host','?'),d.get('addr','?'),d.get('cpu_pct','?')+'%',d.get('mem_pct','?')+'%',d.get('temp_c','?')+'C',sc,health(d)] if compact else [d.get('hostname') or d.get('host','?'),d.get('addr','?'),d.get('version','?'),d.get('cpu_pct','?')+'%',d.get('mem_pct','?')+'%',d.get('disk_pct','?')+'%',d.get('temp_c','?')+'C',fmt_bytes(d.get('rx_bytes')),fmt_bytes(d.get('tx_bytes')),sc,d.get('commit','?')[:12],health(d)]
-        x=1
-        for val,(_,ww) in zip(vals,headers):safe_add(stdscr,ry,x,str(val)[:ww].ljust(ww),attr);x+=ww+1
-    stdscr.refresh()
-
-def main(stdscr):
-    curses.curs_set(0);stdscr.keypad(True);stdscr.timeout(150);devices=[];discovered=[];sel=0;last_stats=0;last_disc=0;last='never';msg='Starting encrypted fleet discovery...';seen=set()
+def update_screen(stdscr,state):
+    opts=["Selected Pi: LGHS update","All online Pis: LGHS update","Selected Pi: OS full-upgrade","All online Pis: OS full-upgrade","Selected Pi: OS full-upgrade + reboot","All online Pis: OS full-upgrade + reboot"];sel=0
     while True:
-        now=time.time()
-        if now-last_disc>=DISCOVERY_SECONDS or not discovered:discovered=discover_devices();last_disc=now
-        if now-last_stats>=REFRESH_SECONDS:
-            devices=refresh_fleet(discovered);sel=min(sel,max(0,len(devices)-1));last_stats=time.time();last=time.strftime('%H:%M:%S');msg=''
-            for d,r in pending_requests(devices):
-                key=f"{d.get('addr')}:{r.get('id')}"
-                if key not in seen:
-                    seen.add(key);state,detail=sudo_prompt(stdscr,d,r);msg=f"Sudo request {state}: {d.get('hostname') or d.get('host')}";last_stats=0
-                    if state=='error':popup(stdscr,'Sudo approval error',detail)
-                    break
-        draw(stdscr,devices,sel,last,msg);k=stdscr.getch()
-        if k==-1:continue
-        if k in (ord('q'),ord('Q')):break
-        if k==curses.KEY_RESIZE:continue
-        if k in (curses.KEY_DOWN,ord('j')) and devices:sel=min(len(devices)-1,sel+1)
-        elif k in (curses.KEY_UP,ord('k')) and devices:sel=max(0,sel-1)
-        elif k in (ord('r'),ord('R')):last_stats=0;last_disc=0
-        elif k in (ord('g'),ord('G')):subprocess.call(['sudo','-n','/usr/local/sbin/lghs-audit-sync']);popup(stdscr,'Controller fleet logs',central_logs())
-        elif k in (ord('p'),ord('P')):
-            q=pending_requests(devices);msg='No pending sudo requests.' if not q else ''
-            for d,r in q:
-                state,detail=sudo_prompt(stdscr,d,r);last_stats=0
-                if state=='error':popup(stdscr,'Sudo approval error',detail)
-                if state=='later':break
-        elif devices:
-            d=devices[sel];addr=d['addr'];host=d.get('hostname') or d.get('host') or addr
-            if k in (10,13):popup(stdscr,*action(addr,f'Details - {host}','sudo -n /usr/local/sbin/lghs-report summary'))
-            elif k in (ord('l'),ord('L')):popup(stdscr,*action(addr,f'Logs - {host}','sudo -n /usr/local/sbin/lghs-report logs all'))
-            elif k in (ord('u'),ord('U')) and confirm(stdscr,f'Force LGHS update on {host}?'):popup(stdscr,f'LGHS update - {host}',fleet_command([d],'sudo -n /usr/local/sbin/lghs-update'));last_stats=0
-            elif k in (ord('a'),ord('A')) and confirm(stdscr,f'Force LGHS update on all {len(devices)} Pis?'):popup(stdscr,'Fleet LGHS update',fleet_command(devices,'sudo -n /usr/local/sbin/lghs-update'));last_stats=0
-            elif k in (ord('o'),ord('O')) and confirm(stdscr,f'Run supported Raspberry Pi OS full-upgrade on {host}?'):popup(stdscr,f'OS update - {host}',fleet_command([d],'sudo -n /usr/local/sbin/lghs-os-update'));last_stats=0
-            elif k in (ord('x'),ord('X')) and confirm(stdscr,f'Run Raspberry Pi OS full-upgrade on ALL {len(devices)} Pis?'):popup(stdscr,'Fleet OS update',fleet_command(devices,'sudo -n /usr/local/sbin/lghs-os-update'));last_stats=0
-            elif k in (ord('c'),ord('C')):popup(stdscr,*action(addr,f'Check - {host}','sudo -n /usr/local/sbin/lghs-check'))
-            elif k in (ord('e'),ord('E')) and confirm(stdscr,f'Re-apply LGHS policy on {host}?'):popup(stdscr,*action(addr,f'Enforce - {host}','sudo -n /usr/local/sbin/lghs-enforce'));last_stats=0
-            elif k in (ord('b'),ord('B')) and confirm(stdscr,f'Reboot {host}?'):ssh_capture(addr,'sudo -n /usr/sbin/reboot');msg=f'Reboot requested for {host}';last_stats=0
-            elif k in (ord('s'),ord('S')):curses.endwin();subprocess.call(ssh_args(addr,batch=False));stdscr.refresh();curses.curs_set(0);last_stats=0
+        refresh_state(state);devices=state["devices"];selected=devices[state.get("selected",0)] if devices and state.get("selected",0)<len(devices) else None;name=(selected.get("hostname") or selected.get("host")) if selected else "none";header(stdscr,"Updates",f"Selected: {name}. Major OS release jumps are intentionally not automated.")
+        for i,x in enumerate(opts):safe_add(stdscr,3+i,4,f"{i+1}. {x}",curses.A_REVERSE if i==sel else 0)
+        stdscr.refresh();k=stdscr.getch();g=global_key(k)
+        if g:return g
+        if k in (27,curses.KEY_BACKSPACE,127):return "main"
+        if k in (curses.KEY_DOWN,ord('j')):sel=min(5,sel+1)
+        elif k in (curses.KEY_UP,ord('k')):sel=max(0,sel-1)
+        elif ord('1')<=k<=ord('6'):sel=k-ord('1');k=10
+        if k in (10,13):
+            all_targets=sel in (1,3,5);osup=sel in (2,3,4,5);reboot=sel in (4,5);targets=[d for d in devices if d.get("online")] if all_targets else ([selected] if selected and selected.get("online") else [])
+            if not targets:popup(stdscr,"Updates","No eligible online Pi selected.");continue
+            label="Raspberry Pi OS update" if osup else "LGHS update"
+            if not confirm(stdscr,f"Run {label} on {len(targets)} Pi(s)?"):continue
+            remote=("sudo -n /usr/local/sbin/lghs-os-update"+(" --reboot" if reboot else "")) if osup else "sudo -n /usr/local/sbin/lghs-update";popup(stdscr,label,fleet_command(targets,remote));state["force_refresh"]=True
 
-if __name__=='__main__':curses.wrapper(main)
+def read_controller_log(kind,limit=180):
+    p={"sudo":LOG_BASE/"sudo.log","audit":LOG_BASE/"audit.jsonl","update":LOG_BASE/"update.log","os":LOG_BASE/"os-update.log"}[kind]
+    if not p.exists():return f"No controller copy yet: {p}\nRun Sync or wait for the audit timer."
+    try:return "\n".join(p.read_text(encoding="utf-8",errors="replace").splitlines()[-limit:])
+    except Exception as e:return str(e)
+
+def logs_screen(stdscr,state):
+    opts=["Fleet sudo command log","Fleet sudo approval audit","LGHS update history","Raspberry Pi OS update history","Sync fleet logs now","Selected Pi live logs"];sel=0
+    while True:
+        header(stdscr,"Audit & logs","Persistent controller copies are stored under /var/log/lghs-fleet.")
+        for i,x in enumerate(opts):safe_add(stdscr,3+i,4,f"{i+1}. {x}",curses.A_REVERSE if i==sel else 0)
+        stdscr.refresh();k=stdscr.getch();g=global_key(k)
+        if g:return g
+        if k in (27,curses.KEY_BACKSPACE,127):return "main"
+        if k in (curses.KEY_DOWN,ord('j')):sel=min(5,sel+1)
+        elif k in (curses.KEY_UP,ord('k')):sel=max(0,sel-1)
+        elif ord('1')<=k<=ord('6'):sel=k-ord('1');k=10
+        if k in (10,13):
+            if sel==0:popup(stdscr,"Fleet sudo log",read_controller_log("sudo"))
+            elif sel==1:popup(stdscr,"Fleet sudo audit",read_controller_log("audit"))
+            elif sel==2:popup(stdscr,"LGHS update history",read_controller_log("update"))
+            elif sel==3:popup(stdscr,"OS update history",read_controller_log("os"))
+            elif sel==4:
+                p=run(["/usr/local/sbin/lghs-audit-sync"]);popup(stdscr,"Audit sync",(p.stdout or "")+(p.stderr or "") or f"Exit {p.returncode}")
+            elif sel==5:
+                ds=state["devices"]
+                if not ds:popup(stdscr,"Live logs","No Pi selected.")
+                else:run_remote_action(stdscr,ds[min(state.get("selected",0),len(ds)-1)],"Live Pi logs","sudo -n /usr/local/sbin/lghs-report logs all")
+
+def controller_screen(stdscr,state):
+    lines=[]
+    for cmd in (["hostname"],["cat","/etc/lghs/version"],["systemctl","is-active","lghs-update.timer"],["systemctl","is-active","lghs-reconcile.timer"],["systemctl","is-active","lghs-audit-sync.timer"]):
+        p=run(cmd);lines.append(" ".join(cmd)+": "+(p.stdout or p.stderr).strip())
+    lines += ["",f"Discovered Pis: {len(state['devices'])}",f"Fleet log path: {LOG_BASE}"];popup(stdscr,"Controller status","\n".join(lines));return "main"
+
+def app(stdscr):
+    curses.curs_set(0);stdscr.keypad(True);stdscr.timeout(300);state={"devices":[],"discovered":[],"selected":0,"last_refresh":0.0,"last_discovery":0.0,"force_refresh":True,"seen_sudo":set()};screen="main"
+    while True:
+        refresh_state(state,state.pop("force_refresh",False));maybe_popup_new_sudo(stdscr,state)
+        if screen=="main":screen=main_menu(stdscr,state)
+        elif screen=="fleet":screen=fleet_screen(stdscr,state)
+        elif screen=="telemetry":screen=telemetry_screen(stdscr,state)
+        elif screen=="sudo":screen=sudo_screen(stdscr,state)
+        elif screen=="updates":screen=update_screen(stdscr,state)
+        elif screen=="logs":screen=logs_screen(stdscr,state)
+        elif screen=="controller":screen=controller_screen(stdscr,state)
+        elif screen=="help":help_popup(stdscr);screen="main"
+        elif screen=="quit":break
+        else:screen="main"
+
+if __name__=="__main__":ensure_root();ensure_dirs();curses.wrapper(app)
