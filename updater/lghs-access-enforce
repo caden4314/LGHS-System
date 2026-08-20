@@ -18,6 +18,8 @@ for dir in /etc/lghs /opt/lghs /var/lib/lghs; do
 done
 [[ -d /etc/lghs/secrets ]] && { chown root:root /etc/lghs/secrets; chmod 0700 /etc/lghs/secrets; }
 [[ -d /var/lib/lghs/sudo-requests ]] && { chown root:root /var/lib/lghs/sudo-requests; chmod 0700 /var/lib/lghs/sudo-requests; }
+[[ -d /var/lib/lghs/netqueue ]] && { chown root:root /var/lib/lghs/netqueue; chmod 0700 /var/lib/lghs/netqueue; }
+[[ -d /var/lib/lghs/netqueue/jobs ]] && { chown root:root /var/lib/lghs/netqueue/jobs; chmod 0700 /var/lib/lghs/netqueue/jobs; }
 
 # Files used by LGHS services are not student-readable. Root services can still
 # consume them, while cs_admin can inspect non-secret configuration if needed.
@@ -32,6 +34,12 @@ for f in /usr/local/sbin/lghs-*; do
   chown root:"$ADMIN_GROUP" "$f"
   chmod 0750 "$f"
 done
+# The Control Pi keeps the unwrapped fleet CLI in libexec so the queue wrapper
+# can call it. Apply the same management-only permissions there.
+if [[ -e /usr/local/libexec/lghsctl-real ]]; then
+  chown root:"$ADMIN_GROUP" /usr/local/libexec/lghsctl-real
+  chmod 0750 /usr/local/libexec/lghsctl-real
+fi
 
 # Student-facing launchers only.
 [[ -e /usr/local/bin/sudo ]] && { chown root:root /usr/local/bin/sudo; chmod 0755 /usr/local/bin/sudo; }
@@ -40,7 +48,7 @@ done
 # A Student Pi must never retain controller-only management clients/collectors
 # from an old image or a role change.
 if [[ "$ROLE" == "student" ]]; then
-  rm -f /usr/local/sbin/lghsctl /usr/local/sbin/lghs-console /usr/local/sbin/lghs-audit-sync
+  rm -f /usr/local/sbin/lghsctl /usr/local/sbin/lghs-console /usr/local/sbin/lghs-audit-sync /usr/local/libexec/lghsctl-real
   systemctl disable --now lghs-audit-sync.timer lghs-audit-sync.service >/dev/null 2>&1 || true
 
   if id "$STUDENT" >/dev/null 2>&1; then
@@ -71,7 +79,7 @@ chmod 0644 /etc/polkit-1/rules.d/48-lghs-service-management.rules
 chown root:root /etc/polkit-1/rules.d/48-lghs-service-management.rules
 
 # Audit/log files stay outside the student's supplementary groups.
-for f in /var/log/sudo.log /var/log/lghs-sudo-audit.jsonl /var/log/lghs-update.log /var/log/lghs-os-update.log; do
+for f in /var/log/sudo.log /var/log/lghs-sudo-audit.jsonl /var/log/lghs-update.log /var/log/lghs-os-update.log /var/log/lghs-netqueue.log; do
   [[ -e "$f" ]] || continue
   chown root:adm "$f" 2>/dev/null || chown root:root "$f"
   chmod 0640 "$f"
