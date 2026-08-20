@@ -3,42 +3,35 @@ set -euo pipefail
 
 STUDENT_USER="lg_cs_cont"
 HARDENED_LIB="/usr/local/lib/lghs/libnetman.so.hardened"
+VERSION_FILE="/usr/local/lib/lghs/libnetman.package-version"
 BACKUP_DIR="/usr/local/lib/lghs-backups"
 EDITOR="/usr/bin/lp-connection-editor"
 EDITOR_REAL="/usr/lib/lghs/lp-connection-editor.real"
 
-log() {
-    logger -t LGHS-NETWORK-UI "$*" 2>/dev/null || true
-    printf '[LGHS network UI] %s\n' "$*"
-}
-
-[[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
+log(){ logger -t LGHS-NETWORK-UI "$*" 2>/dev/null || true;printf '[LGHS network UI] %s\n' "$*"; }
+[[ $EUID -eq 0 ]] || { echo "Run as root" >&2;exit 1; }
 install -d -m 0755 /usr/local/lib/lghs "$BACKUP_DIR" /usr/lib/lghs
 
-# Re-apply the patched wf-panel-pi network plugin if a package update replaced it.
-if [[ -f "$HARDENED_LIB" ]]; then
-    NETMAN_LIB="$(dpkg -L wfplug-netman 2>/dev/null | grep -E '/wf-panel-pi/libnetman\.so$' | head -n1 || true)"
-    if [[ -z "$NETMAN_LIB" ]]; then
-        NETMAN_LIB="$(find /usr/lib -type f -path '*/wf-panel-pi/libnetman.so' -print -quit 2>/dev/null || true)"
-    fi
-    if [[ -n "$NETMAN_LIB" && -f "$NETMAN_LIB" ]]; then
-        if [[ ! -f "$BACKUP_DIR/libnetman.so.stock" ]]; then
-            cp -a "$NETMAN_LIB" "$BACKUP_DIR/libnetman.so.stock"
-        fi
-        if ! cmp -s "$HARDENED_LIB" "$NETMAN_LIB"; then
-            install -m 0644 "$HARDENED_LIB" "$NETMAN_LIB"
-            log "Restored hardened wf-panel-pi network plugin."
-        fi
-    else
-        log "wf-panel-pi libnetman.so not found; UI plugin enforcement skipped."
-    fi
+CURRENT_VERSION="$(dpkg-query -W -f='${Version}' wfplug-netman 2>/dev/null || echo unknown)"
+BUILT_VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+if [[ -f "$HARDENED_LIB" && "$CURRENT_VERSION" != "unknown" && "$BUILT_VERSION" != "unknown" && "$CURRENT_VERSION" != "$BUILT_VERSION" ]];then
+    log "wfplug-netman changed ($BUILT_VERSION -> $CURRENT_VERSION); scheduling hardened plugin rebuild."
+    rm -f "$HARDENED_LIB" "$VERSION_FILE"
 fi
 
-# Defense in depth: even if a menu/launcher reaches the advanced editor,
-# lg_cs_cont is denied while cs_admin/root retain normal access. If a package
-# update replaces our wrapper, preserve the newly installed real editor first.
-if [[ -x "$EDITOR" && ! -L "$EDITOR" ]]; then
-    if ! grep -q 'LGHS_NETWORK_EDITOR_GUARD' "$EDITOR" 2>/dev/null; then
+if [[ -f "$HARDENED_LIB" ]]; then
+    NETMAN_LIB="$(dpkg -L wfplug-netman 2>/dev/null|grep -E '/wf-panel-pi/libnetman\.so$'|head -n1||true)"
+    [[ -n "$NETMAN_LIB" ]] || NETMAN_LIB="$(find /usr/lib -type f -path '*/wf-panel-pi/libnetman.so' -print -quit 2>/dev/null||true)"
+    if [[ -n "$NETMAN_LIB" && -f "$NETMAN_LIB" ]];then
+        [[ -f "$BACKUP_DIR/libnetman.so.stock" ]] || cp -a "$NETMAN_LIB" "$BACKUP_DIR/libnetman.so.stock"
+        if ! cmp -s "$HARDENED_LIB" "$NETMAN_LIB";then install -m 0644 "$HARDENED_LIB" "$NETMAN_LIB";log "Restored hardened wf-panel-pi network plugin.";fi
+    else log "wf-panel-pi libnetman.so not found; UI plugin enforcement skipped.";fi
+fi
+
+# Defense in depth: if an update replaces the real editor, preserve the new copy
+# and reinstall the student guard around it.
+if [[ -x "$EDITOR" && ! -L "$EDITOR" ]];then
+    if ! grep -q 'LGHS_NETWORK_EDITOR_GUARD' "$EDITOR" 2>/dev/null;then
         mv -f "$EDITOR" "$EDITOR_REAL"
         cat > "$EDITOR" <<'EOF'
 #!/bin/sh
@@ -49,14 +42,8 @@ if [ "$(id -un 2>/dev/null)" = "lg_cs_cont" ]; then
 fi
 exec /usr/lib/lghs/lp-connection-editor.real "$@"
 EOF
-        chmod 0755 "$EDITOR" "$EDITOR_REAL"
-        chown root:root "$EDITOR" "$EDITOR_REAL"
-        log "Installed advanced network editor guard for $STUDENT_USER."
+        chmod 0755 "$EDITOR" "$EDITOR_REAL";chown root:root "$EDITOR" "$EDITOR_REAL";log "Installed advanced network editor guard for $STUDENT_USER."
     fi
 fi
 
-# Saved NetworkManager profiles remain root-only so PSKs cannot be read by students.
-if [[ -d /etc/NetworkManager/system-connections ]]; then
-    find /etc/NetworkManager/system-connections -maxdepth 1 -type f \
-        -exec chown root:root {} + -exec chmod 0600 {} +
-fi
+if [[ -d /etc/NetworkManager/system-connections ]];then find /etc/NetworkManager/system-connections -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 0600 {} +;fi
