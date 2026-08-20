@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -u
+STUDENT="lg_cs_cont"
+ADMIN="cs_admin"
+FAIL=0
+pass(){ printf '[PASS] %s\n' "$1"; }
+fail(){ printf '[FAIL] %s\n' "$1"; FAIL=1; }
+
+if id -nG "$STUDENT" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then fail "student sudo restriction"; else pass "student sudo restriction"; fi
+if id -nG "$ADMIN" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then pass "admin sudo membership"; else fail "admin sudo membership"; fi
+if visudo -cf /etc/sudoers >/dev/null 2>&1; then pass "sudoers syntax"; else fail "sudoers syntax"; fi
+if [[ -f /etc/polkit-1/rules.d/49-lghs-network.rules ]]; then pass "NetworkManager PolicyKit rule"; else fail "NetworkManager PolicyKit rule"; fi
+
+BAD=""
+if [[ -d /etc/NetworkManager/system-connections ]]; then
+  BAD="$(find /etc/NetworkManager/system-connections -maxdepth 1 -type f \( ! -user root -o ! -group root -o ! -perm 0600 \) -print 2>/dev/null)"
+fi
+if [[ -z "$BAD" ]]; then pass "NetworkManager profile permissions"; else fail "NetworkManager profile permissions"; fi
+
+if systemctl is-enabled lghs-policy.service >/dev/null 2>&1; then pass "policy service enabled"; else fail "policy service enabled"; fi
+if systemctl is-active NetworkManager >/dev/null 2>&1; then pass "NetworkManager active"; else fail "NetworkManager active"; fi
+
+exit "$FAIL"
