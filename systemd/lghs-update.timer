@@ -2,10 +2,11 @@
 Description=Check for LGHS updates periodically
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=1h
+OnBootSec=2min
+OnUnitActiveSec=15min
 Persistent=true
-RandomizedDelaySec=5min
+RandomizedDelaySec=60s
+Unit=lghs-update.service
 
 [Install]
 WantedBy=timers.target
