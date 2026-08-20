@@ -1,0 +1,11 @@
+[Unit]
+Description=Drain persistent LGHS offline network queue
+After=local-fs.target NetworkManager.service
+ConditionPathExists=/etc/lghs/role
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lghs-netqueue drain
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
