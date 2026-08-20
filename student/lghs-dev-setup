@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STUDENT=lg_cs_cont
+HOME_DIR=/home/$STUDENT
+WORKSPACE=$HOME_DIR/CS2
+VENV=$WORKSPACE/.venv
+
+[[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
+getent passwd "$STUDENT" >/dev/null || exit 0
+
+install -d -m 0755 -o "$STUDENT" -g "$STUDENT" \
+  "$WORKSPACE" "$WORKSPACE/Assignments" "$WORKSPACE/Projects" "$WORKSPACE/My Programs" \
+  "$HOME_DIR/.config/Code/User" "$HOME_DIR/.local/bin"
+
+if [[ ! -x "$VENV/bin/python" ]]; then
+  runuser -u "$STUDENT" -- python3 -m venv "$VENV"
+fi
+
+# Keep the course environment usable without administrator intervention.
+runuser -u "$STUDENT" -- "$VENV/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+
+cat > "$HOME_DIR/.config/Code/User/settings.json" <<'EOF'
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "python.createEnvironment.trigger": "off",
+    "python.analysis.autoImportCompletions": true,
+    "terminal.integrated.defaultProfile.linux": "bash",
+    "files.autoSave": "afterDelay",
+    "files.autoSaveDelay": 1000,
+    "editor.formatOnSave": false,
+    "workbench.startupEditor": "none"
+}
+EOF
+chown "$STUDENT:$STUDENT" "$HOME_DIR/.config/Code/User/settings.json"
+
+cat > /etc/profile.d/lghs-dev-path.sh <<'EOF'
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+EOF
+chmod 0644 /etc/profile.d/lghs-dev-path.sh
+
+if command -v code >/dev/null 2>&1; then
+  runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.python --force >/dev/null 2>&1 || true
+  runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.vscode-pylance --force >/dev/null 2>&1 || true
+fi
+
+chown -R "$STUDENT:$STUDENT" "$WORKSPACE" "$HOME_DIR/.config/Code" "$HOME_DIR/.local"
+printf 'LGHS development environment ready: %s\n' "$VENV"
