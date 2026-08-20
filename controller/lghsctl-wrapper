@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -u
+REAL=/usr/local/libexec/lghsctl-real
+QUEUE=/usr/local/sbin/lghs-netqueue
+
+[[ -x "$REAL" ]] || { echo "LGHS controller backend missing: $REAL" >&2; exit 127; }
+
+"$REAL" "$@"
+RC=$?
+[[ $RC -eq 0 ]] && exit 0
+[[ "${LGHS_NETQUEUE_RUNNING:-0}" == "1" ]] && exit "$RC"
+[[ -x "$QUEUE" ]] || exit "$RC"
+
+CMD="${1:-}"
+TARGET=""
+ACTION=""
+case "$CMD" in
+  update)
+    [[ "${2:-}" != "" && "${2:-}" != "--all" ]] && { TARGET="$2"; ACTION=update; }
+    ;;
+  os-update)
+    if [[ "${2:-}" != "" && "${2:-}" != "--all" && "${2:-}" != "--reboot" ]]; then
+      TARGET="$2"
+      ACTION=os-update
+      [[ " $* " == *" --reboot "* ]] && ACTION=os-update-reboot
+    fi
+    ;;
+  enforce)
+    [[ -n "${2:-}" ]] && { TARGET="$2"; ACTION=enforce; }
+    ;;
+esac
+
+if [[ -n "$TARGET" && -n "$ACTION" ]]; then
+  "$QUEUE" enqueue fleet "$TARGET" "$ACTION" >/dev/null
+  echo "LGHS: $CMD for $TARGET could not run now and was queued persistently." >&2
+fi
+exit "$RC"
