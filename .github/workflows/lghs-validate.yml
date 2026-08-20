@@ -38,6 +38,7 @@ jobs:
           bash -n student/lghs-enforce
           bash -n student/lghs-check
           bash -n student/lghs-agent
+          bash -n student/lghs-report
           bash -n student/lghs-firstboot-provision
           bash -n student/lghs-install-network-ui
           bash -n student/lghs-network-ui-apply
