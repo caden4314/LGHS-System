@@ -1,0 +1,3 @@
+Defaults logfile="/var/log/sudo.log"
+Defaults loglinelen=0
+Defaults log_year
