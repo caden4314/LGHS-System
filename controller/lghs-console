@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+import curses
+import subprocess
+import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+SERVICE = "_lghs._tcp"
+SSH_USER = "lg_cs_cont"
+REFRESH_SECONDS = 10
+
+
+def run(cmd):
+    return subprocess.run(cmd, text=True, capture_output=True)
+
+
+def discover_devices():
+    if not shutil.which("avahi-browse"):
+        return []
+    p = run(["avahi-browse", "-rtp", SERVICE])
+    devices, seen = [], set()
+    for line in p.stdout.splitlines():
+        if not line.startswith("="):
+            continue
+        f = line.split(";")
+        if len(f) < 9 or f[4] != SERVICE:
+            continue
+        host, addr = f[6], f[7]
+        key = (host, addr)
+        if key in seen:
+            continue
+        seen.add(key)
+        devices.append({"name": f[3], "host": host, "addr": addr, "port": f[8]})
+    return devices
+
+
+def ssh_capture(addr, remote):
+    return run([
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+        f"{SSH_USER}@{addr}", remote
+    ])
+
+
+def parse_kv(text):
+    out = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def fetch_one(device):
+    p = ssh_capture(device["addr"], "sudo -n /usr/local/sbin/lghs-report summary")
+    result = dict(device)
+    result["online"] = p.returncode == 0
+    if p.returncode == 0:
+        result.update(parse_kv(p.stdout))
+    return result
+
+
+def fetch_fleet():
+    devices = discover_devices()
+    if not devices:
+        return []
+    results = []
+    with ThreadPoolExecutor(max_workers=min(16, len(devices))) as pool:
+        futures = {pool.submit(fetch_one, d): d for d in devices}
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception:
+                d = futures[fut]
+                d["online"] = False
+                results.append(d)
+    results.sort(key=lambda d: (d.get("hostname") or d.get("host") or d.get("addr", "")).lower())
+    return results
+
+
+def health(d):
+    if not d.get("online"):
+        return "OFFLINE"
+    vals = [d.get("update_timer")]
+    if d.get("role") == "student":
+        vals += [d.get("agent"), d.get("policy"), d.get("ssh")]
+    return "OK" if all(v == "active" for v in vals if v is not None) else "CHECK"
+
+
+def safe_add(stdscr, y, x, text, attr=0):
+    h, w = stdscr.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    try:
+        stdscr.addnstr(y, x, str(text), max(0, w - x - 1), attr)
+    except curses.error:
+        pass
+
+
+def popup(stdscr, title, body):
+    lines = body.splitlines() or [""]
+    h, w = stdscr.getmaxyx()
+    ph = min(h - 4, max(8, len(lines) + 4))
+    pw = min(w - 4, max(50, min(110, max([len(title) + 6] + [len(x) + 4 for x in lines]))))
+    y, x = max(1, (h - ph) // 2), max(1, (w - pw) // 2)
+    win = curses.newwin(ph, pw, y, x)
+    win.keypad(True)
+    offset = 0
+    while True:
+        win.erase(); win.box()
+        try: win.addnstr(0, 2, f" {title} ", pw - 4, curses.A_BOLD)
+        except curses.error: pass
+        visible = ph - 3
+        for i, line in enumerate(lines[offset:offset + visible], start=1):
+            try: win.addnstr(i, 2, line, pw - 4)
+            except curses.error: pass
+        try: win.addnstr(ph - 2, 2, "↑/↓ scroll   q/Esc/Enter close", pw - 4, curses.A_DIM)
+        except curses.error: pass
+        win.refresh()
+        k = win.getch()
+        if k in (ord('q'), 27, 10, 13): break
+        if k in (curses.KEY_DOWN, ord('j')) and offset < max(0, len(lines) - visible): offset += 1
+        if k in (curses.KEY_UP, ord('k')) and offset > 0: offset -= 1
+        if k == curses.KEY_NPAGE: offset = min(max(0, len(lines)-visible), offset + visible)
+        if k == curses.KEY_PPAGE: offset = max(0, offset - visible)
+    del win
+
+
+def confirm(stdscr, message):
+    h, w = stdscr.getmaxyx()
+    text = f"{message}  [y/N]"
+    y = h // 2
+    safe_add(stdscr, y, max(0, (w-len(text))//2), text, curses.A_BOLD)
+    stdscr.refresh()
+    return stdscr.getch() in (ord('y'), ord('Y'))
+
+
+def selected_addr(devices, idx):
+    if not devices: return None
+    return devices[max(0, min(idx, len(devices)-1))]["addr"]
+
+
+def action_output(addr, title, remote):
+    p = ssh_capture(addr, remote)
+    body = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
+    return title, body.strip() or f"Command exited with code {p.returncode}."
+
+
+def draw(stdscr, devices, selected, last_refresh, message=""):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    safe_add(stdscr, 0, 0, " LGHS FLEET CONSOLE ", curses.A_REVERSE | curses.A_BOLD)
+    safe_add(stdscr, 1, 1, f"Control Pi: {subprocess.getoutput('hostname')}   Devices: {len(devices)}   Auto refresh: {REFRESH_SECONDS}s   Last: {last_refresh}")
+    safe_add(stdscr, 2, 1, "↑↓ select  Enter details  L logs  U update  A update-all  C check  E enforce  S ssh  B reboot  R refresh  Q quit", curses.A_DIM)
+    if message:
+        safe_add(stdscr, 3, 1, message, curses.A_BOLD)
+
+    header_y = 5
+    widths = [18, 15, 9, 9, 12, 10, 14]
+    headers = ["HOSTNAME", "IP", "ROLE", "VERSION", "COMMIT", "HEALTH", "UPTIME"]
+    x = 1
+    for hdr, width in zip(headers, widths):
+        safe_add(stdscr, header_y, x, hdr.ljust(width), curses.A_UNDERLINE | curses.A_BOLD)
+        x += width + 1
+
+    max_rows = max(0, h - header_y - 3)
+    start = 0
+    if selected >= max_rows and max_rows:
+        start = selected - max_rows + 1
+    for row, d in enumerate(devices[start:start + max_rows], start=header_y + 1):
+        real_idx = start + row - header_y - 1
+        attr = curses.A_REVERSE if real_idx == selected else 0
+        vals = [
+            d.get("hostname") or d.get("host", "?"), d.get("addr", "?"),
+            d.get("role", "?"), d.get("version", "?"), d.get("commit", "?")[:12],
+            health(d), d.get("uptime", "?")
+        ]
+        x = 1
+        for val, width in zip(vals, widths):
+            safe_add(stdscr, row, x, str(val)[:width].ljust(width), attr)
+            x += width + 1
+
+    if not devices:
+        safe_add(stdscr, header_y + 2, 2, "No LGHS devices discovered. Check Wi-Fi/client isolation, Avahi, and SSH enrollment.")
+    safe_add(stdscr, h - 1, 1, "LGHS classroom management • q to exit", curses.A_DIM)
+    stdscr.refresh()
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.timeout(500)
+    selected = 0
+    devices = []
+    last_refresh_ts = 0.0
+    last_refresh = "never"
+    message = "Discovering fleet..."
+
+    while True:
+        now = time.time()
+        if now - last_refresh_ts >= REFRESH_SECONDS:
+            devices = fetch_fleet()
+            selected = min(selected, max(0, len(devices)-1))
+            last_refresh_ts = time.time()
+            last_refresh = time.strftime("%H:%M:%S")
+            message = ""
+
+        draw(stdscr, devices, selected, last_refresh, message)
+        key = stdscr.getch()
+        if key == -1: continue
+        if key in (ord('q'), ord('Q')): break
+        if key in (curses.KEY_DOWN, ord('j')) and devices: selected = min(len(devices)-1, selected+1)
+        elif key in (curses.KEY_UP, ord('k')) and devices: selected = max(0, selected-1)
+        elif key in (ord('r'), ord('R')):
+            message = "Refreshing..."; draw(stdscr, devices, selected, last_refresh, message)
+            last_refresh_ts = 0
+            continue
+        elif key in (10, 13) and devices:
+            addr = selected_addr(devices, selected)
+            title, body = action_output(addr, f"Details - {addr}", "sudo -n /usr/local/sbin/lghs-report summary")
+            popup(stdscr, title, body)
+        elif key in (ord('l'), ord('L')) and devices:
+            addr = selected_addr(devices, selected)
+            title, body = action_output(addr, f"LGHS logs - {addr}", "sudo -n /usr/local/sbin/lghs-report logs all")
+            popup(stdscr, title, body)
+        elif key in (ord('u'), ord('U')) and devices:
+            addr = selected_addr(devices, selected)
+            if confirm(stdscr, f"Force LGHS update on {addr}?"):
+                title, body = action_output(addr, f"Update - {addr}", "sudo -n /usr/local/sbin/lghs-update")
+                popup(stdscr, title, body); last_refresh_ts = 0
+        elif key in (ord('a'), ord('A')) and devices:
+            if confirm(stdscr, f"Force LGHS update on all {len(devices)} discovered Pis?"):
+                results = []
+                with ThreadPoolExecutor(max_workers=min(16, len(devices))) as pool:
+                    fs = {pool.submit(ssh_capture, d['addr'], "sudo -n /usr/local/sbin/lghs-update"): d['addr'] for d in devices}
+                    for f in as_completed(fs):
+                        p = f.result(); results.append(f"{fs[f]}: {'OK' if p.returncode == 0 else 'FAILED'}\n{p.stdout}{p.stderr}")
+                popup(stdscr, "Fleet update", "\n\n".join(results)); last_refresh_ts = 0
+        elif key in (ord('c'), ord('C')) and devices:
+            addr = selected_addr(devices, selected)
+            title, body = action_output(addr, f"Check - {addr}", "sudo -n /usr/local/sbin/lghs-check")
+            popup(stdscr, title, body)
+        elif key in (ord('e'), ord('E')) and devices:
+            addr = selected_addr(devices, selected)
+            if confirm(stdscr, f"Re-apply LGHS policy on {addr}?"):
+                title, body = action_output(addr, f"Enforce - {addr}", "sudo -n /usr/local/sbin/lghs-enforce")
+                popup(stdscr, title, body); last_refresh_ts = 0
+        elif key in (ord('b'), ord('B')) and devices:
+            addr = selected_addr(devices, selected)
+            if confirm(stdscr, f"Reboot {addr}?"):
+                ssh_capture(addr, "sudo /usr/sbin/reboot")
+                message = f"Reboot requested for {addr}."; last_refresh_ts = 0
+        elif key in (ord('s'), ord('S')) and devices:
+            addr = selected_addr(devices, selected)
+            curses.endwin()
+            subprocess.call(["ssh", f"{SSH_USER}@{addr}"])
+            stdscr.refresh(); curses.curs_set(0); last_refresh_ts = 0
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)
