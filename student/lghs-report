@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:-summary}"
+ARG="${2:-}"
+
+role="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
+version="$(cat /etc/lghs/version 2>/dev/null || echo unknown)"
+commit="$(cat /var/lib/lghs/update/current-commit 2>/dev/null || cat /etc/lghs/build-commit 2>/dev/null || echo unknown)"
+host="$(hostname)"
+
+case "$MODE" in
+  summary)
+    echo "hostname=$host"
+    echo "role=$role"
+    echo "version=$version"
+    echo "commit=$commit"
+    echo "kernel=$(uname -r)"
+    echo "uptime=$(uptime -p 2>/dev/null || true)"
+    echo "boot_time=$(uptime -s 2>/dev/null || true)"
+    echo "ip=$(hostname -I 2>/dev/null | xargs || true)"
+    echo "update_timer=$(systemctl is-active lghs-update.timer 2>/dev/null || true)"
+    echo "update_service=$(systemctl is-active lghs-update.service 2>/dev/null || true)"
+    if [[ "$role" == "student" ]]; then
+      echo "agent=$(systemctl is-active lghs-agent.service 2>/dev/null || true)"
+      echo "policy=$(systemctl is-active lghs-policy.service 2>/dev/null || true)"
+      echo "ssh=$(systemctl is-active ssh.service 2>/dev/null || true)"
+      echo "networkmanager=$(systemctl is-active NetworkManager.service 2>/dev/null || true)"
+      echo "avahi=$(systemctl is-active avahi-daemon.service 2>/dev/null || true)"
+    fi
+    ;;
+
+  versions)
+    echo "HOSTNAME  $host"
+    echo "ROLE      $role"
+    echo "LGHS      $version"
+    echo "COMMIT    $commit"
+    echo "KERNEL    $(uname -r)"
+    python3 --version 2>&1 | sed 's/^/PYTHON    /'
+    if command -v code >/dev/null 2>&1; then
+      code --version 2>/dev/null | head -n1 | sed 's/^/VSCODE    /'
+    else
+      echo "VSCODE    not-installed"
+    fi
+    ;;
+
+  services)
+    units=(lghs-update.timer lghs-update.service)
+    if [[ "$role" == "student" ]]; then
+      units+=(lghs-agent.service lghs-policy.service ssh.service NetworkManager.service avahi-daemon.service)
+    fi
+    printf '%-28s %-10s %-10s\n' UNIT ENABLED ACTIVE
+    for unit in "${units[@]}"; do
+      enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+      active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+      printf '%-28s %-10s %-10s\n' "$unit" "$enabled" "$active"
+    done
+    ;;
+
+  logs)
+    service="${ARG:-all}"
+    case "$service" in
+      all)
+        journalctl --no-pager -n 120 \
+          -u lghs-update.service \
+          -u lghs-agent.service \
+          -u lghs-policy.service 2>/dev/null || true
+        ;;
+      update)
+        journalctl --no-pager -n 120 -u lghs-update.service 2>/dev/null || true
+        ;;
+      agent)
+        journalctl --no-pager -n 120 -u lghs-agent.service 2>/dev/null || true
+        ;;
+      policy)
+        journalctl --no-pager -n 120 -u lghs-policy.service 2>/dev/null || true
+        ;;
+      *)
+        echo "Unknown LGHS log group: $service" >&2
+        echo "Allowed: all, update, agent, policy" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+
+  update-state)
+    echo "current_commit=$(cat /var/lib/lghs/update/current-commit 2>/dev/null || echo unknown)"
+    echo "previous_commit=$(cat /var/lib/lghs/update/previous-commit 2>/dev/null || echo none)"
+    echo "pending_commit=$(cat /var/lib/lghs/update/pending-commit 2>/dev/null || echo none)"
+    systemctl status lghs-update.timer --no-pager --lines=0 2>/dev/null || true
+    ;;
+
+  *)
+    echo "Usage: lghs-report {summary|versions|services|logs [all|update|agent|policy]|update-state}" >&2
+    exit 2
+    ;;
+esac
