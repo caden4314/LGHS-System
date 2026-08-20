@@ -31,8 +31,10 @@ fi
 
 install -m 0755 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
 install -m 0755 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
+install -m 0755 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
+install -m 0644 "$ROOT_DIR/systemd/lghs-firstboot-provision.service" /etc/systemd/system/lghs-firstboot-provision.service
 
 COMMON_PKGS=(git curl python3 openssh-client)
 if ! command -v flock >/dev/null 2>&1; then COMMON_PKGS+=(util-linux); fi
@@ -127,7 +129,7 @@ EOF
 fi
 
 systemctl daemon-reload
-systemctl enable lghs-update.service lghs-update.timer avahi-daemon.service
+systemctl enable lghs-update.service lghs-update.timer lghs-firstboot-provision.service avahi-daemon.service
 if [[ "$ROLE" == "student" ]]; then
   systemctl enable lghs-policy.service lghs-agent.service ssh
 fi
