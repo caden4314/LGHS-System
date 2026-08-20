@@ -20,8 +20,6 @@ if [[ -n "$SOURCE_COMMIT" && "$SOURCE_COMMIT" != "unknown" ]]; then
   printf '%s\n' "$SOURCE_COMMIT" > /var/lib/lghs/update/current-commit
 fi
 
-# Common live-management components. Every LGHS update reinstalls these files,
-# so system changes do not require a reflash.
 install -m 0755 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
 install -m 0755 "$ROOT_DIR/updater/lghs-os-update" /usr/local/sbin/lghs-os-update
 install -m 0755 "$ROOT_DIR/updater/lghs-autologin-apply" /usr/local/sbin/lghs-autologin-apply
@@ -77,9 +75,14 @@ if [[ "$ROLE" == "controller" ]]; then
   if (( ${#MISSING_PKGS[@]} )); then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"; fi
 
   KEY_FILE=/etc/lghs/secrets/controller_ed25519
-  if [[ ! -f "$KEY_FILE" ]]; then ssh-keygen -q -t ed25519 -N '' -C 'LGHS fleet controller' -f "$KEY_FILE"; fi
-  chmod 0600 "$KEY_FILE"; chmod 0644 "$KEY_FILE.pub"
-  install -m 0644 "$KEY_FILE.pub" /etc/lghs/controller_ed25519.pub
+  if [[ "${LGHS_IMAGE_BUILD:-0}" == "1" ]]; then
+    rm -f "$KEY_FILE" "$KEY_FILE.pub" /etc/lghs/controller_ed25519.pub
+    echo 'LGHS image build: controller fleet key generation suppressed.'
+  else
+    if [[ ! -f "$KEY_FILE" ]]; then ssh-keygen -q -t ed25519 -N '' -C 'LGHS fleet controller' -f "$KEY_FILE"; fi
+    chmod 0600 "$KEY_FILE"; chmod 0644 "$KEY_FILE.pub"
+    install -m 0644 "$KEY_FILE.pub" /etc/lghs/controller_ed25519.pub
+  fi
   touch /var/lib/lghs/ssh_known_hosts; chmod 0644 /var/lib/lghs/ssh_known_hosts
   install -d -m 0750 -o root -g adm /var/log/lghs-fleet
   cat > /etc/logrotate.d/lghs-fleet <<'EOF'
@@ -141,8 +144,6 @@ EOF
   if [[ ! -f /usr/local/lib/lghs/libnetman.so.hardened ]]; then /usr/local/sbin/lghs-install-network-ui; else /usr/local/sbin/lghs-network-ui-apply; fi
 fi
 
-# VS Code/Python workspace is maintained for every classroom account on both
-# Student and Controller systems.
 /usr/local/sbin/lghs-dev-setup
 /usr/local/sbin/lghs-autologin-apply || true
 
@@ -151,8 +152,6 @@ systemctl daemon-reload
 systemctl enable lghs-update.service lghs-update.timer lghs-firstboot-provision.service lghs-reconcile.timer avahi-daemon.service
 if [[ "$ROLE" == "student" ]]; then systemctl enable lghs-policy.service lghs-agent.service ssh; else systemctl enable lghs-audit-sync.timer; fi
 
-# Apply filesystem/group/PolicyKit restrictions last so the installer itself can
-# lay down files freely, then leave the management plane locked down.
 /usr/local/sbin/lghs-access-enforce
 
 if systemctl is-system-running --quiet 2>/dev/null || systemctl is-system-running 2>/dev/null | grep -Eq 'running|degraded'; then
