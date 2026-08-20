@@ -1,7 +1,6 @@
 [Unit]
 Description=LGHS Live Update
-After=network-online.target
-Wants=network-online.target
+After=local-fs.target
 ConditionPathExists=/etc/lghs/role
 
 [Service]
