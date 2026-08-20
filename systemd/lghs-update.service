@@ -1,8 +1,15 @@
 [Unit]
-Description=LGHS Version Check
+Description=LGHS Live Update
 After=network-online.target
 Wants=network-online.target
+ConditionPathExists=/etc/lghs/role
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/lghs-update
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target
