@@ -1,7 +1,7 @@
 [Unit]
 Description=LGHS Student Discovery Agent
-After=network-online.target avahi-daemon.service
-Wants=network-online.target
+After=avahi-daemon.service
+ConditionPathExists=/etc/lghs/role
 
 [Service]
 Type=oneshot
