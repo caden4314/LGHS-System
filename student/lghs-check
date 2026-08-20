@@ -33,6 +33,10 @@ if command -v code >/dev/null 2>&1;then pass "VS Code installed";else fail "VS C
 if command -v gcc >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && command -v pipx >/dev/null 2>&1;then pass "developer toolchain";else fail "developer toolchain";fi
 
 if [[ -x /usr/local/sbin/lghs-update && -x /usr/local/sbin/lghs-os-update && -x /usr/local/sbin/lghs-reconcile && -x /usr/local/sbin/lghs-access-enforce ]];then pass "live LGHS/OS/self-heal tools";else fail "live LGHS/OS/self-heal tools";fi
+if [[ -x /usr/local/sbin/lghs-netqueue && -d /var/lib/lghs/netqueue/jobs && -f /etc/systemd/system/lghs-netqueue.service && -f /etc/systemd/system/lghs-netqueue.timer ]];then pass "persistent offline network queue installed";else fail "persistent offline network queue installed";fi
+if systemctl is-enabled lghs-netqueue.timer >/dev/null 2>&1;then pass "offline network queue retry timer enabled";else fail "offline network queue retry timer enabled";fi
+if [[ -x /etc/NetworkManager/dispatcher.d/90-lghs-netqueue ]];then pass "network reconnect queue trigger installed";else fail "network reconnect queue trigger installed";fi
+if ! grep -Eq '^(After|Wants|Requires)=.*network-online\.target' /etc/systemd/system/lghs-update.service /etc/systemd/system/lghs-agent.service /etc/systemd/system/lghs-netqueue.service 2>/dev/null;then pass "LGHS services do not require network-online to start";else fail "LGHS services do not require network-online to start";fi
 if systemctl is-enabled lghs-update.timer >/dev/null 2>&1;then pass "LGHS update timer enabled";else fail "LGHS update timer enabled";fi
 if systemctl is-enabled lghs-reconcile.timer >/dev/null 2>&1;then pass "self-heal timer enabled";else fail "self-heal timer enabled";fi
 if systemctl is-enabled lghs-policy.service >/dev/null 2>&1;then pass "policy service enabled";else fail "policy service enabled";fi
