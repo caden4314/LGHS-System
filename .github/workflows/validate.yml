@@ -1,0 +1,19 @@
+name: Validate LGHS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install validators
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Shellcheck
+        run: |
+          shellcheck install.sh student/lghs-enforce student/lghs-check student/lghs-agent updater/lghs-update
+      - name: Python syntax
+        run: python3 -m py_compile controller/lghsctl
