@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Responsive launcher for the LGHS Fleet Console.
+
+The original console contains all UI/screens/actions. This launcher loads it as a
+module and moves discovery/telemetry refresh work to background workers so
+curses never blocks on Avahi/SSH before reading keyboard input.
+"""
+import curses
+import importlib.machinery
+import importlib.util
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+BASE = "/usr/local/libexec/lghs-console-base"
+
+
+def load_base():
+    loader = importlib.machinery.SourceFileLoader("lghs_console_base", BASE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+mod = load_base()
+workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lghs-fleet")
+
+
+def _harvest(state):
+    now = time.time()
+    future = state.get("_discovery_future")
+    if future is not None and future.done():
+        try:
+            state["discovered"] = future.result()
+        except Exception:
+            state["discovered"] = state.get("discovered", [])
+        state["last_discovery"] = now
+        state["_discovery_future"] = None
+
+    future = state.get("_refresh_future")
+    if future is not None and future.done():
+        try:
+            devices = future.result()
+            state["devices"] = devices
+            if devices:
+                state["selected"] = min(state.get("selected", 0), len(devices) - 1)
+        except Exception:
+            pass
+        state["last_refresh"] = now
+        state["_refresh_future"] = None
+
+
+def refresh_state_async(state, force=False):
+    """Schedule refresh work and return immediately to curses."""
+    _harvest(state)
+    now = time.time()
+
+    need_discovery = (
+        force
+        or not state.get("discovered")
+        or now - state.get("last_discovery", 0) >= mod.DISCOVERY_SECONDS
+    )
+    if need_discovery and state.get("_discovery_future") is None:
+        state["_discovery_future"] = workers.submit(mod.discover_devices)
+
+    need_refresh = force or now - state.get("last_refresh", 0) >= mod.REFRESH_SECONDS
+    if need_refresh and state.get("_refresh_future") is None:
+        discovered = list(state.get("discovered", []))
+        if discovered:
+            state["_refresh_future"] = workers.submit(mod.refresh_fleet, discovered)
+        elif state.get("_discovery_future") is None:
+            state["last_refresh"] = now
+
+    # A forced refresh remains nonblocking. Once a discovery completes, the next
+    # 50 ms UI tick schedules the corresponding SSH telemetry refresh.
+
+
+mod.refresh_state = refresh_state_async
+
+
+def responsive_app(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    # 50 ms input tick keeps arrows/function keys feeling immediate while all
+    # network work happens in the background.
+    stdscr.timeout(50)
+    state = {
+        "devices": [],
+        "discovered": [],
+        "selected": 0,
+        "last_refresh": 0.0,
+        "last_discovery": 0.0,
+        "force_refresh": True,
+        "seen_sudo": set(),
+        "_discovery_future": None,
+        "_refresh_future": None,
+    }
+    screen = "main"
+    while True:
+        refresh_state_async(state, state.pop("force_refresh", False))
+        mod.maybe_popup_new_sudo(stdscr, state)
+        if screen == "main": screen = mod.main_menu(stdscr, state)
+        elif screen == "fleet": screen = mod.fleet_screen(stdscr, state)
+        elif screen == "telemetry": screen = mod.telemetry_screen(stdscr, state)
+        elif screen == "sudo": screen = mod.sudo_screen(stdscr, state)
+        elif screen == "updates": screen = mod.update_screen(stdscr, state)
+        elif screen == "logs": screen = mod.logs_screen(stdscr, state)
+        elif screen == "controller": screen = mod.controller_screen(stdscr, state)
+        elif screen == "help": mod.help_popup(stdscr); screen = "main"
+        elif screen == "quit": break
+        else: screen = "main"
+
+
+if __name__ == "__main__":
+    mod.ensure_root()
+    mod.ensure_dirs()
+    if not os.path.exists(BASE):
+        raise SystemExit(f"Missing Fleet Console base: {BASE}")
+    try:
+        curses.wrapper(responsive_app)
+    finally:
+        workers.shutdown(wait=False, cancel_futures=True)
