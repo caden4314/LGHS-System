@@ -4,14 +4,8 @@ set -euo pipefail
 ROLE="${1:-}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Run as root: sudo ./install.sh <controller|student>" >&2
-  exit 1
-fi
-if [[ "$ROLE" != "controller" && "$ROLE" != "student" ]]; then
-  echo "Usage: sudo ./install.sh <controller|student>" >&2
-  exit 2
-fi
+if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo ./install.sh <controller|student>" >&2; exit 1; fi
+if [[ "$ROLE" != "controller" && "$ROLE" != "student" ]]; then echo "Usage: sudo ./install.sh <controller|student>" >&2; exit 2; fi
 
 install -d -m 0755 /opt/lghs /etc/lghs /var/lib/lghs /var/lib/lghs/update
 install -d -m 0700 /etc/lghs/secrets
@@ -19,24 +13,23 @@ printf '%s\n' "$ROLE" > /etc/lghs/role
 printf '%s\n' "$(cat "$ROOT_DIR/VERSION")" > /etc/lghs/version
 
 SOURCE_COMMIT="unknown"
-if [[ -f "$ROOT_DIR/.lghs-source-commit" ]]; then
-  SOURCE_COMMIT="$(tr -d '[:space:]' < "$ROOT_DIR/.lghs-source-commit")"
-elif [[ -d "$ROOT_DIR/.git" ]]; then
-  SOURCE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
-fi
+if [[ -f "$ROOT_DIR/.lghs-source-commit" ]]; then SOURCE_COMMIT="$(tr -d '[:space:]' < "$ROOT_DIR/.lghs-source-commit")";
+elif [[ -d "$ROOT_DIR/.git" ]]; then SOURCE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"; fi
 if [[ -n "$SOURCE_COMMIT" && "$SOURCE_COMMIT" != "unknown" ]]; then
   printf '%s\n' "$SOURCE_COMMIT" > /etc/lghs/source-commit
   printf '%s\n' "$SOURCE_COMMIT" > /var/lib/lghs/update/current-commit
 fi
 
-# Common live-management components. All are reinstalled on every LGHS update,
-# so functionality can evolve without reflashing the SD card.
+# Common live-management components. Every LGHS update reinstalls these files,
+# so system changes do not require a reflash.
 install -m 0755 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
 install -m 0755 "$ROOT_DIR/updater/lghs-os-update" /usr/local/sbin/lghs-os-update
 install -m 0755 "$ROOT_DIR/updater/lghs-autologin-apply" /usr/local/sbin/lghs-autologin-apply
 install -m 0755 "$ROOT_DIR/updater/lghs-reconcile" /usr/local/sbin/lghs-reconcile
+install -m 0755 "$ROOT_DIR/updater/lghs-access-enforce" /usr/local/sbin/lghs-access-enforce
 install -m 0755 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
 install -m 0755 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
+install -m 0755 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
 install -m 0644 "$ROOT_DIR/systemd/lghs-firstboot-provision.service" /etc/systemd/system/lghs-firstboot-provision.service
@@ -47,17 +40,10 @@ install -m 0440 "$ROOT_DIR/policies/sudoers/89-lghs-audit" /etc/sudoers.d/89-lgh
 COMMON_PKGS=(git curl python3 openssh-client sudo logrotate)
 if ! command -v flock >/dev/null 2>&1; then COMMON_PKGS+=(util-linux); fi
 MISSING_PKGS=()
-for pkg in "${COMMON_PKGS[@]}"; do
-  dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg")
-done
-if (( ${#MISSING_PKGS[@]} )); then
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"
-fi
+for pkg in "${COMMON_PKGS[@]}"; do dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg"); done
+if (( ${#MISSING_PKGS[@]} )); then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"; fi
 
-if ! id cs_admin >/dev/null 2>&1; then
-  useradd -m -s /bin/bash cs_admin
-fi
+if ! id cs_admin >/dev/null 2>&1; then useradd -m -s /bin/bash cs_admin; fi
 usermod -aG sudo cs_admin
 install -d -m 0700 -o cs_admin -g cs_admin /home/cs_admin/.ssh
 cat > /etc/sudoers.d/91-lghs-admin <<'EOF'
@@ -87,26 +73,15 @@ if [[ "$ROLE" == "controller" ]]; then
 
   CTRL_PKGS=(avahi-daemon avahi-utils)
   MISSING_PKGS=()
-  for pkg in "${CTRL_PKGS[@]}"; do
-    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg")
-  done
-  if (( ${#MISSING_PKGS[@]} )); then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"
-  fi
+  for pkg in "${CTRL_PKGS[@]}"; do dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg"); done
+  if (( ${#MISSING_PKGS[@]} )); then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"; fi
 
   KEY_FILE=/etc/lghs/secrets/controller_ed25519
-  if [[ ! -f "$KEY_FILE" ]]; then
-    ssh-keygen -q -t ed25519 -N '' -C 'LGHS fleet controller' -f "$KEY_FILE"
-  fi
-  chmod 0600 "$KEY_FILE"
-  chmod 0644 "$KEY_FILE.pub"
+  if [[ ! -f "$KEY_FILE" ]]; then ssh-keygen -q -t ed25519 -N '' -C 'LGHS fleet controller' -f "$KEY_FILE"; fi
+  chmod 0600 "$KEY_FILE"; chmod 0644 "$KEY_FILE.pub"
   install -m 0644 "$KEY_FILE.pub" /etc/lghs/controller_ed25519.pub
-  install -d -m 0755 /var/lib/lghs
-  touch /var/lib/lghs/ssh_known_hosts
-  chmod 0644 /var/lib/lghs/ssh_known_hosts
+  touch /var/lib/lghs/ssh_known_hosts; chmod 0644 /var/lib/lghs/ssh_known_hosts
   install -d -m 0750 -o root -g adm /var/log/lghs-fleet
-
   cat > /etc/logrotate.d/lghs-fleet <<'EOF'
 /var/log/lghs-fleet/*.log /var/log/lghs-fleet/*.jsonl /var/log/lghs-fleet/*/*.log /var/log/lghs-fleet/*/*.jsonl {
     weekly
@@ -129,7 +104,6 @@ else
   install -m 0755 "$ROOT_DIR/student/lghs-approved-exec" /usr/local/sbin/lghs-approved-exec
   install -m 0755 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
   install -m 0755 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
-  install -m 0755 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
   install -m 0755 "$ROOT_DIR/student/sudo" /usr/local/bin/sudo
   install -d -m 0700 /var/lib/lghs/sudo-requests
   touch /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log /var/log/lghs-update.log /var/log/lghs-os-update.log
@@ -139,19 +113,12 @@ else
   install -m 0440 "$ROOT_DIR/policies/sudoers/90-lghs-student" /etc/sudoers.d/90-lghs-student
   install -m 0644 "$ROOT_DIR/policies/polkit/49-lghs-network.rules" /etc/polkit-1/rules.d/49-lghs-network.rules
 
-  STUDENT_PKGS=(openssh-server network-manager policykit-1 avahi-daemon avahi-utils python3-pip python3-venv python3-dev pipx git build-essential)
+  STUDENT_PKGS=(openssh-server network-manager policykit-1 avahi-daemon avahi-utils)
   MISSING_PKGS=()
-  for pkg in "${STUDENT_PKGS[@]}"; do
-    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg")
-  done
-  if (( ${#MISSING_PKGS[@]} )); then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"
-  fi
+  for pkg in "${STUDENT_PKGS[@]}"; do dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg"); done
+  if (( ${#MISSING_PKGS[@]} )); then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"; fi
 
-  if [[ -f /etc/lghs/controller_ed25519.pub ]]; then
-    install -m 0600 -o cs_admin -g cs_admin /etc/lghs/controller_ed25519.pub /home/cs_admin/.ssh/authorized_keys
-  fi
+  if [[ -f /etc/lghs/controller_ed25519.pub ]]; then install -m 0600 -o cs_admin -g cs_admin /etc/lghs/controller_ed25519.pub /home/cs_admin/.ssh/authorized_keys; fi
 
   install -d -m 0755 /etc/ssh/sshd_config.d
   cat > /etc/ssh/sshd_config.d/90-lghs-fleet.conf <<'EOF'
@@ -168,39 +135,30 @@ Match User cs_admin
 EOF
   chmod 0644 /etc/ssh/sshd_config.d/90-lghs-fleet.conf
   sshd -t
-
   install -m 0644 "$ROOT_DIR/systemd/lghs-policy.service" /etc/systemd/system/lghs-policy.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
 
-  if [[ ! -f /usr/local/lib/lghs/libnetman.so.hardened ]]; then
-    /usr/local/sbin/lghs-install-network-ui
-  else
-    /usr/local/sbin/lghs-network-ui-apply
-  fi
-  /usr/local/sbin/lghs-dev-setup || true
+  if [[ ! -f /usr/local/lib/lghs/libnetman.so.hardened ]]; then /usr/local/sbin/lghs-install-network-ui; else /usr/local/sbin/lghs-network-ui-apply; fi
 fi
 
-# Role-aware desktop autologin is re-applied on every install/update so distro
-# changes to LightDM/labwc do not silently revert classroom behavior.
+# VS Code/Python workspace is maintained for every classroom account on both
+# Student and Controller systems.
+/usr/local/sbin/lghs-dev-setup
 /usr/local/sbin/lghs-autologin-apply || true
 
 visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
 systemctl enable lghs-update.service lghs-update.timer lghs-firstboot-provision.service lghs-reconcile.timer avahi-daemon.service
-if [[ "$ROLE" == "student" ]]; then
-  systemctl enable lghs-policy.service lghs-agent.service ssh
-else
-  systemctl enable lghs-audit-sync.timer
-fi
+if [[ "$ROLE" == "student" ]]; then systemctl enable lghs-policy.service lghs-agent.service ssh; else systemctl enable lghs-audit-sync.timer; fi
+
+# Apply filesystem/group/PolicyKit restrictions last so the installer itself can
+# lay down files freely, then leave the management plane locked down.
+/usr/local/sbin/lghs-access-enforce
 
 if systemctl is-system-running --quiet 2>/dev/null || systemctl is-system-running 2>/dev/null | grep -Eq 'running|degraded'; then
   systemctl try-restart avahi-daemon.service || true
   systemctl try-restart lghs-reconcile.timer || true
-  if [[ "$ROLE" == "student" ]]; then
-    systemctl try-restart lghs-policy.service lghs-agent.service ssh.service || true
-  else
-    systemctl try-restart lghs-audit-sync.timer || true
-  fi
+  if [[ "$ROLE" == "student" ]]; then systemctl try-restart lghs-policy.service lghs-agent.service ssh.service || true; else systemctl try-restart lghs-audit-sync.timer || true; fi
 fi
 
 echo "LGHS $ROLE installation completed."
