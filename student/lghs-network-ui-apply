@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STUDENT_USER="lg_cs_cont"
+HARDENED_LIB="/usr/local/lib/lghs/libnetman.so.hardened"
+BACKUP_DIR="/usr/local/lib/lghs-backups"
+EDITOR="/usr/bin/lp-connection-editor"
+EDITOR_REAL="/usr/lib/lghs/lp-connection-editor.real"
+
+log() {
+    logger -t LGHS-NETWORK-UI "$*" 2>/dev/null || true
+    printf '[LGHS network UI] %s\n' "$*"
+}
+
+[[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
+install -d -m 0755 /usr/local/lib/lghs "$BACKUP_DIR" /usr/lib/lghs
+
+# Re-apply the patched wf-panel-pi network plugin if a package update replaced it.
+if [[ -f "$HARDENED_LIB" ]]; then
+    NETMAN_LIB="$(dpkg -L wfplug-netman 2>/dev/null | grep -E '/wf-panel-pi/libnetman\.so$' | head -n1 || true)"
+    if [[ -z "$NETMAN_LIB" ]]; then
+        NETMAN_LIB="$(find /usr/lib -type f -path '*/wf-panel-pi/libnetman.so' -print -quit 2>/dev/null || true)"
+    fi
+    if [[ -n "$NETMAN_LIB" && -f "$NETMAN_LIB" ]]; then
+        if [[ ! -f "$BACKUP_DIR/libnetman.so.stock" ]]; then
+            cp -a "$NETMAN_LIB" "$BACKUP_DIR/libnetman.so.stock"
+        fi
+        if ! cmp -s "$HARDENED_LIB" "$NETMAN_LIB"; then
+            install -m 0644 "$HARDENED_LIB" "$NETMAN_LIB"
+            log "Restored hardened wf-panel-pi network plugin."
+        fi
+    else
+        log "wf-panel-pi libnetman.so not found; UI plugin enforcement skipped."
+    fi
+fi
+
+# Defense in depth: even if a menu/launcher reaches the advanced editor,
+# lg_cs_cont is denied while cs_admin/root retain normal access.
+if [[ -x "$EDITOR" && ! -L "$EDITOR" ]]; then
+    if ! grep -q 'LGHS_NETWORK_EDITOR_GUARD' "$EDITOR" 2>/dev/null; then
+        if [[ ! -e "$EDITOR_REAL" ]]; then
+            mv "$EDITOR" "$EDITOR_REAL"
+        else
+            rm -f "$EDITOR"
+        fi
+        cat > "$EDITOR" <<'EOF'
+#!/bin/sh
+# LGHS_NETWORK_EDITOR_GUARD
+if [ "$(id -un 2>/dev/null)" = "lg_cs_cont" ]; then
+    command -v notify-send >/dev/null 2>&1 && notify-send "Network settings" "Advanced connection editing is managed by LGHS." >/dev/null 2>&1 || true
+    exit 126
+fi
+exec /usr/lib/lghs/lp-connection-editor.real "$@"
+EOF
+        chmod 0755 "$EDITOR"
+        chown root:root "$EDITOR"
+        log "Installed advanced network editor guard for $STUDENT_USER."
+    fi
+fi
+
+# Saved NetworkManager profiles remain root-only so PSKs cannot be read by students.
+if [[ -d /etc/NetworkManager/system-connections ]]; then
+    find /etc/NetworkManager/system-connections -maxdepth 1 -type f \
+        -exec chown root:root {} + -exec chmod 0600 {} +
+fi
