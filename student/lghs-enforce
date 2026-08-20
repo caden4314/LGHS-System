@@ -50,5 +50,6 @@ chmod 0644 /etc/logrotate.d/lghs-sudo
 NM=/etc/NetworkManager/system-connections
 if [[ -d "$NM" ]]; then find "$NM" -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 0600 {} +;fi
 if [[ -x /usr/local/sbin/lghs-network-ui-apply ]]; then /usr/local/sbin/lghs-network-ui-apply;fi
+if [[ -x /usr/local/sbin/lghs-access-enforce ]]; then /usr/local/sbin/lghs-access-enforce;fi
 visudo -cf /etc/sudoers >/dev/null
 log "Policy enforcement complete"
