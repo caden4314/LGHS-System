@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Background LGHS fleet desktop notifications for the Control Pi."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+BASE = "/usr/local/libexec/lghs-console-base"
+STATE = Path("/var/lib/lghs/fleet-notify-state.json")
+UPDATE_LOG = Path("/var/log/lghs-update.log")
+OS_UPDATE_LOG = Path("/var/log/lghs-os-update.log")
+POLL_SECONDS = 5
+
+
+def load_base():
+    loader = importlib.machinery.SourceFileLoader("lghs_console_notify_base", BASE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+mod = load_base()
+
+
+def notify(title, body, urgency="normal"):
+    if not shutil.which("notify-send"):
+        return
+    try:
+        user = pwd.getpwnam("cs_admin")
+    except KeyError:
+        return
+    bus = f"/run/user/{user.pw_uid}/bus"
+    if not os.path.exists(bus):
+        return
+    envarg = f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}"
+    try:
+        subprocess.run(
+            ["runuser", "-u", "cs_admin", "--", "env", envarg,
+             "notify-send", "-a", "LGHS Fleet", "-u", urgency, title, body],
+            timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"initialized": False, "devices": {}, "sudo_seen": [], "logs": {}}
+
+
+def save_state(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, STATE)
+
+
+def newest_log_line(path):
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return lines[-1] if lines else ""
+    except Exception:
+        return ""
+
+
+def main():
+    state = load_state()
+    while True:
+        try:
+            discovered = mod.discover_devices()
+            devices = mod.refresh_fleet(discovered)
+            current = {}
+            seen_now = set(state.get("sudo_seen", []))
+
+            for d in devices:
+                addr = d.get("addr", "?")
+                host = d.get("hostname") or d.get("host") or addr
+                online = bool(d.get("online"))
+                current[addr] = {"host": host, "online": online}
+
+                previous = state.get("devices", {}).get(addr)
+                if state.get("initialized") and previous is not None and previous.get("online") != online:
+                    if online:
+                        notify("LGHS Pi online", f"{host} ({addr}) is back online.")
+                    else:
+                        notify("LGHS Pi offline", f"{host} ({addr}) is no longer responding.", "critical")
+
+                for req in d.get("sudo_requests", []):
+                    rid = str(req.get("id", ""))
+                    key = f"{addr}:{rid}"
+                    if not rid:
+                        continue
+                    if state.get("initialized") and key not in seen_now:
+                        cmd = req.get("command", "sudo request")
+                        notify("LGHS sudo request", f"{host}: {cmd}", "critical")
+                    seen_now.add(key)
+
+            # Keep only a bounded history of request IDs.
+            state["sudo_seen"] = list(seen_now)[-500:]
+            state["devices"] = current
+
+            for name, path in (("LGHS update", UPDATE_LOG), ("Raspberry Pi OS update", OS_UPDATE_LOG)):
+                line = newest_log_line(path)
+                old = state.get("logs", {}).get(name, "")
+                if state.get("initialized") and line and line != old:
+                    urgency = "critical" if "fail" in line.lower() or "error" in line.lower() else "normal"
+                    notify(name, line, urgency)
+                state.setdefault("logs", {})[name] = line
+
+            state["initialized"] = True
+            save_state(state)
+        except Exception as exc:
+            # Notification failures must never affect fleet management.
+            try:
+                subprocess.run(["logger", "-t", "LGHS-FLEET-NOTIFY", str(exc)], check=False)
+            except Exception:
+                pass
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
