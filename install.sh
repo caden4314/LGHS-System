@@ -29,7 +29,6 @@ if [[ -n "$SOURCE_COMMIT" && "$SOURCE_COMMIT" != "unknown" ]]; then
   printf '%s\n' "$SOURCE_COMMIT" > /var/lib/lghs/update/current-commit
 fi
 
-# Common management and live-update components.
 install -m 0755 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
 install -m 0755 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
@@ -46,12 +45,13 @@ if (( ${#MISSING_PKGS[@]} )); then
   DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"
 fi
 
-# Dedicated key-only fleet administration account. Password login is locked.
+# Dedicated fleet administrator. The account is unlocked so OpenSSH permits
+# public-key login, but password and keyboard-interactive SSH are disabled for it.
 if ! id cs_admin >/dev/null 2>&1; then
   useradd -m -s /bin/bash cs_admin
 fi
 usermod -aG sudo cs_admin
-passwd -l cs_admin >/dev/null 2>&1 || true
+passwd -d cs_admin >/dev/null 2>&1 || true
 install -d -m 0700 -o cs_admin -g cs_admin /home/cs_admin/.ssh
 cat > /etc/sudoers.d/91-lghs-admin <<'EOF'
 cs_admin ALL=(ALL) NOPASSWD: ALL
@@ -73,8 +73,6 @@ if [[ "$ROLE" == "controller" ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"
   fi
 
-  # The image builder injects the fleet private key. Manual controller installs
-  # create one locally. The private key never belongs in Git.
   KEY_FILE=/etc/lghs/secrets/controller_ed25519
   if [[ ! -f "$KEY_FILE" ]]; then
     ssh-keygen -q -t ed25519 -N '' -C 'LGHS fleet controller' -f "$KEY_FILE"
@@ -82,6 +80,9 @@ if [[ "$ROLE" == "controller" ]]; then
   chmod 0600 "$KEY_FILE"
   chmod 0644 "$KEY_FILE.pub"
   install -m 0644 "$KEY_FILE.pub" /etc/lghs/controller_ed25519.pub
+  install -d -m 0755 /var/lib/lghs
+  touch /var/lib/lghs/ssh_known_hosts
+  chmod 0644 /var/lib/lghs/ssh_known_hosts
 else
   install -m 0755 "$ROOT_DIR/student/lghs-enforce" /usr/local/sbin/lghs-enforce
   install -m 0755 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
@@ -100,10 +101,26 @@ else
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"
   fi
 
-  # Student images receive only the controller public key.
   if [[ -f /etc/lghs/controller_ed25519.pub ]]; then
     install -m 0600 -o cs_admin -g cs_admin /etc/lghs/controller_ed25519.pub /home/cs_admin/.ssh/authorized_keys
   fi
+
+  # Fleet management SSH is public-key only and does not permit forwarding.
+  install -d -m 0755 /etc/ssh/sshd_config.d
+  cat > /etc/ssh/sshd_config.d/90-lghs-fleet.conf <<'EOF'
+Match User cs_admin
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PubkeyAuthentication yes
+    X11Forwarding no
+    AllowAgentForwarding no
+    AllowTcpForwarding no
+    PermitTunnel no
+    GatewayPorts no
+EOF
+  chmod 0644 /etc/ssh/sshd_config.d/90-lghs-fleet.conf
+  sshd -t
 
   install -m 0644 "$ROOT_DIR/systemd/lghs-policy.service" /etc/systemd/system/lghs-policy.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
