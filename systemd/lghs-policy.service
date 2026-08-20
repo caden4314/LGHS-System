@@ -1,0 +1,12 @@
+[Unit]
+Description=LGHS Classroom Security Policy
+After=local-fs.target
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lghs-enforce
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
