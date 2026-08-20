@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
+ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
+STUDENT=lg_cs_cont
+ADMIN=cs_admin
+ADMIN_GROUP=lghs-admin
+
+getent group "$ADMIN_GROUP" >/dev/null 2>&1 || groupadd --system "$ADMIN_GROUP"
+if id "$ADMIN" >/dev/null 2>&1; then usermod -aG "$ADMIN_GROUP" "$ADMIN"; fi
+
+# LGHS management/config/state is readable by root and the dedicated admin only.
+for dir in /etc/lghs /opt/lghs /var/lib/lghs; do
+  [[ -e "$dir" ]] || continue
+  chown root:"$ADMIN_GROUP" "$dir"
+  chmod 0750 "$dir"
+done
+[[ -d /etc/lghs/secrets ]] && { chown root:root /etc/lghs/secrets; chmod 0700 /etc/lghs/secrets; }
+[[ -d /var/lib/lghs/sudo-requests ]] && { chown root:root /var/lib/lghs/sudo-requests; chmod 0700 /var/lib/lghs/sudo-requests; }
+
+# Files used by LGHS services are not student-readable. Root services can still
+# consume them, while cs_admin can inspect non-secret configuration if needed.
+find /etc/lghs -maxdepth 1 -type f -exec chown root:"$ADMIN_GROUP" {} + -exec chmod 0640 {} + 2>/dev/null || true
+find /var/lib/lghs -maxdepth 1 -type f -exec chown root:"$ADMIN_GROUP" {} + -exec chmod 0640 {} + 2>/dev/null || true
+
+# Management commands are not directly executable by the student. The one
+# public sudo wrapper invokes its broker via real sudo as root, so broker files
+# can remain admin-only here.
+for f in /usr/local/sbin/lghs-*; do
+  [[ -e "$f" ]] || continue
+  chown root:"$ADMIN_GROUP" "$f"
+  chmod 0750 "$f"
+done
+
+# Student-facing launchers only.
+[[ -e /usr/local/bin/sudo ]] && { chown root:root /usr/local/bin/sudo; chmod 0755 /usr/local/bin/sudo; }
+[[ -e /usr/local/bin/lghs-vscode ]] && { chown root:root /usr/local/bin/lghs-vscode; chmod 0755 /usr/local/bin/lghs-vscode; }
+
+# A Student Pi must never retain controller-only management clients/collectors
+# from an old image or a role change.
+if [[ "$ROLE" == "student" ]]; then
+  rm -f /usr/local/sbin/lghsctl /usr/local/sbin/lghs-console /usr/local/sbin/lghs-audit-sync
+  systemctl disable --now lghs-audit-sync.timer lghs-audit-sync.service >/dev/null 2>&1 || true
+
+  if id "$STUDENT" >/dev/null 2>&1; then
+    for grp in sudo adm systemd-journal "$ADMIN_GROUP"; do
+      if id -nG "$STUDENT" | tr ' ' '\n' | grep -qx "$grp"; then
+        gpasswd -d "$STUDENT" "$grp" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
+fi
+
+# Students may inspect normal desktop state but cannot use PolicyKit to manage
+# LGHS/system services or change unit definitions. The managed sudo workflow is
+# the only supported path for privileged classroom commands.
+install -d -m 0755 /etc/polkit-1/rules.d
+cat > /etc/polkit-1/rules.d/48-lghs-service-management.rules <<'EOF'
+polkit.addRule(function(action, subject) {
+    if (subject.user == "lg_cs_cont") {
+        if (action.id == "org.freedesktop.systemd1.manage-units" ||
+            action.id == "org.freedesktop.systemd1.manage-unit-files" ||
+            action.id == "org.freedesktop.systemd1.reload-daemon") {
+            return polkit.Result.NO;
+        }
+    }
+});
+EOF
+chmod 0644 /etc/polkit-1/rules.d/48-lghs-service-management.rules
+chown root:root /etc/polkit-1/rules.d/48-lghs-service-management.rules
+
+# Audit/log files stay outside the student's supplementary groups.
+for f in /var/log/sudo.log /var/log/lghs-sudo-audit.jsonl /var/log/lghs-update.log /var/log/lghs-os-update.log; do
+  [[ -e "$f" ]] || continue
+  chown root:adm "$f" 2>/dev/null || chown root:root "$f"
+  chmod 0640 "$f"
+done
+
+exit 0
