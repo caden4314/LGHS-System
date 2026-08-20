@@ -8,7 +8,7 @@ if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo ./install.sh <controller|stud
 if [[ "$ROLE" != "controller" && "$ROLE" != "student" ]]; then echo "Usage: sudo ./install.sh <controller|student>" >&2; exit 2; fi
 
 install -d -m 0755 /opt/lghs /etc/lghs /var/lib/lghs /var/lib/lghs/update
-install -d -m 0700 /etc/lghs/secrets
+install -d -m 0700 /etc/lghs/secrets /var/lib/lghs/netqueue /var/lib/lghs/netqueue/jobs
 printf '%s\n' "$ROLE" > /etc/lghs/role
 printf '%s\n' "$(cat "$ROOT_DIR/VERSION")" > /etc/lghs/version
 
@@ -25,6 +25,7 @@ install -m 0755 "$ROOT_DIR/updater/lghs-os-update" /usr/local/sbin/lghs-os-updat
 install -m 0755 "$ROOT_DIR/updater/lghs-autologin-apply" /usr/local/sbin/lghs-autologin-apply
 install -m 0755 "$ROOT_DIR/updater/lghs-reconcile" /usr/local/sbin/lghs-reconcile
 install -m 0755 "$ROOT_DIR/updater/lghs-access-enforce" /usr/local/sbin/lghs-access-enforce
+install -m 0755 "$ROOT_DIR/updater/lghs-netqueue" /usr/local/sbin/lghs-netqueue
 install -m 0755 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
 install -m 0755 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
 install -m 0755 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
@@ -33,7 +34,15 @@ install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-u
 install -m 0644 "$ROOT_DIR/systemd/lghs-firstboot-provision.service" /etc/systemd/system/lghs-firstboot-provision.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-reconcile.service" /etc/systemd/system/lghs-reconcile.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-reconcile.timer" /etc/systemd/system/lghs-reconcile.timer
+install -m 0644 "$ROOT_DIR/systemd/lghs-netqueue.service" /etc/systemd/system/lghs-netqueue.service
+install -m 0644 "$ROOT_DIR/systemd/lghs-netqueue.timer" /etc/systemd/system/lghs-netqueue.timer
+install -d -m 0755 /etc/NetworkManager/dispatcher.d
+install -m 0755 "$ROOT_DIR/systemd/90-lghs-netqueue" /etc/NetworkManager/dispatcher.d/90-lghs-netqueue
 install -m 0440 "$ROOT_DIR/policies/sudoers/89-lghs-audit" /etc/sudoers.d/89-lghs-audit
+
+touch /var/log/lghs-netqueue.log
+chown root:adm /var/log/lghs-netqueue.log 2>/dev/null || true
+chmod 0640 /var/log/lghs-netqueue.log
 
 COMMON_PKGS=(git curl python3 openssh-client sudo logrotate)
 if ! command -v flock >/dev/null 2>&1; then COMMON_PKGS+=(util-linux); fi
@@ -149,7 +158,7 @@ fi
 
 visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
-systemctl enable lghs-update.service lghs-update.timer lghs-firstboot-provision.service lghs-reconcile.timer avahi-daemon.service
+systemctl enable lghs-update.service lghs-update.timer lghs-firstboot-provision.service lghs-reconcile.timer lghs-netqueue.timer avahi-daemon.service
 if [[ "$ROLE" == "student" ]]; then systemctl enable lghs-policy.service lghs-agent.service ssh; else systemctl enable lghs-audit-sync.timer; fi
 
 /usr/local/sbin/lghs-access-enforce
@@ -157,6 +166,8 @@ if [[ "$ROLE" == "student" ]]; then systemctl enable lghs-policy.service lghs-ag
 if systemctl is-system-running --quiet 2>/dev/null || systemctl is-system-running 2>/dev/null | grep -Eq 'running|degraded'; then
   systemctl try-restart avahi-daemon.service || true
   systemctl try-restart lghs-reconcile.timer || true
+  systemctl try-restart lghs-netqueue.timer || true
+  systemctl start --no-block lghs-netqueue.service >/dev/null 2>&1 || true
   if [[ "$ROLE" == "student" ]]; then systemctl try-restart lghs-policy.service lghs-agent.service ssh.service || true; else systemctl try-restart lghs-audit-sync.timer || true; fi
 fi
 
