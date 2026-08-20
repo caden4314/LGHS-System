@@ -19,6 +19,17 @@ install -d -m 0700 /etc/lghs/secrets
 printf '%s\n' "$ROLE" > /etc/lghs/role
 printf '%s\n' "$(cat "$ROOT_DIR/VERSION")" > /etc/lghs/version
 
+SOURCE_COMMIT="unknown"
+if [[ -f "$ROOT_DIR/.lghs-source-commit" ]]; then
+  SOURCE_COMMIT="$(tr -d '[:space:]' < "$ROOT_DIR/.lghs-source-commit")"
+elif [[ -d "$ROOT_DIR/.git" ]]; then
+  SOURCE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+fi
+if [[ -n "$SOURCE_COMMIT" && "$SOURCE_COMMIT" != "unknown" ]]; then
+  printf '%s\n' "$SOURCE_COMMIT" > /etc/lghs/source-commit
+  printf '%s\n' "$SOURCE_COMMIT" > /var/lib/lghs/update/current-commit
+fi
+
 # Common live-update components for both controller and student systems.
 install -m 0755 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
