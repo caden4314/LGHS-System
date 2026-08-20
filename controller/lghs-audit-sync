@@ -88,10 +88,7 @@ def append_lines(path, text, prefix=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a', encoding='utf-8') as f:
         for line in text.splitlines():
-            if prefix:
-                f.write(f'[{prefix}] {line}\n')
-            else:
-                f.write(line + '\n')
+            f.write((f'[{prefix}] ' if prefix else '') + line + '\n')
     os.chmod(path, 0o640)
     try:
         import grp
@@ -103,37 +100,32 @@ def append_lines(path, text, prefix=None):
 def sync_kind(state, dev, kind):
     addr, did = dev['addr'], dev['device_id']
     key = f'{did}:{kind}'
-    old = state.get(key, {'offset': 0, 'head_sha256': ''})
+    old = state.get(key, {'offset': 0, 'inode': 0})
     meta_p = remote(addr, 'meta', kind)
     if meta_p.returncode != 0:
         return
     try:
         meta = json.loads(meta_p.stdout)
         size = int(meta.get('size', 0))
-        head = str(meta.get('head_sha256', ''))
+        inode = int(meta.get('inode', 0))
     except Exception:
         return
 
     offset = int(old.get('offset', 0))
-    # Rotation/truncation detection: if the file shrank or its beginning changed,
-    # restart from byte zero so the controller never silently skips a new file.
-    if size < offset or (old.get('head_sha256') and head and old.get('head_sha256') != head):
+    if size < offset or (old.get('inode') and inode and int(old.get('inode')) != inode):
         offset = 0
     if size <= offset:
-        state[key] = {'offset': size, 'head_sha256': head}
+        state[key] = {'offset': size, 'inode': inode}
         return
 
     read_p = remote(addr, 'read', kind, str(offset))
     if read_p.returncode != 0:
         return
     text = read_p.stdout or ''
-    per_device_name = {
-        'sudo': 'sudo.log', 'audit': 'audit.jsonl',
-        'update': 'update.log', 'os-update': 'os-update.log'
-    }[kind]
-    append_lines(BASE / did / per_device_name, text)
-    append_lines(BASE / per_device_name, text, did)
-    state[key] = {'offset': size, 'head_sha256': head}
+    name = {'sudo':'sudo.log','audit':'audit.jsonl','update':'update.log','os-update':'os-update.log'}[kind]
+    append_lines(BASE / did / name, text)
+    append_lines(BASE / name, text, did)
+    state[key] = {'offset': size, 'inode': inode}
 
 
 def main():
@@ -142,7 +134,7 @@ def main():
     ensure_dirs()
     state = load_state()
     for dev in discover():
-        # Only already-enrolled machines are collected. Do not silently TOFU here.
+        # Collection only starts after explicit host-key enrollment.
         if run(['ssh-keygen', '-F', dev['addr'], '-f', KNOWN_HOSTS]).returncode != 0:
             continue
         dev['device_id'] = device_id(dev['addr'])
