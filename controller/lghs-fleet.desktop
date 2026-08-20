@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=LGHS Fleet Control
+Comment=Open the LGHS classroom fleet management console
+Exec=/usr/bin/sudo /usr/local/sbin/lghs-console
+Icon=utilities-system-monitor
+Terminal=true
+Categories=System;Monitor;
+StartupNotify=true
