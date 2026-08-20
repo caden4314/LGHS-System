@@ -1,4 +1,11 @@
 Defaults:lg_cs_cont timestamp_timeout=0
+
+# Students do not receive arbitrary sudo. These root-owned helpers only create,
+# query, and execute an exact one-time command after controller approval.
+lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-broker *
+lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-approved-exec *
+
+# Power controls remain directly available with the student's own password.
 lg_cs_cont ALL=(root) PASSWD: /usr/sbin/reboot
 lg_cs_cont ALL=(root) PASSWD: /usr/sbin/poweroff
 lg_cs_cont ALL=(root) PASSWD: /usr/sbin/shutdown
