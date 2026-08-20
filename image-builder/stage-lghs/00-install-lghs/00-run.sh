@@ -35,17 +35,26 @@ if [[ ! -f "${SOURCE_DIR}/install.sh" ]]; then
     exit 1
 fi
 
-rm -rf "${ROOTFS_DIR}/tmp/LGHS-System"
-mkdir -p "${ROOTFS_DIR}/tmp/LGHS-System"
-cp -a "${SOURCE_DIR}/." "${ROOTFS_DIR}/tmp/LGHS-System/"
-chmod 0755 "${ROOTFS_DIR}/tmp/LGHS-System/install.sh"
+# Do not use /tmp for the staged source: pi-gen's chroot preparation can mount
+# or clean temporary directories. /opt remains visible inside on_chroot.
+CHROOT_SOURCE="/opt/lghs-build-source"
+rm -rf "${ROOTFS_DIR}${CHROOT_SOURCE}"
+mkdir -p "${ROOTFS_DIR}${CHROOT_SOURCE}"
+cp -a "${SOURCE_DIR}/." "${ROOTFS_DIR}${CHROOT_SOURCE}/"
+chmod 0755 "${ROOTFS_DIR}${CHROOT_SOURCE}/install.sh"
+
+if [[ ! -f "${ROOTFS_DIR}${CHROOT_SOURCE}/install.sh" ]]; then
+    echo "LGHS: failed to stage install.sh into image rootfs." >&2
+    exit 1
+fi
 
 install -d -m 0755 "${ROOTFS_DIR}/etc/lghs"
 printf '%s\n' "${IMAGE_HOSTNAME}" > "${ROOTFS_DIR}/etc/lghs/build-hostname"
 printf '%s\n' "${LGHS_ROLE}" > "${ROOTFS_DIR}/etc/lghs/build-role"
 
 on_chroot <<EOF
-cd /tmp/LGHS-System
+set -e
+cd ${CHROOT_SOURCE}
 /bin/bash ./install.sh ${LGHS_ROLE}
 EOF
 
@@ -147,7 +156,7 @@ if id lg_cs_cont >/dev/null 2>&1 && command -v code >/dev/null 2>&1; then
 fi
 EOF
 
-rm -rf "${ROOTFS_DIR}/tmp/LGHS-System"
+rm -rf "${ROOTFS_DIR}${CHROOT_SOURCE}"
 
 echo "LGHS: ${LGHS_ROLE} role installed for ${IMAGE_HOSTNAME}."
 echo "LGHS: VS Code opens ~/CS2 with hello.py and classroom folders ready."
