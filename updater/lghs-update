@@ -1,29 +1,79 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_URL="${LGHS_UPDATE_BASE_URL:-}"
+REPO_URL="${LGHS_REPO_URL:-https://github.com/caden4314/LGHS-System.git}"
+BRANCH="${LGHS_UPDATE_BRANCH:-main}"
+CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
 STATE_DIR=/var/lib/lghs/update
-CURRENT="$(cat /etc/lghs/version 2>/dev/null || echo unknown)"
+ROLE="$(cat /etc/lghs/role 2>/dev/null || true)"
+LOCK_FILE=/run/lock/lghs-update.lock
 
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
-[[ -n "$BASE_URL" ]] || { echo "LGHS_UPDATE_BASE_URL is not configured; no update attempted."; exit 0; }
+[[ "$ROLE" == "controller" || "$ROLE" == "student" ]] || { echo "Invalid or missing LGHS role" >&2; exit 1; }
 
-install -d -m 0755 "$STATE_DIR"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+install -d -m 0755 "$STATE_DIR" /opt/lghs
+exec 9>"$LOCK_FILE"
+flock -n 9 || { echo "Another LGHS update is already running."; exit 0; }
 
-curl -fsS "$BASE_URL/manifest.txt" -o "$TMP/manifest.txt"
-NEW="$(sed -n 's/^version=//p' "$TMP/manifest.txt" | head -n1)"
-SHA="$(sed -n 's/^sha256=//p' "$TMP/manifest.txt" | head -n1)"
-FILE="$(sed -n 's/^file=//p' "$TMP/manifest.txt" | head -n1)"
-
-[[ -n "$NEW" && -n "$SHA" && -n "$FILE" ]] || { echo "Invalid update manifest" >&2; exit 1; }
-if [[ "$NEW" == "$CURRENT" ]]; then
-  echo "LGHS is already at $CURRENT"
-  exit 0
+if [[ ! -d "$CHECKOUT/.git" ]]; then
+    echo "LGHS updater: creating local checkout..."
+    rm -rf "$CHECKOUT"
+    git clone --depth 2 --branch "$BRANCH" "$REPO_URL" "$CHECKOUT"
 fi
 
-curl -fsS "$BASE_URL/$FILE" -o "$TMP/$FILE"
-printf '%s  %s\n' "$SHA" "$TMP/$FILE" | sha256sum -c -
+cd "$CHECKOUT"
+git remote set-url origin "$REPO_URL"
+git fetch --prune origin "$BRANCH"
 
-echo "Verified LGHS update $CURRENT -> $NEW. Installation hook is intentionally disabled until the staged rollback path is completed."
+CURRENT_COMMIT="$(git rev-parse HEAD)"
+TARGET_COMMIT="$(git rev-parse "origin/$BRANCH")"
+
+if [[ "$CURRENT_COMMIT" == "$TARGET_COMMIT" ]]; then
+    echo "LGHS is already current at ${CURRENT_COMMIT:0:12}."
+    exit 0
+fi
+
+PREVIOUS_COMMIT="$CURRENT_COMMIT"
+printf '%s\n' "$PREVIOUS_COMMIT" > "$STATE_DIR/previous-commit"
+printf '%s\n' "$TARGET_COMMIT" > "$STATE_DIR/pending-commit"
+
+echo "LGHS updater: ${CURRENT_COMMIT:0:12} -> ${TARGET_COMMIT:0:12}"
+git reset --hard "$TARGET_COMMIT"
+chmod 0755 install.sh updater/lghs-update 2>/dev/null || true
+
+apply_install() {
+    /bin/bash ./install.sh "$ROLE"
+
+    if [[ "$ROLE" == "student" ]]; then
+        /usr/local/sbin/lghs-check
+    else
+        /usr/local/sbin/lghsctl --help >/dev/null
+        [[ "$(cat /etc/lghs/role)" == "controller" ]]
+    fi
+
+    systemctl daemon-reload
+}
+
+if apply_install; then
+    printf '%s\n' "$TARGET_COMMIT" > "$STATE_DIR/current-commit"
+    rm -f "$STATE_DIR/pending-commit"
+    echo "LGHS update applied successfully: ${TARGET_COMMIT:0:12}"
+    exit 0
+fi
+
+RC=$?
+echo "LGHS update validation failed (exit $RC); rolling back to ${PREVIOUS_COMMIT:0:12}." >&2
+
+git reset --hard "$PREVIOUS_COMMIT"
+chmod 0755 install.sh updater/lghs-update 2>/dev/null || true
+
+if /bin/bash ./install.sh "$ROLE"; then
+    systemctl daemon-reload
+    printf '%s\n' "$PREVIOUS_COMMIT" > "$STATE_DIR/current-commit"
+    rm -f "$STATE_DIR/pending-commit"
+    echo "LGHS rollback completed." >&2
+else
+    echo "LGHS rollback installation also failed. Manual repair is required." >&2
+fi
+
+exit "$RC"
