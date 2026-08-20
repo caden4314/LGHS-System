@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="${LGHS_UPDATE_BASE_URL:-}"
+STATE_DIR=/var/lib/lghs/update
+CURRENT="$(cat /etc/lghs/version 2>/dev/null || echo unknown)"
+
+[[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
+[[ -n "$BASE_URL" ]] || { echo "LGHS_UPDATE_BASE_URL is not configured; no update attempted."; exit 0; }
+
+install -d -m 0755 "$STATE_DIR"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+curl -fsS "$BASE_URL/manifest.txt" -o "$TMP/manifest.txt"
+NEW="$(sed -n 's/^version=//p' "$TMP/manifest.txt" | head -n1)"
+SHA="$(sed -n 's/^sha256=//p' "$TMP/manifest.txt" | head -n1)"
+FILE="$(sed -n 's/^file=//p' "$TMP/manifest.txt" | head -n1)"
+
+[[ -n "$NEW" && -n "$SHA" && -n "$FILE" ]] || { echo "Invalid update manifest" >&2; exit 1; }
+if [[ "$NEW" == "$CURRENT" ]]; then
+  echo "LGHS is already at $CURRENT"
+  exit 0
+fi
+
+curl -fsS "$BASE_URL/$FILE" -o "$TMP/$FILE"
+printf '%s  %s\n' "$SHA" "$TMP/$FILE" | sha256sum -c -
+
+echo "Verified LGHS update $CURRENT -> $NEW. Installation hook is intentionally disabled until the staged rollback path is completed."
