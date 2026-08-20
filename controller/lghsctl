@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+
+SERVICE = "_lghs._tcp"
+
+def run(cmd):
+    return subprocess.run(cmd, text=True, capture_output=True)
+
+def discover():
+    if not shutil.which("avahi-browse"):
+        print("avahi-browse is not installed", file=sys.stderr)
+        return 1
+    p = run(["avahi-browse", "-rtp", SERVICE])
+    if p.returncode not in (0, 1):
+        print(p.stderr.strip(), file=sys.stderr)
+        return p.returncode
+    devices = []
+    for line in p.stdout.splitlines():
+        if not line.startswith("="):
+            continue
+        fields = line.split(";")
+        if len(fields) < 9:
+            continue
+        iface, proto, name, stype, domain, host, addr, port = fields[1:9]
+        if stype != SERVICE:
+            continue
+        txt = ";".join(fields[9:])
+        devices.append((name, host, addr, port, txt))
+    if not devices:
+        print("No LGHS devices discovered.")
+        return 0
+    print(f"{'NAME':28} {'HOST':28} {'ADDRESS':16} PORT")
+    for name, host, addr, port, _ in devices:
+        print(f"{name[:28]:28} {host[:28]:28} {addr[:16]:16} {port}")
+    return 0
+
+def ssh_target(target):
+    return target if "@" in target else f"cs_admin@{target}"
+
+def ssh_cmd(target, remote):
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_target(target), remote]
+    return subprocess.call(cmd)
+
+def main():
+    ap = argparse.ArgumentParser(prog="lghsctl", description="LGHS classroom fleet controller")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("discover")
+    p = sub.add_parser("check"); p.add_argument("target")
+    p = sub.add_parser("enforce"); p.add_argument("target")
+    p = sub.add_parser("reboot"); p.add_argument("target")
+    p = sub.add_parser("ssh"); p.add_argument("target")
+    args = ap.parse_args()
+
+    if args.cmd == "discover":
+        return discover()
+    if args.cmd == "check":
+        return ssh_cmd(args.target, "sudo /usr/local/sbin/lghs-check")
+    if args.cmd == "enforce":
+        return ssh_cmd(args.target, "sudo /usr/local/sbin/lghs-enforce")
+    if args.cmd == "reboot":
+        return ssh_cmd(args.target, "sudo /usr/sbin/reboot")
+    if args.cmd == "ssh":
+        return subprocess.call(["ssh", ssh_target(args.target)])
+    return 2
+
+if __name__ == "__main__":
+    raise SystemExit(main())
