@@ -6,18 +6,18 @@ ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
 CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
 [[ "$ROLE" == "student" || "$ROLE" == "controller" ]] || exit 0
 
-# Prefer the live checkout so any managed files added by a future LGHS update are
-# reinstalled automatically without requiring a reflash.
+# Prefer the live checkout so every managed component and permission can be
+# reinstalled after Raspberry Pi OS/package changes without reflashing.
 if [[ -x "$CHECKOUT/install.sh" ]]; then
     /bin/bash "$CHECKOUT/install.sh" "$ROLE"
     exit 0
 fi
 
-# Minimal fallback if the checkout is temporarily unavailable.
-if [[ -x /usr/local/sbin/lghs-autologin-apply ]]; then
-    /usr/local/sbin/lghs-autologin-apply
-fi
+# Minimal fallback while the checkout is temporarily unavailable.
+[[ -x /usr/local/sbin/lghs-autologin-apply ]] && /usr/local/sbin/lghs-autologin-apply || true
+[[ -x /usr/local/sbin/lghs-dev-setup ]] && /usr/local/sbin/lghs-dev-setup || true
 if [[ "$ROLE" == "student" ]]; then
-    [[ -x /usr/local/sbin/lghs-enforce ]] && /usr/local/sbin/lghs-enforce
-    [[ -x /usr/local/sbin/lghs-network-ui-apply ]] && /usr/local/sbin/lghs-network-ui-apply
+    [[ -x /usr/local/sbin/lghs-enforce ]] && /usr/local/sbin/lghs-enforce || true
+    [[ -x /usr/local/sbin/lghs-network-ui-apply ]] && /usr/local/sbin/lghs-network-ui-apply || true
 fi
+[[ -x /usr/local/sbin/lghs-access-enforce ]] && /usr/local/sbin/lghs-access-enforce || true
