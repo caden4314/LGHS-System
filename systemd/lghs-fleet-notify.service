@@ -1,0 +1,13 @@
+[Unit]
+Description=LGHS Fleet desktop notifications
+After=network-online.target avahi-daemon.service display-manager.service
+Wants=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/lghs-fleet-notify
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
