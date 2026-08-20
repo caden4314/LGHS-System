@@ -71,6 +71,7 @@ cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-check
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-enforce
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-export *
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-sync
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/poweroff
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/shutdown
