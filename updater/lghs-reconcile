@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
+ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
+CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
+[[ "$ROLE" == "student" || "$ROLE" == "controller" ]] || exit 0
+
+# Prefer the live checkout so any managed files added by a future LGHS update are
+# reinstalled automatically without requiring a reflash.
+if [[ -x "$CHECKOUT/install.sh" ]]; then
+    /bin/bash "$CHECKOUT/install.sh" "$ROLE"
+    exit 0
+fi
+
+# Minimal fallback if the checkout is temporarily unavailable.
+if [[ -x /usr/local/sbin/lghs-autologin-apply ]]; then
+    /usr/local/sbin/lghs-autologin-apply
+fi
+if [[ "$ROLE" == "student" ]]; then
+    [[ -x /usr/local/sbin/lghs-enforce ]] && /usr/local/sbin/lghs-enforce
+    [[ -x /usr/local/sbin/lghs-network-ui-apply ]] && /usr/local/sbin/lghs-network-ui-apply
+fi
