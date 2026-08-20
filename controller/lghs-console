@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import curses
+import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -22,24 +24,19 @@ def run(cmd):
 def ensure_dirs():
     os.makedirs(os.path.dirname(KNOWN_HOSTS), exist_ok=True)
     os.makedirs(CONTROL_DIR, exist_ok=True)
-    if not os.path.exists(KNOWN_HOSTS):
-        open(KNOWN_HOSTS, "a").close()
+    if not os.path.exists(KNOWN_HOSTS): open(KNOWN_HOSTS, "a").close()
 
 
 def discover_devices():
-    if not shutil.which("avahi-browse"):
-        return []
+    if not shutil.which("avahi-browse"): return []
     p = run(["avahi-browse", "-rtp", SERVICE])
     devices, seen = [], set()
     for line in p.stdout.splitlines():
-        if not line.startswith("="):
-            continue
+        if not line.startswith("="): continue
         f = line.split(";")
-        if len(f) < 9 or f[4] != SERVICE:
-            continue
+        if len(f) < 9 or f[4] != SERVICE: continue
         key = (f[6], f[7])
-        if key in seen:
-            continue
+        if key in seen: continue
         seen.add(key)
         devices.append({"name": f[3], "host": f[6], "addr": f[7], "port": f[8]})
     return devices
@@ -51,37 +48,24 @@ def enrolled(addr):
 
 
 def enroll(addr):
-    if enrolled(addr):
-        return True
+    if enrolled(addr): return True
     p = run(["ssh-keyscan", "-T", "3", "-t", "ed25519", addr])
-    if p.returncode != 0 or not p.stdout.strip():
-        return False
-    with open(KNOWN_HOSTS, "a", encoding="utf-8") as f:
-        f.write(p.stdout)
+    if p.returncode != 0 or not p.stdout.strip(): return False
+    with open(KNOWN_HOSTS, "a", encoding="utf-8") as f: f.write(p.stdout)
     test = ssh_capture(addr, "true", auto_enroll=False)
-    if test.returncode == 0:
-        return True
-    run(["ssh-keygen", "-R", addr, "-f", KNOWN_HOSTS])
-    return False
+    if test.returncode == 0: return True
+    run(["ssh-keygen", "-R", addr, "-f", KNOWN_HOSTS]); return False
 
 
 def ssh_args(addr, batch=True):
     ensure_dirs()
-    a = [
-        "ssh", "-i", KEY_FILE,
-        "-o", "IdentitiesOnly=yes",
-        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
-        "-o", "StrictHostKeyChecking=yes",
-        "-o", "PasswordAuthentication=no",
-        "-o", "KbdInteractiveAuthentication=no",
-        "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
-        "-o", "ClearAllForwardings=yes",
-        "-o", "ConnectTimeout=2",
-        "-o", "ControlMaster=auto", "-o", "ControlPersist=90",
-        "-o", f"ControlPath={CONTROL_DIR}/%C",
-    ]
-    if batch:
-        a += ["-o", "BatchMode=yes"]
+    a = ["ssh", "-i", KEY_FILE, "-o", "IdentitiesOnly=yes",
+         "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=yes",
+         "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
+         "-o", "ForwardAgent=no", "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes",
+         "-o", "ConnectTimeout=2", "-o", "ControlMaster=auto", "-o", "ControlPersist=90",
+         "-o", f"ControlPath={CONTROL_DIR}/%C"]
+    if batch: a += ["-o", "BatchMode=yes"]
     a.append(f"{SSH_USER}@{addr}")
     return a
 
@@ -96,71 +80,72 @@ def parse_kv(text):
     d = {}
     for line in text.splitlines():
         if "=" in line:
-            k, v = line.split("=", 1)
-            d[k.strip()] = v.strip()
+            k, v = line.split("=", 1); d[k.strip()] = v.strip()
     return d
 
 
 def fetch_one(device):
+    d = dict(device); d["sudo_requests"] = []
     p = ssh_capture(device["addr"], "sudo -n /usr/local/sbin/lghs-report summary")
-    d = dict(device)
     d["online"] = p.returncode == 0
     if d["online"]:
         d.update(parse_kv(p.stdout))
+        if d.get("role") == "student":
+            q = ssh_capture(device["addr"], "sudo -n /usr/local/sbin/lghs-sudo-admin list --json")
+            if q.returncode == 0:
+                try: d["sudo_requests"] = json.loads(q.stdout or "[]")
+                except Exception: d["sudo_requests"] = []
     return d
 
 
 def refresh_fleet(devices):
-    if not devices:
-        return []
-    out = []
-    with ThreadPoolExecutor(max_workers=min(8, len(devices))) as pool:
-        fs = {pool.submit(fetch_one, d): d for d in devices}
+    if not devices: return []
+    out=[]
+    with ThreadPoolExecutor(max_workers=min(8,len(devices))) as pool:
+        fs={pool.submit(fetch_one,d):d for d in devices}
         for f in as_completed(fs):
             try: out.append(f.result())
             except Exception:
-                d = dict(fs[f]); d["online"] = False; out.append(d)
-    out.sort(key=lambda d: (d.get("hostname") or d.get("host") or d.get("addr", "")).lower())
+                d=dict(fs[f]); d["online"]=False; d["sudo_requests"]=[]; out.append(d)
+    out.sort(key=lambda d:(d.get("hostname") or d.get("host") or d.get("addr","")).lower())
     return out
 
 
 def health(d):
     if not d.get("online"): return "OFFLINE"
-    vals = [d.get("update_timer")]
-    if d.get("role") == "student": vals += [d.get("agent"), d.get("policy"), d.get("ssh")]
-    return "OK" if all(v == "active" for v in vals if v is not None) else "CHECK"
+    vals=[d.get("update_timer")]
+    if d.get("role")=="student": vals += [d.get("agent"),d.get("policy"),d.get("ssh")]
+    return "OK" if all(v=="active" for v in vals if v is not None) else "CHECK"
 
 
-def safe_add(win, y, x, text, attr=0):
-    h, w = win.getmaxyx()
-    if y < 0 or y >= h or x < 0 or x >= w: return
-    try: win.addnstr(y, x, str(text), max(0, w-x-1), attr)
+def safe_add(win,y,x,text,attr=0):
+    h,w=win.getmaxyx()
+    if y<0 or y>=h or x<0 or x>=w:return
+    try: win.addnstr(y,x,str(text),max(0,w-x-1),attr)
     except curses.error: pass
 
 
 def fmt_bytes(n):
-    try: n=float(n)
-    except: return "?"
+    try:n=float(n)
+    except:return "?"
     for u in ("B","K","M","G","T"):
-        if n < 1024: return f"{n:.0f}{u}"
-        n /= 1024
+        if n<1024:return f"{n:.0f}{u}"
+        n/=1024
     return f"{n:.0f}P"
 
 
-def popup(stdscr, title, body):
-    lines = body.splitlines() or [""]
-    h,w=stdscr.getmaxyx(); ph=min(max(8,h-4),max(8,len(lines)+4)); pw=min(max(40,w-4),110)
+def popup(stdscr,title,body):
+    lines=body.splitlines() or [""]; h,w=stdscr.getmaxyx(); ph=min(max(8,h-4),max(8,len(lines)+4)); pw=min(max(40,w-4),110)
     y=max(1,(h-ph)//2); x=max(1,(w-pw)//2); win=curses.newwin(ph,pw,y,x); win.keypad(True); off=0
     while True:
-        win.erase(); win.box(); safe_add(win,0,2,f" {title} ",curses.A_BOLD)
-        vis=ph-3
+        win.erase(); win.box(); safe_add(win,0,2,f" {title} ",curses.A_BOLD); vis=ph-3
         for i,line in enumerate(lines[off:off+vis],1): safe_add(win,i,2,line)
-        safe_add(win,ph-2,2,"↑/↓ scroll   q/Esc/Enter close",curses.A_DIM); win.refresh(); k=win.getch()
-        if k in (ord('q'),27,10,13): break
-        if k in (curses.KEY_DOWN,ord('j')): off=min(max(0,len(lines)-vis),off+1)
-        elif k in (curses.KEY_UP,ord('k')): off=max(0,off-1)
-        elif k==curses.KEY_NPAGE: off=min(max(0,len(lines)-vis),off+vis)
-        elif k==curses.KEY_PPAGE: off=max(0,off-vis)
+        safe_add(win,ph-2,2,"Up/Down scroll   q/Esc/Enter close",curses.A_DIM); win.refresh(); k=win.getch()
+        if k in (ord('q'),27,10,13):break
+        if k in (curses.KEY_DOWN,ord('j')):off=min(max(0,len(lines)-vis),off+1)
+        elif k in (curses.KEY_UP,ord('k')):off=max(0,off-1)
+        elif k==curses.KEY_NPAGE:off=min(max(0,len(lines)-vis),off+vis)
+        elif k==curses.KEY_PPAGE:off=max(0,off-vis)
 
 
 def confirm(stdscr,msg):
@@ -169,86 +154,129 @@ def confirm(stdscr,msg):
 
 
 def action(addr,title,remote):
-    p=ssh_capture(addr,remote); body=(p.stdout or "") + (("\n"+p.stderr) if p.stderr else "")
-    return title, body.strip() or f"Exit code {p.returncode}"
+    p=ssh_capture(addr,remote); body=(p.stdout or "")+(("\n"+p.stderr) if p.stderr else "")
+    return title,body.strip() or f"Exit code {p.returncode}"
+
+
+def pending_requests(devices):
+    out=[]
+    for d in devices:
+        for r in d.get("sudo_requests",[]): out.append((d,r))
+    out.sort(key=lambda pair: float(pair[1].get("requested_epoch",0)))
+    return out
+
+
+def resolve_sudo(addr,rid,decision):
+    if not rid or any(c not in '0123456789abcdef' for c in rid.lower()):
+        return False,"Invalid request ID"
+    p=ssh_capture(addr,f"sudo -n /usr/local/sbin/lghs-sudo-admin {decision} {rid}")
+    return p.returncode==0,(p.stdout or p.stderr).strip()
+
+
+def sudo_prompt(stdscr,device,req):
+    h,w=stdscr.getmaxyx(); ph=min(max(14,h-4),20); pw=min(max(60,w-4),110); y=max(1,(h-ph)//2); x=max(1,(w-pw)//2)
+    win=curses.newwin(ph,pw,y,x); win.keypad(True)
+    command=req.get('command',''); cwd=req.get('cwd',''); host=device.get('hostname') or device.get('host') or device.get('addr'); rid=req.get('id','')
+    while True:
+        win.erase(); win.box(); safe_add(win,0,2," SUDO APPROVAL ",curses.A_BOLD|curses.A_REVERSE)
+        safe_add(win,2,3,f"{host} has requested sudo:",curses.A_BOLD)
+        safe_add(win,4,3,command,curses.A_BOLD)
+        safe_add(win,7,3,f"User: {req.get('requester','?')}")
+        safe_add(win,8,3,f"Working directory: {cwd}")
+        safe_add(win,9,3,f"Request: {rid}",curses.A_DIM)
+        safe_add(win,ph-3,3,"Y  Approve once     N  Deny     L  Later",curses.A_BOLD)
+        safe_add(win,ph-2,3,"Approval is valid only for this exact command and expires automatically.",curses.A_DIM)
+        win.refresh(); k=win.getch()
+        if k in (ord('y'),ord('Y')):
+            ok,msg=resolve_sudo(device['addr'],rid,'approve'); return ('approved' if ok else 'error'),msg
+        if k in (ord('n'),ord('N')):
+            ok,msg=resolve_sudo(device['addr'],rid,'deny'); return ('denied' if ok else 'error'),msg
+        if k in (ord('l'),ord('L'),27): return 'later',''
 
 
 def draw_bar(win,y,x,label,value,width=12):
-    try: v=max(0,min(100,float(value)))
-    except: v=0
+    try:v=max(0,min(100,float(value)))
+    except:v=0
     inner=max(3,width); filled=round(inner*v/100)
     safe_add(win,y,x,f"{label:<5}[{'#'*filled}{'-'*(inner-filled)}] {v:5.1f}%")
 
 
 def draw(stdscr,devices,sel,last,message=""):
     stdscr.erase(); h,w=stdscr.getmaxyx(); compact=w<100 or h<24
-    online=sum(1 for d in devices if d.get("online")); checks=sum(1 for d in devices if health(d)=="CHECK")
+    online=sum(1 for d in devices if d.get("online")); checks=sum(1 for d in devices if health(d)=="CHECK"); pending=len(pending_requests(devices))
     safe_add(stdscr,0,0," LGHS FLEET LIVE ",curses.A_REVERSE|curses.A_BOLD)
-    safe_add(stdscr,1,1,f"Controller {subprocess.getoutput('hostname')}   {online}/{len(devices)} online   alerts {checks}   refresh {REFRESH_SECONDS:.0f}s   {last}")
-    safe_add(stdscr,2,1,"↑↓ select  Enter details  L logs  U update  A update-all  C check  E enforce  S ssh  B reboot  R refresh  Q quit",curses.A_DIM)
-    if message: safe_add(stdscr,3,1,message,curses.A_BOLD)
-
+    safe_add(stdscr,1,1,f"Controller {subprocess.getoutput('hostname')}   {online}/{len(devices)} online   alerts {checks}   sudo {pending}   refresh {REFRESH_SECONDS:.0f}s   {last}")
+    safe_add(stdscr,2,1,"Up/Down select  Enter details  P sudo  L logs  U update  A update-all  C check  E enforce  S ssh  B reboot  R refresh  Q quit",curses.A_DIM)
+    if message:safe_add(stdscr,3,1,message,curses.A_BOLD)
     hy=5
-    if compact:
-        headers=[("HOST",16),("IP",15),("CPU",6),("RAM",6),("TEMP",7),("STATE",8)]
-    else:
-        headers=[("HOST",16),("IP",15),("VER",8),("CPU",6),("RAM",6),("DISK",6),("TEMP",7),("RX",7),("TX",7),("COMMIT",12),("STATE",8)]
+    headers=[("HOST",16),("IP",15),("CPU",6),("RAM",6),("TEMP",7),("SUDO",5),("STATE",8)] if compact else [("HOST",16),("IP",15),("VER",8),("CPU",6),("RAM",6),("DISK",6),("TEMP",7),("RX",7),("TX",7),("SUDO",5),("COMMIT",12),("STATE",8)]
     x=1
-    for n,ww in headers: safe_add(stdscr,hy,x,n.ljust(ww),curses.A_BOLD|curses.A_UNDERLINE); x+=ww+1
+    for n,ww in headers:safe_add(stdscr,hy,x,n.ljust(ww),curses.A_BOLD|curses.A_UNDERLINE);x+=ww+1
     rows=max(0,h-hy-8); start=max(0,sel-rows+1) if rows and sel>=rows else 0
     for ry,d in enumerate(devices[start:start+rows],hy+1):
-        idx=start+ry-hy-1; attr=curses.A_REVERSE if idx==sel else 0
-        if compact:
-            vals=[d.get("hostname") or d.get("host","?"),d.get("addr","?"),d.get("cpu_pct","?")+"%",d.get("mem_pct","?")+"%",d.get("temp_c","?")+"C",health(d)]
-        else:
-            vals=[d.get("hostname") or d.get("host","?"),d.get("addr","?"),d.get("version","?"),d.get("cpu_pct","?")+"%",d.get("mem_pct","?")+"%",d.get("disk_pct","?")+"%",d.get("temp_c","?")+"C",fmt_bytes(d.get("rx_bytes")),fmt_bytes(d.get("tx_bytes")),d.get("commit","?")[:12],health(d)]
+        idx=start+ry-hy-1; attr=curses.A_REVERSE if idx==sel else 0; sc=str(len(d.get('sudo_requests',[])))
+        if compact:vals=[d.get("hostname") or d.get("host","?"),d.get("addr","?"),d.get("cpu_pct","?")+"%",d.get("mem_pct","?")+"%",d.get("temp_c","?")+"C",sc,health(d)]
+        else:vals=[d.get("hostname") or d.get("host","?"),d.get("addr","?"),d.get("version","?"),d.get("cpu_pct","?")+"%",d.get("mem_pct","?")+"%",d.get("disk_pct","?")+"%",d.get("temp_c","?")+"C",fmt_bytes(d.get("rx_bytes")),fmt_bytes(d.get("tx_bytes")),sc,d.get("commit","?")[:12],health(d)]
         x=1
-        for val,(_,ww) in zip(vals,headers): safe_add(stdscr,ry,x,str(val)[:ww].ljust(ww),attr); x+=ww+1
-
+        for val,(_,ww) in zip(vals,headers):safe_add(stdscr,ry,x,str(val)[:ww].ljust(ww),attr);x+=ww+1
     if devices and 0<=sel<len(devices):
-        d=devices[sel]; base=max(h-5,hy+2)
+        d=devices[sel];base=max(h-5,hy+2)
         if base<h-1:
             safe_add(stdscr,base,1,f"Selected: {d.get('hostname') or d.get('host')}   uptime {d.get('uptime','?')}   role {d.get('role','?')}",curses.A_BOLD)
             if h-base>=3:
-                draw_bar(stdscr,base+1,1,"CPU",d.get("cpu_pct"),10)
-                draw_bar(stdscr,base+1,31,"RAM",d.get("mem_pct"),10)
-                if w>72: draw_bar(stdscr,base+1,61,"DISK",d.get("disk_pct"),10)
-    if not devices: safe_add(stdscr,hy+2,2,"No LGHS devices discovered yet.")
+                draw_bar(stdscr,base+1,1,"CPU",d.get("cpu_pct"),10);draw_bar(stdscr,base+1,31,"RAM",d.get("mem_pct"),10)
+                if w>72:draw_bar(stdscr,base+1,61,"DISK",d.get("disk_pct"),10)
+    if not devices:safe_add(stdscr,hy+2,2,"No LGHS devices discovered yet.")
     stdscr.refresh()
 
 
 def main(stdscr):
-    curses.curs_set(0); stdscr.keypad(True); stdscr.timeout(150)
-    devices=[]; discovered=[]; sel=0; last_stats=0.0; last_discovery=0.0; last="never"; msg="Starting encrypted fleet discovery..."
+    curses.curs_set(0);stdscr.keypad(True);stdscr.timeout(150)
+    devices=[];discovered=[];sel=0;last_stats=0.0;last_discovery=0.0;last="never";msg="Starting encrypted fleet discovery...";seen=set()
     while True:
         now=time.time()
-        if now-last_discovery>=DISCOVERY_SECONDS or not discovered:
-            discovered=discover_devices(); last_discovery=now
+        if now-last_discovery>=DISCOVERY_SECONDS or not discovered:discovered=discover_devices();last_discovery=now
         if now-last_stats>=REFRESH_SECONDS:
-            devices=refresh_fleet(discovered); sel=min(sel,max(0,len(devices)-1)); last_stats=time.time(); last=time.strftime("%H:%M:%S"); msg=""
-        draw(stdscr,devices,sel,last,msg); k=stdscr.getch()
-        if k==-1: continue
-        if k in (ord('q'),ord('Q')): break
-        if k in (curses.KEY_RESIZE,): continue
-        if k in (curses.KEY_DOWN,ord('j')) and devices: sel=min(len(devices)-1,sel+1)
-        elif k in (curses.KEY_UP,ord('k')) and devices: sel=max(0,sel-1)
-        elif k in (ord('r'),ord('R')): last_stats=0; last_discovery=0; msg="Refreshing..."
+            devices=refresh_fleet(discovered);sel=min(sel,max(0,len(devices)-1));last_stats=time.time();last=time.strftime("%H:%M:%S");msg=""
+            for d,r in pending_requests(devices):
+                key=f"{d.get('addr')}:{r.get('id')}"
+                if key not in seen:
+                    seen.add(key);state,detail=sudo_prompt(stdscr,d,r)
+                    if state=='approved':msg=f"Approved sudo request from {d.get('hostname') or d.get('host')}"
+                    elif state=='denied':msg=f"Denied sudo request from {d.get('hostname') or d.get('host')}"
+                    elif state=='error':popup(stdscr,"Sudo approval error",detail)
+                    last_stats=0;break
+        draw(stdscr,devices,sel,last,msg);k=stdscr.getch()
+        if k==-1:continue
+        if k in (ord('q'),ord('Q')):break
+        if k==curses.KEY_RESIZE:continue
+        if k in (curses.KEY_DOWN,ord('j')) and devices:sel=min(len(devices)-1,sel+1)
+        elif k in (curses.KEY_UP,ord('k')) and devices:sel=max(0,sel-1)
+        elif k in (ord('r'),ord('R')):last_stats=0;last_discovery=0;msg="Refreshing..."
+        elif k in (ord('p'),ord('P')):
+            queue=pending_requests(devices)
+            if not queue:msg="No pending sudo requests."
+            else:
+                for d,r in queue:
+                    state,detail=sudo_prompt(stdscr,d,r)
+                    if state in ('approved','denied'):last_stats=0
+                    elif state=='error':popup(stdscr,"Sudo approval error",detail)
+                    if state=='later':break
         elif devices:
             addr=devices[sel]["addr"]
-            if k in (10,13): popup(stdscr,*action(addr,f"Details - {addr}","sudo -n /usr/local/sbin/lghs-report summary"))
-            elif k in (ord('l'),ord('L')): popup(stdscr,*action(addr,f"Logs - {addr}","sudo -n /usr/local/sbin/lghs-report logs all"))
-            elif k in (ord('u'),ord('U')) and confirm(stdscr,f"Force update {addr}?"): popup(stdscr,*action(addr,f"Update - {addr}","sudo -n /usr/local/sbin/lghs-update")); last_stats=0
-            elif k in (ord('c'),ord('C')): popup(stdscr,*action(addr,f"Check - {addr}","sudo -n /usr/local/sbin/lghs-check"))
-            elif k in (ord('e'),ord('E')) and confirm(stdscr,f"Re-apply policy {addr}?"): popup(stdscr,*action(addr,f"Enforce - {addr}","sudo -n /usr/local/sbin/lghs-enforce")); last_stats=0
-            elif k in (ord('b'),ord('B')) and confirm(stdscr,f"Reboot {addr}?"): ssh_capture(addr,"sudo -n /usr/sbin/reboot"); msg=f"Reboot requested for {addr}"; last_stats=0
+            if k in (10,13):popup(stdscr,*action(addr,f"Details - {addr}","sudo -n /usr/local/sbin/lghs-report summary"))
+            elif k in (ord('l'),ord('L')):popup(stdscr,*action(addr,f"Logs - {addr}","sudo -n /usr/local/sbin/lghs-report logs all"))
+            elif k in (ord('u'),ord('U')) and confirm(stdscr,f"Force update {addr}?"):popup(stdscr,*action(addr,f"Update - {addr}","sudo -n /usr/local/sbin/lghs-update"));last_stats=0
+            elif k in (ord('c'),ord('C')):popup(stdscr,*action(addr,f"Check - {addr}","sudo -n /usr/local/sbin/lghs-check"))
+            elif k in (ord('e'),ord('E')) and confirm(stdscr,f"Re-apply policy {addr}?"):popup(stdscr,*action(addr,f"Enforce - {addr}","sudo -n /usr/local/sbin/lghs-enforce"));last_stats=0
+            elif k in (ord('b'),ord('B')) and confirm(stdscr,f"Reboot {addr}?"):ssh_capture(addr,"sudo -n /usr/sbin/reboot");msg=f"Reboot requested for {addr}";last_stats=0
             elif k in (ord('s'),ord('S')):
-                curses.endwin(); subprocess.call(ssh_args(addr,batch=False)); stdscr.refresh(); curses.curs_set(0); last_stats=0
+                curses.endwin();subprocess.call(ssh_args(addr,batch=False));stdscr.refresh();curses.curs_set(0);last_stats=0
             elif k in (ord('a'),ord('A')) and confirm(stdscr,f"Force update all {len(devices)} Pis?"):
                 with ThreadPoolExecutor(max_workers=min(8,len(devices))) as pool:
-                    fs={pool.submit(ssh_capture,d['addr'],"sudo -n /usr/local/sbin/lghs-update"):d['addr'] for d in devices}
-                    results=[]
+                    fs={pool.submit(ssh_capture,d['addr'],"sudo -n /usr/local/sbin/lghs-update"):d['addr'] for d in devices};results=[]
                     for f in as_completed(fs):
-                        p=f.result(); results.append(f"{fs[f]}: {'OK' if p.returncode==0 else 'FAILED'}\n{p.stdout}{p.stderr}")
-                popup(stdscr,"Fleet update","\n\n".join(results)); last_stats=0
+                        p=f.result();results.append(f"{fs[f]}: {'OK' if p.returncode==0 else 'FAILED'}\n{p.stdout}{p.stderr}")
+                popup(stdscr,"Fleet update","\n\n".join(results));last_stats=0
 
-if __name__ == "__main__": curses.wrapper(main)
+if __name__=="__main__":curses.wrapper(main)
