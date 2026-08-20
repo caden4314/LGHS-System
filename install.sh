@@ -53,7 +53,7 @@ fi
 if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/sbin/lghsctl
 
-  CTRL_PKGS=(openssh-client avahi-utils)
+  CTRL_PKGS=(openssh-client avahi-daemon avahi-utils)
   MISSING_PKGS=()
   for pkg in "${CTRL_PKGS[@]}"; do
     dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg")
@@ -86,14 +86,15 @@ else
 fi
 
 systemctl daemon-reload
-systemctl enable lghs-update.service lghs-update.timer
+systemctl enable lghs-update.service lghs-update.timer avahi-daemon.service
 
 if [[ "$ROLE" == "student" ]]; then
-  systemctl enable lghs-policy.service lghs-agent.service avahi-daemon ssh
+  systemctl enable lghs-policy.service lghs-agent.service ssh
 fi
 
 # During a live reinstall, immediately refresh already-running LGHS services.
 if systemctl is-system-running --quiet 2>/dev/null || systemctl is-system-running 2>/dev/null | grep -Eq 'running|degraded'; then
+  systemctl try-restart avahi-daemon.service || true
   if [[ "$ROLE" == "student" ]]; then
     systemctl try-restart lghs-policy.service lghs-agent.service || true
   fi
