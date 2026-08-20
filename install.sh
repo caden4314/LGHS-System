@@ -52,6 +52,7 @@ fi
 
 if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/sbin/lghsctl
+  install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/sbin/lghs-console
 
   CTRL_PKGS=(openssh-client avahi-daemon avahi-utils)
   MISSING_PKGS=()
