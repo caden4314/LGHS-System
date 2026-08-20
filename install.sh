@@ -35,6 +35,7 @@ install -m 0755 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lgh
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
 install -m 0644 "$ROOT_DIR/systemd/lghs-firstboot-provision.service" /etc/systemd/system/lghs-firstboot-provision.service
+install -m 0440 "$ROOT_DIR/policies/sudoers/89-lghs-audit" /etc/sudoers.d/89-lghs-audit
 
 COMMON_PKGS=(git curl python3 openssh-client)
 if ! command -v flock >/dev/null 2>&1; then COMMON_PKGS+=(util-linux); fi
@@ -47,8 +48,6 @@ if (( ${#MISSING_PKGS[@]} )); then
   DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"
 fi
 
-# Dedicated administrator. Interactive sudo uses the admin password, while the
-# controller's narrow fleet-management commands remain passwordless.
 if ! id cs_admin >/dev/null 2>&1; then
   useradd -m -s /bin/bash cs_admin
 fi
@@ -61,12 +60,12 @@ cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-report *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-update
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-check
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-enforce
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/poweroff
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/shutdown
 EOF
 chmod 0440 /etc/sudoers.d/91-lghs-admin
-visudo -cf /etc/sudoers >/dev/null
 
 if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/sbin/lghsctl
@@ -98,11 +97,20 @@ else
   install -m 0755 "$ROOT_DIR/student/lghs-agent" /usr/local/sbin/lghs-agent
   install -m 0755 "$ROOT_DIR/student/lghs-network-ui-apply" /usr/local/sbin/lghs-network-ui-apply
   install -m 0755 "$ROOT_DIR/student/lghs-install-network-ui" /usr/local/sbin/lghs-install-network-ui
+  install -m 0755 "$ROOT_DIR/student/lghs-sudo-broker" /usr/local/sbin/lghs-sudo-broker
+  install -m 0755 "$ROOT_DIR/student/lghs-approved-exec" /usr/local/sbin/lghs-approved-exec
+  install -m 0755 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
+  install -m 0755 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
+  install -m 0755 "$ROOT_DIR/student/sudo" /usr/local/bin/sudo
+  install -d -m 0700 /var/lib/lghs/sudo-requests
+  touch /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log
+  chown root:adm /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log 2>/dev/null || true
+  chmod 0640 /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log
 
   install -m 0440 "$ROOT_DIR/policies/sudoers/90-lghs-student" /etc/sudoers.d/90-lghs-student
   install -m 0644 "$ROOT_DIR/policies/polkit/49-lghs-network.rules" /etc/polkit-1/rules.d/49-lghs-network.rules
 
-  STUDENT_PKGS=(openssh-server network-manager policykit-1 avahi-daemon avahi-utils)
+  STUDENT_PKGS=(openssh-server network-manager policykit-1 avahi-daemon avahi-utils python3-pip python3-venv python3-dev pipx git build-essential)
   MISSING_PKGS=()
   for pkg in "${STUDENT_PKGS[@]}"; do
     dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg")
@@ -116,7 +124,6 @@ else
     install -m 0600 -o cs_admin -g cs_admin /etc/lghs/controller_ed25519.pub /home/cs_admin/.ssh/authorized_keys
   fi
 
-  # Fleet management SSH is public-key only and does not permit forwarding.
   install -d -m 0755 /etc/ssh/sshd_config.d
   cat > /etc/ssh/sshd_config.d/90-lghs-fleet.conf <<'EOF'
 Match User cs_admin
@@ -136,15 +143,15 @@ EOF
   install -m 0644 "$ROOT_DIR/systemd/lghs-policy.service" /etc/systemd/system/lghs-policy.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
 
-  # Fresh images and already-running student Pis converge on the same hardened
-  # panel. Compilation happens only when the cached hardened plugin is absent.
   if [[ ! -f /usr/local/lib/lghs/libnetman.so.hardened ]]; then
     /usr/local/sbin/lghs-install-network-ui
   else
     /usr/local/sbin/lghs-network-ui-apply
   fi
+  /usr/local/sbin/lghs-dev-setup || true
 fi
 
+visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
 systemctl enable lghs-update.service lghs-update.timer lghs-firstboot-provision.service avahi-daemon.service
 if [[ "$ROLE" == "student" ]]; then
