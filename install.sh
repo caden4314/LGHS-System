@@ -30,8 +30,9 @@ if [[ -n "$SOURCE_COMMIT" && "$SOURCE_COMMIT" != "unknown" ]]; then
   printf '%s\n' "$SOURCE_COMMIT" > /var/lib/lghs/update/current-commit
 fi
 
-# Common live-update components for both controller and student systems.
+# Common management and live-update components for every LGHS system.
 install -m 0755 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
+install -m 0755 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
 
