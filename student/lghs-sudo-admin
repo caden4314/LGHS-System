@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+import datetime as dt
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REQUEST_DIR = Path('/var/lib/lghs/sudo-requests')
+AUDIT_LOG = Path('/var/log/lghs-sudo-audit.jsonl')
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.lghs-', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, separators=(',', ':'))
+            f.write('\n'); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+
+
+def audit(event, **fields):
+    record = {'time': now_iso(), 'event': event, **fields}
+    fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+    try:
+        os.write(fd, (json.dumps(record, separators=(',', ':')) + '\n').encode())
+    finally:
+        os.close(fd)
+    try:
+        import grp
+        os.chown(AUDIT_LOG, 0, grp.getgrnam('adm').gr_gid)
+    except Exception:
+        pass
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+
+
+def refresh_expired(path, data):
+    if data and data.get('status') == 'pending' and time.time() > float(data.get('expires_epoch', 0)):
+        data['status'] = 'expired'; data['resolved_at'] = now_iso()
+        atomic_write(path, data)
+        audit('expired', request_id=data.get('id'), device_id=data.get('device_id'), requester=data.get('requester'))
+    return data
+
+
+def list_requests(all_states=False):
+    out = []
+    REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(REQUEST_DIR, 0o700)
+    for path in sorted(REQUEST_DIR.glob('*.json')):
+        data = refresh_expired(path, load(path))
+        if not data: continue
+        if all_states or data.get('status') == 'pending': out.append(data)
+    out.sort(key=lambda x: float(x.get('requested_epoch', 0)))
+    return out
+
+
+def resolve(rid, decision):
+    path = REQUEST_DIR / f'{rid}.json'
+    data = refresh_expired(path, load(path))
+    if not data:
+        raise SystemExit('Unknown sudo request.')
+    if data.get('status') != 'pending':
+        raise SystemExit(f"Request is already {data.get('status')}.")
+    actor = os.environ.get('SUDO_USER') or os.environ.get('USER') or 'root'
+    data['status'] = decision
+    data['resolved_at'] = now_iso()
+    data['approved_by' if decision == 'approved' else 'denied_by'] = actor
+    atomic_write(path, data)
+    audit(decision, request_id=rid, device_id=data.get('device_id'), requester=data.get('requester'),
+          actor=actor, cwd=data.get('cwd'), argv=data.get('argv'))
+    print(json.dumps(data, separators=(',', ':')))
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Run through sudo.')
+    if len(sys.argv) < 2:
+        raise SystemExit('Usage: lghs-sudo-admin list [--all] [--json] | approve ID | deny ID')
+    action = sys.argv[1]
+    if action == 'list':
+        all_states = '--all' in sys.argv[2:]
+        items = list_requests(all_states)
+        if '--json' in sys.argv[2:]:
+            print(json.dumps(items, separators=(',', ':')))
+        else:
+            for r in items:
+                print(f"{r.get('id')} {r.get('status')} {r.get('device_id')} {r.get('requester')} :: {r.get('command')}")
+    elif action in ('approve','deny') and len(sys.argv) == 3:
+        resolve(sys.argv[2], 'approved' if action == 'approve' else 'denied')
+    else:
+        raise SystemExit('Invalid sudo admin command.')
+
+if __name__ == '__main__':
+    main()
