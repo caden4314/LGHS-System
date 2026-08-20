@@ -1,189 +1,422 @@
 #!/usr/bin/env python3
 """Responsive LGHS Fleet Console launcher with health/activity views."""
-import curses, importlib.machinery, importlib.util, json, os, time
+import curses
+import importlib.machinery
+import importlib.util
+import json
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-BASE="/usr/local/libexec/lghs-console-base"
-ACTIVITY=Path("/var/log/lghs-fleet/activity.jsonl")
-NOTIFY_STATE=Path("/var/lib/lghs/fleet-notify-state.json")
-TEMP_WARN=80.0;TEMP_CRIT=85.0;DISK_WARN=90.0;DISK_CRIT=96.0;STALE_SECONDS=45
+BASE = "/usr/local/libexec/lghs-console-base"
+ACTIVITY = Path("/var/log/lghs-fleet/activity.jsonl")
+NOTIFY_STATE = Path("/var/lib/lghs/fleet-notify-state.json")
+TEMP_WARN = 80.0
+TEMP_CRIT = 85.0
+DISK_WARN = 90.0
+DISK_CRIT = 96.0
 
 
 def load_base():
-    loader=importlib.machinery.SourceFileLoader("lghs_console_base",BASE)
-    spec=importlib.util.spec_from_loader(loader.name,loader)
-    mod=importlib.util.module_from_spec(spec);loader.exec_module(mod);return mod
-mod=load_base();workers=ThreadPoolExecutor(max_workers=2,thread_name_prefix="lghs-fleet")
+    loader = importlib.machinery.SourceFileLoader("lghs_console_base", BASE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+mod = load_base()
+workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lghs-fleet")
 
 
 def _harvest(state):
-    now=time.time();f=state.get("_discovery_future")
-    if f is not None and f.done():
-        try:state["discovered"]=f.result()
-        except Exception:pass
-        state["last_discovery"]=now;state["_discovery_future"]=None
-    f=state.get("_refresh_future")
-    if f is not None and f.done():
+    now = time.time()
+    future = state.get("_discovery_future")
+    if future is not None and future.done():
         try:
-            devices=f.result();state["devices"]=devices
-            if devices:state["selected"]=min(state.get("selected",0),len(devices)-1)
-        except Exception:pass
-        state["last_refresh"]=now;state["_refresh_future"]=None
+            state["discovered"] = future.result()
+        except Exception:
+            pass
+        state["last_discovery"] = now
+        state["_discovery_future"] = None
+
+    future = state.get("_refresh_future")
+    if future is not None and future.done():
+        try:
+            devices = future.result()
+            state["devices"] = devices
+            if devices:
+                state["selected"] = min(state.get("selected", 0), len(devices) - 1)
+        except Exception:
+            pass
+        state["last_refresh"] = now
+        state["_refresh_future"] = None
 
 
-def refresh_state_async(state,force=False):
-    _harvest(state);now=time.time()
-    if (force or not state.get("discovered") or now-state.get("last_discovery",0)>=mod.DISCOVERY_SECONDS) and state.get("_discovery_future") is None:
-        state["_discovery_future"]=workers.submit(mod.discover_devices)
-    if (force or now-state.get("last_refresh",0)>=mod.REFRESH_SECONDS) and state.get("_refresh_future") is None:
-        discovered=list(state.get("discovered",[]))
-        if discovered:state["_refresh_future"]=workers.submit(mod.refresh_fleet,discovered)
-        elif state.get("_discovery_future") is None:state["last_refresh"]=now
-mod.refresh_state=refresh_state_async
+def refresh_state_async(state, force=False):
+    _harvest(state)
+    now = time.time()
+    if (
+        force
+        or not state.get("discovered")
+        or now - state.get("last_discovery", 0) >= mod.DISCOVERY_SECONDS
+    ) and state.get("_discovery_future") is None:
+        state["_discovery_future"] = workers.submit(mod.discover_devices)
+
+    if (
+        force or now - state.get("last_refresh", 0) >= mod.REFRESH_SECONDS
+    ) and state.get("_refresh_future") is None:
+        discovered = list(state.get("discovered", []))
+        if discovered:
+            state["_refresh_future"] = workers.submit(mod.refresh_fleet, discovered)
+        elif state.get("_discovery_future") is None:
+            state["last_refresh"] = now
 
 
-def n(v):
-    try:return float(v)
-    except Exception:return None
+mod.refresh_state = refresh_state_async
+
+
+def number(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
 
 
 def notify_last_seen(addr):
     try:
-        data=json.loads(NOTIFY_STATE.read_text(encoding="utf-8"));return float(data.get("devices",{}).get(addr,{}).get("last_seen",0) or 0)
-    except Exception:return 0
+        data = json.loads(NOTIFY_STATE.read_text(encoding="utf-8"))
+        return float(data.get("devices", {}).get(addr, {}).get("last_seen", 0) or 0)
+    except Exception:
+        return 0
 
 
-def device_issues(d):
-    out=[];host=d.get("hostname") or d.get("host") or d.get("addr","?")
-    if not d.get("online"):
-        last=notify_last_seen(d.get("addr",""));age=time.time()-last if last else None
-        out.append(("CRITICAL","SSH/OFFLINE",f"not responding"+(f"; last seen {int(age)}s ago" if age is not None else "")))
+def device_issues(device):
+    out = []
+    if not device.get("online"):
+        last = notify_last_seen(device.get("addr", ""))
+        age = time.time() - last if last else None
+        detail = "not responding"
+        if age is not None:
+            detail += f"; last seen {int(age)}s ago"
+        out.append(("CRITICAL", "SSH/OFFLINE", detail))
         return out
-    temp=n(d.get("temp_c"));disk=n(d.get("disk_pct"))
-    if temp is not None and temp>=TEMP_CRIT:out.append(("CRITICAL","TEMP",f"{temp:.1f}C"))
-    elif temp is not None and temp>=TEMP_WARN:out.append(("WARNING","TEMP",f"{temp:.1f}C"))
-    if disk is not None and disk>=DISK_CRIT:out.append(("CRITICAL","DISK",f"{disk:.0f}% used"))
-    elif disk is not None and disk>=DISK_WARN:out.append(("WARNING","DISK",f"{disk:.0f}% used"))
-    expected=[("update_timer","UPDATE TIMER"),("reconcile_timer","RECONCILE")]
-    if d.get("role")=="student":expected += [("agent","AGENT"),("policy","POLICY"),("ssh","SSH"),("networkmanager","NETWORK"),("avahi","DISCOVERY")]
-    for key,label in expected:
-        val=d.get(key)
-        if val and val!="active":out.append(("CRITICAL" if key in ("ssh","policy") else "WARNING",label,val))
-    if d.get("update_service")=="failed":out.append(("CRITICAL","UPDATE","last update failed"))
-    if d.get("role")=="student" and d.get("student_sudo")=="yes":out.append(("CRITICAL","SECURITY","student account is in sudo"))
+
+    temp = number(device.get("temp_c"))
+    disk = number(device.get("disk_pct"))
+    if temp is not None and temp >= TEMP_CRIT:
+        out.append(("CRITICAL", "TEMP", f"{temp:.1f}C"))
+    elif temp is not None and temp >= TEMP_WARN:
+        out.append(("WARNING", "TEMP", f"{temp:.1f}C"))
+
+    if disk is not None and disk >= DISK_CRIT:
+        out.append(("CRITICAL", "DISK", f"{disk:.0f}% used"))
+    elif disk is not None and disk >= DISK_WARN:
+        out.append(("WARNING", "DISK", f"{disk:.0f}% used"))
+
+    expected = [("update_timer", "UPDATE TIMER"), ("reconcile_timer", "RECONCILE")]
+    if device.get("role") == "student":
+        expected += [
+            ("agent", "AGENT"),
+            ("policy", "POLICY"),
+            ("ssh", "SSH"),
+            ("networkmanager", "NETWORK"),
+            ("avahi", "DISCOVERY"),
+        ]
+    for key, label in expected:
+        value = device.get(key)
+        if value and value != "active":
+            severity = "CRITICAL" if key in ("ssh", "policy") else "WARNING"
+            out.append((severity, label, value))
+
+    if device.get("update_service") == "failed":
+        out.append(("CRITICAL", "UPDATE", "last update failed"))
+    if device.get("role") == "student" and device.get("student_sudo") == "yes":
+        out.append(("CRITICAL", "SECURITY", "student account is in sudo"))
     return out
 
 
 def all_issues(devices):
-    rows=[]
-    for d in devices:
-        for sev,kind,detail in device_issues(d):rows.append((d,sev,kind,detail))
-    return sorted(rows,key=lambda x:(x[1]!="CRITICAL",(x[0].get("hostname") or x[0].get("host") or "").lower(),x[2]))
+    rows = []
+    for device in devices:
+        for severity, kind, detail in device_issues(device):
+            rows.append((device, severity, kind, detail))
+    return sorted(
+        rows,
+        key=lambda row: (
+            row[1] != "CRITICAL",
+            (row[0].get("hostname") or row[0].get("host") or "").lower(),
+            row[2],
+        ),
+    )
 
 
 def recent_activity(limit=80):
     try:
-        lines=ACTIVITY.read_text(encoding="utf-8",errors="replace").splitlines()[-limit:];out=[]
+        lines = ACTIVITY.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+        out = []
         for line in reversed(lines):
-            try:out.append(json.loads(line))
-            except Exception:pass
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
         return out
-    except Exception:return []
+    except Exception:
+        return []
 
 
-def header_ext(stdscr,title,subtitle=""):
-    stdscr.erase();h,_=stdscr.getmaxyx();mod.safe_add(stdscr,0,0,f" LGHS CONTROL | {title} ",curses.A_REVERSE|curses.A_BOLD)
-    if subtitle:mod.safe_add(stdscr,1,1,subtitle)
-    mod.safe_add(stdscr,h-2,1,"F1 Help F2 Fleet F3 Telemetry F4 Sudo F5 Updates F6 Logs F7 Attention F8 Activity F10 Quit",curses.A_DIM)
-    mod.safe_add(stdscr,h-1,1,"Arrows move | Enter select | 1-9 quick select | Esc back | R refresh",curses.A_DIM)
-mod.header=header_ext
+def header_ext(stdscr, title, subtitle=""):
+    stdscr.erase()
+    height, _ = stdscr.getmaxyx()
+    mod.safe_add(stdscr, 0, 0, f" LGHS CONTROL | {title} ", curses.A_REVERSE | curses.A_BOLD)
+    if subtitle:
+        mod.safe_add(stdscr, 1, 1, subtitle)
+    mod.safe_add(
+        stdscr,
+        height - 2,
+        1,
+        "F1 Help F2 Fleet F3 Telemetry F4 Sudo F5 Updates F6 Logs F7 Attention F8 Activity F10 Quit",
+        curses.A_DIM,
+    )
+    mod.safe_add(
+        stdscr,
+        height - 1,
+        1,
+        "Arrows move | Enter select | 1-9 quick select | Esc back | R refresh",
+        curses.A_DIM,
+    )
 
 
-def global_key_ext(k):
-    if k==curses.KEY_F7:return "attention"
-    if k==curses.KEY_F8:return "activity"
-    return mod._original_global_key(k)
-mod._original_global_key=mod.global_key;mod.global_key=global_key_ext
+mod.header = header_ext
+mod._original_global_key = mod.global_key
 
 
-def main_menu(stdscr,state):
-    items=[("Fleet overview","fleet"),("Needs Attention","attention"),("Fleet Activity","activity"),("Telemetry","telemetry"),("Sudo requests","sudo"),("Updates","updates"),("Audit & logs","logs"),("Controller status","controller")];sel=0
+def global_key_ext(key):
+    if key == curses.KEY_F7:
+        return "attention"
+    if key == curses.KEY_F8:
+        return "activity"
+    return mod._original_global_key(key)
+
+
+mod.global_key = global_key_ext
+
+
+def main_menu(stdscr, state):
+    items = [
+        ("Fleet overview", "fleet"),
+        ("Needs Attention", "attention"),
+        ("Fleet Activity", "activity"),
+        ("Telemetry", "telemetry"),
+        ("Sudo requests", "sudo"),
+        ("Updates", "updates"),
+        ("Audit & logs", "logs"),
+        ("Controller status", "controller"),
+    ]
+    selected = 0
+    last_signature = None
+    last_draw = 0.0
+
     while True:
-        refresh_state_async(state,state.pop("force_refresh",False));mod.maybe_popup_new_sudo(stdscr,state)
-        fleet=state["devices"];issues=all_issues(fleet);online=sum(1 for d in fleet if d.get("online"));pending=len(mod.pending_requests(fleet));crit=sum(1 for x in issues if x[1]=="CRITICAL");warn=len(issues)-crit
-        header_ext(stdscr,"Main menu",f"{online}/{len(fleet)} Pis online | {len(issues)} issue(s) | {pending} sudo request(s)")
-        for i,(name,_) in enumerate(items):mod.safe_add(stdscr,3+i,4,f"{i+1}. {name}",(curses.A_REVERSE|curses.A_BOLD) if i==sel else 0)
-        y=3;_,w=stdscr.getmaxyx();x=max(36,w-38);boxw=min(36,max(20,w-x-1))
-        try:
-            win=curses.newwin(9,boxw,y,x);win.box();mod.safe_add(win,0,2," FLEET STATUS ",curses.A_BOLD);mod.safe_add(win,2,2,f"Online       {online}/{len(fleet)}");mod.safe_add(win,3,2,f"Needs attn   {len(issues)}");mod.safe_add(win,4,2,f"Critical     {crit}");mod.safe_add(win,5,2,f"Warnings     {warn}");mod.safe_add(win,6,2,f"Pending sudo {pending}")
-            acts=recent_activity(1);last=(acts[0].get("event","") if acts else "No events yet");mod.safe_add(win,7,2,f"Last: {last}",curses.A_DIM);win.refresh()
-        except curses.error:pass
-        stdscr.refresh();k=stdscr.getch();g=global_key_ext(k)
-        if g:return g
-        if k in (ord('q'),ord('Q')):return "quit"
-        if k in (curses.KEY_DOWN,ord('j')):sel=min(len(items)-1,sel+1)
-        elif k in (curses.KEY_UP,ord('k')):sel=max(0,sel-1)
-        elif ord('1')<=k<=ord('8'):return items[k-ord('1')][1]
-        elif k in (10,13):return items[sel][1]
+        refresh_state_async(state, state.pop("force_refresh", False))
+        mod.maybe_popup_new_sudo(stdscr, state)
+        fleet = state["devices"]
+        issues = all_issues(fleet)
+        online = sum(1 for d in fleet if d.get("online"))
+        pending = len(mod.pending_requests(fleet))
+        critical = sum(1 for row in issues if row[1] == "CRITICAL")
+        warnings = len(issues) - critical
+        activities = recent_activity(1)
+        last_event = activities[0].get("event", "") if activities else "No events yet"
+
+        signature = (
+            selected,
+            online,
+            len(fleet),
+            len(issues),
+            critical,
+            warnings,
+            pending,
+            last_event,
+        )
+        now = time.time()
+
+        # Do not repaint the whole terminal on every 50 ms input tick. Repaint
+        # when visible data changes, selection changes, or once per second as a
+        # safety refresh. This keeps input fast without causing terminal flash.
+        if signature != last_signature or now - last_draw >= 1.0:
+            header_ext(
+                stdscr,
+                "Main menu",
+                f"{online}/{len(fleet)} Pis online | {len(issues)} issue(s) | {pending} sudo request(s)",
+            )
+            for index, (name, _) in enumerate(items):
+                attr = curses.A_REVERSE | curses.A_BOLD if index == selected else 0
+                mod.safe_add(stdscr, 3 + index, 4, f"{index + 1}. {name}", attr)
+
+            y = 3
+            _, width = stdscr.getmaxyx()
+            x = max(36, width - 38)
+            box_width = min(36, max(20, width - x - 1))
+            status_win = None
+            try:
+                status_win = curses.newwin(9, box_width, y, x)
+                status_win.box()
+                mod.safe_add(status_win, 0, 2, " FLEET STATUS ", curses.A_BOLD)
+                mod.safe_add(status_win, 2, 2, f"Online       {online}/{len(fleet)}")
+                mod.safe_add(status_win, 3, 2, f"Needs attn   {len(issues)}")
+                mod.safe_add(status_win, 4, 2, f"Critical     {critical}")
+                mod.safe_add(status_win, 5, 2, f"Warnings     {warnings}")
+                mod.safe_add(status_win, 6, 2, f"Pending sudo {pending}")
+                mod.safe_add(status_win, 7, 2, f"Last: {last_event}", curses.A_DIM)
+            except curses.error:
+                status_win = None
+
+            # Parent first, child last. The old order refreshed the status box
+            # and then painted stdscr over it 20 times/sec, causing flicker.
+            stdscr.noutrefresh()
+            if status_win is not None:
+                status_win.noutrefresh()
+            curses.doupdate()
+            last_signature = signature
+            last_draw = now
+
+        key = stdscr.getch()
+        action = global_key_ext(key)
+        if action:
+            return action
+        if key in (ord("q"), ord("Q")):
+            return "quit"
+        if key in (curses.KEY_DOWN, ord("j")):
+            selected = min(len(items) - 1, selected + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            selected = max(0, selected - 1)
+        elif ord("1") <= key <= ord("8"):
+            return items[key - ord("1")][1]
+        elif key in (10, 13):
+            return items[selected][1]
 
 
-def attention_screen(stdscr,state):
-    sel=0
+def attention_screen(stdscr, state):
+    selected = 0
     while True:
-        refresh_state_async(state,state.pop("force_refresh",False));rows=all_issues(state["devices"]);sel=min(sel,max(0,len(rows)-1));header_ext(stdscr,"Needs Attention",f"{len(rows)} active fleet issue(s). Critical items sort first.");h,_=stdscr.getmaxyx();vis=max(1,h-7);start=max(0,sel-vis+1) if sel>=vis else 0
-        mod.safe_add(stdscr,3,1,"#  SEVERITY  DEVICE           ISSUE          DETAIL",curses.A_BOLD|curses.A_UNDERLINE)
-        for pos,(d,sev,kind,detail) in enumerate(rows[start:start+vis]):
-            idx=start+pos;host=d.get("hostname") or d.get("host") or d.get("addr","?");mod.safe_add(stdscr,4+pos,1,f"{pos+1 if pos<9 else ' ':>1}  {sev:8}  {host[:16]:16} {kind[:13]:13} {detail[:60]}",curses.A_REVERSE if idx==sel else 0)
-        if not rows:mod.safe_add(stdscr,5,3,"All currently discovered Pis look healthy.",curses.A_BOLD)
-        stdscr.refresh();k=stdscr.getch();g=global_key_ext(k)
-        if g:return g
-        if k in (27,curses.KEY_BACKSPACE,127):return "main"
-        if k in (ord('r'),ord('R')):state["force_refresh"]=True;continue
-        sel,act=mod.list_select_key(k,sel,len(rows),start,vis)
-        if act=="open" and rows:
-            d=rows[sel][0]
-            for i,x in enumerate(state["devices"]):
-                if x.get("addr")==d.get("addr"):state["selected"]=i;break
-            nxt=mod.device_menu(stdscr,state,d)
-            if nxt!="fleet":return nxt
+        refresh_state_async(state, state.pop("force_refresh", False))
+        rows = all_issues(state["devices"])
+        selected = min(selected, max(0, len(rows) - 1))
+        header_ext(stdscr, "Needs Attention", f"{len(rows)} active fleet issue(s). Critical items sort first.")
+        height, _ = stdscr.getmaxyx()
+        visible = max(1, height - 7)
+        start = max(0, selected - visible + 1) if selected >= visible else 0
+        mod.safe_add(stdscr, 3, 1, "#  SEVERITY  DEVICE           ISSUE          DETAIL", curses.A_BOLD | curses.A_UNDERLINE)
+        for pos, (device, severity, kind, detail) in enumerate(rows[start:start + visible]):
+            index = start + pos
+            host = device.get("hostname") or device.get("host") or device.get("addr", "?")
+            attr = curses.A_REVERSE if index == selected else 0
+            mod.safe_add(stdscr, 4 + pos, 1, f"{pos + 1 if pos < 9 else ' ':>1}  {severity:8}  {host[:16]:16} {kind[:13]:13} {detail[:60]}", attr)
+        if not rows:
+            mod.safe_add(stdscr, 5, 3, "All currently discovered Pis look healthy.", curses.A_BOLD)
+        stdscr.refresh()
+        key = stdscr.getch()
+        action = global_key_ext(key)
+        if action:
+            return action
+        if key in (27, curses.KEY_BACKSPACE, 127):
+            return "main"
+        if key in (ord("r"), ord("R")):
+            state["force_refresh"] = True
+            continue
+        selected, action = mod.list_select_key(key, selected, len(rows), start, visible)
+        if action == "open" and rows:
+            device = rows[selected][0]
+            for index, item in enumerate(state["devices"]):
+                if item.get("addr") == device.get("addr"):
+                    state["selected"] = index
+                    break
+            next_screen = mod.device_menu(stdscr, state, device)
+            if next_screen != "fleet":
+                return next_screen
 
 
-def activity_screen(stdscr,state):
-    sel=0
+def activity_screen(stdscr, state):
+    selected = 0
     while True:
-        rows=recent_activity(200);sel=min(sel,max(0,len(rows)-1));header_ext(stdscr,"Fleet Activity",f"{len(rows)} recent event(s), newest first.");h,_=stdscr.getmaxyx();vis=max(1,h-7);start=max(0,sel-vis+1) if sel>=vis else 0
-        mod.safe_add(stdscr,3,1,"#  TIME      LEVEL     DEVICE           EVENT                 DETAIL",curses.A_BOLD|curses.A_UNDERLINE)
-        for pos,r in enumerate(rows[start:start+vis]):
-            idx=start+pos;tm=time.strftime("%H:%M:%S",time.localtime(float(r.get("ts",0) or 0)));mod.safe_add(stdscr,4+pos,1,f"{pos+1 if pos<9 else ' ':>1}  {tm:8} {str(r.get('severity','normal')).upper()[:8]:8} {str(r.get('host','?'))[:16]:16} {str(r.get('event',''))[:20]:20} {str(r.get('detail',''))[:50]}",curses.A_REVERSE if idx==sel else 0)
-        if not rows:mod.safe_add(stdscr,5,3,"No fleet activity recorded yet.")
-        stdscr.refresh();k=stdscr.getch();g=global_key_ext(k)
-        if g:return g
-        if k in (27,curses.KEY_BACKSPACE,127):return "main"
-        if k in (ord('r'),ord('R')):continue
-        sel,_=mod.list_select_key(k,sel,len(rows),start,vis)
+        rows = recent_activity(200)
+        selected = min(selected, max(0, len(rows) - 1))
+        header_ext(stdscr, "Fleet Activity", f"{len(rows)} recent event(s), newest first.")
+        height, _ = stdscr.getmaxyx()
+        visible = max(1, height - 7)
+        start = max(0, selected - visible + 1) if selected >= visible else 0
+        mod.safe_add(stdscr, 3, 1, "#  TIME      LEVEL     DEVICE           EVENT                 DETAIL", curses.A_BOLD | curses.A_UNDERLINE)
+        for pos, row in enumerate(rows[start:start + visible]):
+            index = start + pos
+            stamp = time.strftime("%H:%M:%S", time.localtime(float(row.get("ts", 0) or 0)))
+            attr = curses.A_REVERSE if index == selected else 0
+            mod.safe_add(stdscr, 4 + pos, 1, f"{pos + 1 if pos < 9 else ' ':>1}  {stamp:8} {str(row.get('severity','normal')).upper()[:8]:8} {str(row.get('host','?'))[:16]:16} {str(row.get('event',''))[:20]:20} {str(row.get('detail',''))[:50]}", attr)
+        if not rows:
+            mod.safe_add(stdscr, 5, 3, "No fleet activity recorded yet.")
+        stdscr.refresh()
+        key = stdscr.getch()
+        action = global_key_ext(key)
+        if action:
+            return action
+        if key in (27, curses.KEY_BACKSPACE, 127):
+            return "main"
+        selected, _ = mod.list_select_key(key, selected, len(rows), start, visible)
 
 
 def responsive_app(stdscr):
-    curses.curs_set(0);stdscr.keypad(True);stdscr.timeout(50)
-    state={"devices":[],"discovered":[],"selected":0,"last_refresh":0.0,"last_discovery":0.0,"force_refresh":True,"seen_sudo":set(),"_discovery_future":None,"_refresh_future":None};screen="main"
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.timeout(50)
+    state = {
+        "devices": [],
+        "discovered": [],
+        "selected": 0,
+        "last_refresh": 0.0,
+        "last_discovery": 0.0,
+        "force_refresh": True,
+        "seen_sudo": set(),
+        "_discovery_future": None,
+        "_refresh_future": None,
+    }
+    screen = "main"
     while True:
-        refresh_state_async(state,state.pop("force_refresh",False));mod.maybe_popup_new_sudo(stdscr,state)
-        if screen=="main":screen=main_menu(stdscr,state)
-        elif screen=="attention":screen=attention_screen(stdscr,state)
-        elif screen=="activity":screen=activity_screen(stdscr,state)
-        elif screen=="fleet":screen=mod.fleet_screen(stdscr,state)
-        elif screen=="telemetry":screen=mod.telemetry_screen(stdscr,state)
-        elif screen=="sudo":screen=mod.sudo_screen(stdscr,state)
-        elif screen=="updates":screen=mod.update_screen(stdscr,state)
-        elif screen=="logs":screen=mod.logs_screen(stdscr,state)
-        elif screen=="controller":screen=mod.controller_screen(stdscr,state)
-        elif screen=="help":mod.help_popup(stdscr);screen="main"
-        elif screen=="quit":break
-        else:screen="main"
+        refresh_state_async(state, state.pop("force_refresh", False))
+        mod.maybe_popup_new_sudo(stdscr, state)
+        if screen == "main":
+            screen = main_menu(stdscr, state)
+        elif screen == "attention":
+            screen = attention_screen(stdscr, state)
+        elif screen == "activity":
+            screen = activity_screen(stdscr, state)
+        elif screen == "fleet":
+            screen = mod.fleet_screen(stdscr, state)
+        elif screen == "telemetry":
+            screen = mod.telemetry_screen(stdscr, state)
+        elif screen == "sudo":
+            screen = mod.sudo_screen(stdscr, state)
+        elif screen == "updates":
+            screen = mod.update_screen(stdscr, state)
+        elif screen == "logs":
+            screen = mod.logs_screen(stdscr, state)
+        elif screen == "controller":
+            screen = mod.controller_screen(stdscr, state)
+        elif screen == "help":
+            mod.help_popup(stdscr)
+            screen = "main"
+        elif screen == "quit":
+            break
+        else:
+            screen = "main"
 
-if __name__=="__main__":
-    mod.ensure_root();mod.ensure_dirs()
-    if not os.path.exists(BASE):raise SystemExit(f"Missing Fleet Console base: {BASE}")
-    try:curses.wrapper(responsive_app)
-    finally:workers.shutdown(wait=False,cancel_futures=True)
+
+if __name__ == "__main__":
+    mod.ensure_root()
+    mod.ensure_dirs()
+    if not os.path.exists(BASE):
+        raise SystemExit(f"Missing Fleet Console base: {BASE}")
+    try:
+        curses.wrapper(responsive_app)
+    finally:
+        workers.shutdown(wait=False, cancel_futures=True)
