@@ -1,0 +1,12 @@
+[Unit]
+Description=LGHS Student Discovery Agent
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lghs-agent
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
