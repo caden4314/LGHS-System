@@ -1,0 +1,10 @@
+polkit.addRule(function(action, subject) {
+    if (subject.user == "lg_cs_cont") {
+        if (action.id == "org.freedesktop.NetworkManager.settings.modify.system" ||
+            action.id == "org.freedesktop.NetworkManager.settings.modify.own" ||
+            action.id == "org.freedesktop.NetworkManager.settings.modify.hostname" ||
+            action.id == "org.freedesktop.NetworkManager.settings.modify.global-dns") {
+            return polkit.Result.AUTH_ADMIN;
+        }
+    }
+});
