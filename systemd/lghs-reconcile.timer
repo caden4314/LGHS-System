@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically reconcile LGHS managed configuration
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+RandomizedDelaySec=2min
+Unit=lghs-reconcile.service
+
+[Install]
+WantedBy=timers.target
