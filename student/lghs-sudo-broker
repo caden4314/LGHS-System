@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+import datetime as dt
+import json
+import os
+import secrets
+import shlex
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REQUEST_DIR = Path('/var/lib/lghs/sudo-requests')
+AUDIT_LOG = Path('/var/log/lghs-sudo-audit.jsonl')
+STUDENT = 'lg_cs_cont'
+TTL = 600
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.lghs-', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, separators=(',', ':'))
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+
+
+def audit(event, **fields):
+    record = {'time': now_iso(), 'event': event, **fields}
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+    try:
+        os.write(fd, (json.dumps(record, separators=(',', ':')) + '\n').encode())
+    finally:
+        os.close(fd)
+    try:
+        import grp
+        os.chown(AUDIT_LOG, 0, grp.getgrnam('adm').gr_gid)
+    except Exception:
+        pass
+
+
+def caller():
+    user = os.environ.get('SUDO_USER', '')
+    uid = int(os.environ.get('SUDO_UID', '-1'))
+    if os.geteuid() != 0 or user != STUDENT or uid < 0:
+        raise SystemExit('LGHS sudo broker may only be called by the classroom student through sudo.')
+    return user, uid
+
+
+def safe_cwd(uid):
+    cwd = os.environ.get('LGHS_REQUEST_CWD') or os.getcwd()
+    home = Path('/home') / STUDENT
+    try:
+        resolved = Path(cwd).resolve()
+        if resolved == home or home in resolved.parents:
+            return str(resolved)
+    except Exception:
+        pass
+    return str(home)
+
+
+def request(argv):
+    user, uid = caller()
+    if not argv:
+        raise SystemExit('No command supplied.')
+    if len(argv) > 128 or sum(len(x) for x in argv) > 16384:
+        raise SystemExit('Command is too large for LGHS approval.')
+    rid = secrets.token_hex(12)
+    created = time.time()
+    data = {
+        'id': rid,
+        'device_id': read_device_id(),
+        'requester': user,
+        'requester_uid': uid,
+        'cwd': safe_cwd(uid),
+        'argv': argv,
+        'command': shlex.join(argv),
+        'status': 'pending',
+        'requested_at': now_iso(),
+        'requested_epoch': created,
+        'expires_epoch': created + TTL,
+    }
+    REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(REQUEST_DIR, 0o700)
+    atomic_write(REQUEST_DIR / f'{rid}.json', data)
+    audit('requested', request_id=rid, device_id=data['device_id'], requester=user,
+          cwd=data['cwd'], argv=argv)
+    print(rid)
+
+
+def status(rid):
+    user, uid = caller()
+    path = REQUEST_DIR / f'{rid}.json'
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        raise SystemExit('Unknown LGHS sudo request.')
+    if data.get('requester') != user or int(data.get('requester_uid', -2)) != uid:
+        raise SystemExit('Request does not belong to this user.')
+    if data.get('status') == 'pending' and time.time() > float(data.get('expires_epoch', 0)):
+        data['status'] = 'expired'
+        data['resolved_at'] = now_iso()
+        atomic_write(path, data)
+        audit('expired', request_id=rid, device_id=data.get('device_id'), requester=user)
+    print(json.dumps({'id': rid, 'status': data.get('status', 'unknown'),
+                      'command': data.get('command', ''), 'reason': data.get('reason', '')}))
+
+
+def read_device_id():
+    try:
+        for line in Path('/etc/lghs/device.conf').read_text(encoding='utf-8').splitlines():
+            if line.startswith('DEVICE_ID='):
+                return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return os.uname().nodename
+
+
+def main():
+    if len(sys.argv) < 2:
+        raise SystemExit('Usage: lghs-sudo-broker request -- command... | status ID')
+    action = sys.argv[1]
+    if action == 'request':
+        args = sys.argv[2:]
+        if args and args[0] == '--': args = args[1:]
+        request(args)
+    elif action == 'status' and len(sys.argv) == 3:
+        status(sys.argv[2])
+    else:
+        raise SystemExit('Invalid LGHS sudo broker request.')
+
+if __name__ == '__main__':
+    main()
