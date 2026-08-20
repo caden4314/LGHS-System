@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import hashlib
 import json
 import os
 import sys
@@ -20,10 +19,9 @@ def die(msg):
 
 def metadata(path):
     if not path.exists():
-        return {'size': 0, 'head_sha256': ''}
-    with path.open('rb') as f:
-        head = f.read(512)
-    return {'size': path.stat().st_size, 'head_sha256': hashlib.sha256(head).hexdigest()}
+        return {'size': 0, 'inode': 0}
+    st = path.stat()
+    return {'size': st.st_size, 'inode': st.st_ino}
 
 
 def main():
