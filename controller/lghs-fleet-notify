@@ -1,131 +1,126 @@
 #!/usr/bin/env python3
-"""Background LGHS fleet desktop notifications for the Control Pi."""
-import importlib.machinery
-import importlib.util
-import json
-import os
-import pwd
-import shutil
-import subprocess
-import time
+"""Background LGHS fleet notifications and activity feed."""
+import importlib.machinery, importlib.util, json, os, pwd, shutil, subprocess, time
 from pathlib import Path
 
-BASE = "/usr/local/libexec/lghs-console-base"
-STATE = Path("/var/lib/lghs/fleet-notify-state.json")
-UPDATE_LOG = Path("/var/log/lghs-update.log")
-OS_UPDATE_LOG = Path("/var/log/lghs-os-update.log")
-POLL_SECONDS = 5
+BASE="/usr/local/libexec/lghs-console-base"
+STATE=Path("/var/lib/lghs/fleet-notify-state.json")
+ACTIVITY=Path("/var/log/lghs-fleet/activity.jsonl")
+UPDATE_LOG=Path("/var/log/lghs-update.log")
+OS_UPDATE_LOG=Path("/var/log/lghs-os-update.log")
+POLL_SECONDS=5
+DEDUP_SECONDS=300
+TEMP_WARN=80.0
+TEMP_CRIT=85.0
+DISK_WARN=90.0
+DISK_CRIT=96.0
 
 
 def load_base():
-    loader = importlib.machinery.SourceFileLoader("lghs_console_notify_base", BASE)
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    loader=importlib.machinery.SourceFileLoader("lghs_console_notify_base",BASE)
+    spec=importlib.util.spec_from_loader(loader.name,loader)
+    mod=importlib.util.module_from_spec(spec);loader.exec_module(mod);return mod
+mod=load_base()
 
 
-mod = load_base()
-
-
-def notify(title, body, urgency="normal"):
-    if not shutil.which("notify-send"):
-        return
+def notify(title,body,urgency="normal"):
+    if not shutil.which("notify-send"): return
+    try:user=pwd.getpwnam("cs_admin")
+    except KeyError:return
+    bus=f"/run/user/{user.pw_uid}/bus"
+    if not os.path.exists(bus):return
     try:
-        user = pwd.getpwnam("cs_admin")
-    except KeyError:
-        return
-    bus = f"/run/user/{user.pw_uid}/bus"
-    if not os.path.exists(bus):
-        return
-    envarg = f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}"
-    try:
-        subprocess.run(
-            ["runuser", "-u", "cs_admin", "--", "env", envarg,
-             "notify-send", "-a", "LGHS Fleet", "-u", urgency, title, body],
-            timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except Exception:
-        pass
+        subprocess.run(["runuser","-u","cs_admin","--","env",f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}","notify-send","-a","LGHS Fleet","-u",urgency,title,body],timeout=5,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+    except Exception:pass
 
 
 def load_state():
+    try:s=json.loads(STATE.read_text(encoding="utf-8"))
+    except Exception:s={}
+    for k,v in {"initialized":False,"devices":{},"sudo_seen":[],"logs":{},"dedupe":{}}.items():s.setdefault(k,v)
+    return s
+
+
+def save_state(s):
+    STATE.parent.mkdir(parents=True,exist_ok=True);tmp=STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(s,sort_keys=True),encoding="utf-8");os.replace(tmp,STATE)
+
+
+def activity(severity,event,host,detail=""):
+    ACTIVITY.parent.mkdir(parents=True,exist_ok=True)
+    with ACTIVITY.open("a",encoding="utf-8") as f:f.write(json.dumps({"ts":time.time(),"severity":severity,"event":event,"host":host,"detail":detail},separators=(",",":"))+"\n")
+
+
+def emit(s,key,severity,title,body,host,event):
+    now=time.time();last=float(s["dedupe"].get(key,0) or 0)
+    if now-last<DEDUP_SECONDS:return
+    s["dedupe"][key]=now
+    notify(title,body,"critical" if severity=="critical" else "normal")
+    activity(severity,event,host,body)
+
+
+def num(v):
+    try:return float(v)
+    except Exception:return None
+
+
+def issues(d):
+    host=d.get("hostname") or d.get("host") or d.get("addr","?");out=[]
+    if not d.get("online"):
+        return [("critical","ssh",f"{host} is not responding over fleet SSH")]
+    temp=num(d.get("temp_c"));disk=num(d.get("disk_pct"))
+    if temp is not None and temp>=TEMP_CRIT:out.append(("critical","temperature",f"temperature {temp:.1f}C"))
+    elif temp is not None and temp>=TEMP_WARN:out.append(("warning","temperature",f"temperature {temp:.1f}C"))
+    if disk is not None and disk>=DISK_CRIT:out.append(("critical","disk",f"disk usage {disk:.0f}%"))
+    elif disk is not None and disk>=DISK_WARN:out.append(("warning","disk",f"disk usage {disk:.0f}%"))
+    expected=["update_timer","reconcile_timer"]
+    if d.get("role")=="student":expected += ["agent","policy","ssh","networkmanager","avahi"]
+    for k in expected:
+        v=d.get(k)
+        if v and v!="active":out.append(("critical" if k in ("ssh","policy") else "warning",f"service:{k}",f"{k} is {v}"))
+    if d.get("update_service")=="failed":out.append(("critical","update-failure","LGHS update service failed"))
+    if d.get("role")=="student" and d.get("student_sudo")=="yes":out.append(("critical","student-sudo","student account unexpectedly belongs to sudo"))
+    return out
+
+
+def newest(path):
     try:
-        return json.loads(STATE.read_text(encoding="utf-8"))
-    except Exception:
-        return {"initialized": False, "devices": {}, "sudo_seen": [], "logs": {}}
-
-
-def save_state(state):
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, STATE)
-
-
-def newest_log_line(path):
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        return lines[-1] if lines else ""
-    except Exception:
-        return ""
+        lines=path.read_text(encoding="utf-8",errors="replace").splitlines();return lines[-1] if lines else ""
+    except Exception:return ""
 
 
 def main():
-    state = load_state()
+    s=load_state()
     while True:
         try:
-            discovered = mod.discover_devices()
-            devices = mod.refresh_fleet(discovered)
-            current = {}
-            seen_now = set(state.get("sudo_seen", []))
-
+            devices=mod.refresh_fleet(mod.discover_devices());current={};seen=set(s.get("sudo_seen",[]))
             for d in devices:
-                addr = d.get("addr", "?")
-                host = d.get("hostname") or d.get("host") or addr
-                online = bool(d.get("online"))
-                current[addr] = {"host": host, "online": online}
-
-                previous = state.get("devices", {}).get(addr)
-                if state.get("initialized") and previous is not None and previous.get("online") != online:
-                    if online:
-                        notify("LGHS Pi online", f"{host} ({addr}) is back online.")
-                    else:
-                        notify("LGHS Pi offline", f"{host} ({addr}) is no longer responding.", "critical")
-
-                for req in d.get("sudo_requests", []):
-                    rid = str(req.get("id", ""))
-                    key = f"{addr}:{rid}"
-                    if not rid:
-                        continue
-                    if state.get("initialized") and key not in seen_now:
-                        cmd = req.get("command", "sudo request")
-                        notify("LGHS sudo request", f"{host}: {cmd}", "critical")
-                    seen_now.add(key)
-
-            # Keep only a bounded history of request IDs.
-            state["sudo_seen"] = list(seen_now)[-500:]
-            state["devices"] = current
-
-            for name, path in (("LGHS update", UPDATE_LOG), ("Raspberry Pi OS update", OS_UPDATE_LOG)):
-                line = newest_log_line(path)
-                old = state.get("logs", {}).get(name, "")
-                if state.get("initialized") and line and line != old:
-                    urgency = "critical" if "fail" in line.lower() or "error" in line.lower() else "normal"
-                    notify(name, line, urgency)
-                state.setdefault("logs", {})[name] = line
-
-            state["initialized"] = True
-            save_state(state)
+                addr=d.get("addr","?");host=d.get("hostname") or d.get("host") or addr;online=bool(d.get("online"));prev=s.get("devices",{}).get(addr,{})
+                curissues={k:[sev,msg] for sev,k,msg in issues(d)};oldissues=prev.get("issues",{}) if isinstance(prev,dict) else {}
+                current[addr]={"host":host,"online":online,"last_seen":time.time() if online else prev.get("last_seen",0),"issues":curissues}
+                if s.get("initialized") and prev and prev.get("online")!=online:
+                    if online:emit(s,f"online:{addr}","normal","LGHS Pi online",f"{host} ({addr}) is back online.",host,"Pi online")
+                    else:emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) is offline or SSH is unreachable.",host,"Pi offline")
+                for key,(sev,msg) in curissues.items():
+                    if key not in oldissues:
+                        emit(s,f"issue:{addr}:{key}",sev,"LGHS CRITICAL" if sev=="critical" else "LGHS warning",f"{host}: {msg}",host,"Fleet health")
+                for req in d.get("sudo_requests",[]):
+                    rid=str(req.get("id",""));rk=f"{addr}:{rid}"
+                    if rid and s.get("initialized") and rk not in seen:
+                        emit(s,f"sudo:{rk}","warning","LGHS sudo request",f"{host}: {req.get('command','sudo request')}",host,"Sudo requested")
+                    if rid:seen.add(rk)
+            s["sudo_seen"]=list(seen)[-500:];s["devices"]=current
+            for name,path in (("LGHS update",UPDATE_LOG),("Raspberry Pi OS update",OS_UPDATE_LOG)):
+                line=newest(path);old=s["logs"].get(name,"")
+                if s.get("initialized") and line and line!=old:
+                    sev="critical" if any(x in line.lower() for x in ("fail","error","rollback")) else "normal"
+                    emit(s,f"log:{name}:{line}",sev,"LGHS CRITICAL" if sev=="critical" else name,line,"LGCSCONT",name)
+                s["logs"][name]=line
+            s["initialized"]=True
+            cutoff=time.time()-86400;s["dedupe"]={k:v for k,v in s["dedupe"].items() if float(v or 0)>=cutoff};save_state(s)
         except Exception as exc:
-            # Notification failures must never affect fleet management.
-            try:
-                subprocess.run(["logger", "-t", "LGHS-FLEET-NOTIFY", str(exc)], check=False)
-            except Exception:
-                pass
+            try:subprocess.run(["logger","-t","LGHS-FLEET-NOTIFY",str(exc)],check=False)
+            except Exception:pass
         time.sleep(POLL_SECONDS)
 
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":main()
