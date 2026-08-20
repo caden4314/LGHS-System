@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Build Raspberry Pi's network panel with the LGHS student-only UI restriction.
+# Normal Wi-Fi selection/on/off remains available. The Advanced Options submenu
+# (connection information, connection editor, VPN creation/configuration) is not
+# added when wf-panel-pi is running as lg_cs_cont.
+
+[[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
+
+SRC=/usr/local/src/lghs-pplug-netman
+COMMIT=9064d7b4f9c3c841bfd195dae9e0bf8110412d0f
+BUILD_PKGS=(
+  meson ninja-build
+  libgtk-3-dev libgtkmm-3.0-dev
+  lxpanel-pi-dev wf-panel-pi-dev
+  libgtk-layer-shell-dev libglm-dev
+  libsecret-1-dev libnm-dev libnma-dev
+)
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends "${BUILD_PKGS[@]}"
+
+rm -rf "$SRC"
+git clone --quiet https://github.com/raspberrypi-ui/pplug-netman.git "$SRC"
+git -C "$SRC" checkout --quiet "$COMMIT"
+
+python3 - "$SRC/src/applet.c" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+include_old = '#include <unistd.h>\n#include <sys/socket.h>'
+include_new = '#include <unistd.h>\n#include <pwd.h>\n#include <sys/socket.h>'
+if include_old not in s:
+    raise SystemExit('LGHS patch failed: include anchor not found')
+s = s.replace(include_old, include_new, 1)
+
+anchor = 'G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN'
+helper = '''G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN\nstatic gboolean lghs_restricted_student (void)\n{\n    struct passwd *pw = getpwuid (geteuid ());\n    return pw && pw->pw_name && strcmp (pw->pw_name, "lg_cs_cont") == 0;\n}\n#endif\n\n#ifdef LXPANEL_PLUGIN'''
+if anchor not in s:
+    raise SystemExit('LGHS patch failed: type anchor not found')
+s = s.replace(anchor, helper, 1)
+
+menu_old = '\tnma_menu_add_vpn_submenu (menu, applet);\n\n\tif (!INDICATOR_ENABLED (applet))'
+menu_new = '''#ifdef LXPANEL_PLUGIN\n\tif (!lghs_restricted_student ())\n\t\tnma_menu_add_vpn_submenu (menu, applet);\n#else\n\tnma_menu_add_vpn_submenu (menu, applet);\n#endif\n\n\tif (!INDICATOR_ENABLED (applet))'''
+if menu_old not in s:
+    raise SystemExit('LGHS patch failed: Advanced Options menu anchor not found')
+s = s.replace(menu_old, menu_new, 1)
+
+p.write_text(s)
+PY
+
+rm -rf "$SRC/build"
+meson setup "$SRC/build" "$SRC" --prefix=/usr --libdir=/usr/lib/aarch64-linux-gnu
+meson compile -C "$SRC/build"
+meson install -C "$SRC/build"
+
+# Verify the installed Wayfire panel plugin exists. Debian package layout can
+# also install the LXPanel build, but LGHS targets wf-panel-pi on current Pi OS.
+if ! find /usr/lib/aarch64-linux-gnu -type f \( -name '*netman*.so' -o -name '*netman*' \) -print -quit | grep -q .; then
+    echo 'LGHS: patched network panel install verification failed' >&2
+    exit 1
+fi
+
+rm -rf "$SRC"
+apt-get purge -y "${BUILD_PKGS[@]}" || true
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+
+echo 'LGHS: restricted student network UI installed.'
