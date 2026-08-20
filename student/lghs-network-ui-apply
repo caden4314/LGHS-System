@@ -7,6 +7,7 @@ VERSION_FILE="/usr/local/lib/lghs/libnetman.package-version"
 BACKUP_DIR="/usr/local/lib/lghs-backups"
 EDITOR="/usr/bin/lp-connection-editor"
 EDITOR_REAL="/usr/lib/lghs/lp-connection-editor.real"
+REBUILD=0
 
 log(){ logger -t LGHS-NETWORK-UI "$*" 2>/dev/null || true;printf '[LGHS network UI] %s\n' "$*"; }
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2;exit 1; }
@@ -15,8 +16,9 @@ install -d -m 0755 /usr/local/lib/lghs "$BACKUP_DIR" /usr/lib/lghs
 CURRENT_VERSION="$(dpkg-query -W -f='${Version}' wfplug-netman 2>/dev/null || echo unknown)"
 BUILT_VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
 if [[ -f "$HARDENED_LIB" && "$CURRENT_VERSION" != "unknown" && "$BUILT_VERSION" != "unknown" && "$CURRENT_VERSION" != "$BUILT_VERSION" ]];then
-    log "wfplug-netman changed ($BUILT_VERSION -> $CURRENT_VERSION); scheduling hardened plugin rebuild."
+    log "wfplug-netman changed ($BUILT_VERSION -> $CURRENT_VERSION); rebuilding hardened plugin."
     rm -f "$HARDENED_LIB" "$VERSION_FILE"
+    REBUILD=1
 fi
 
 if [[ -f "$HARDENED_LIB" ]]; then
@@ -28,8 +30,6 @@ if [[ -f "$HARDENED_LIB" ]]; then
     else log "wf-panel-pi libnetman.so not found; UI plugin enforcement skipped.";fi
 fi
 
-# Defense in depth: if an update replaces the real editor, preserve the new copy
-# and reinstall the student guard around it.
 if [[ -x "$EDITOR" && ! -L "$EDITOR" ]];then
     if ! grep -q 'LGHS_NETWORK_EDITOR_GUARD' "$EDITOR" 2>/dev/null;then
         mv -f "$EDITOR" "$EDITOR_REAL"
@@ -47,3 +47,7 @@ EOF
 fi
 
 if [[ -d /etc/NetworkManager/system-connections ]];then find /etc/NetworkManager/system-connections -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 0600 {} +;fi
+
+if [[ $REBUILD -eq 1 && -x /usr/local/sbin/lghs-install-network-ui ]];then
+    exec /usr/local/sbin/lghs-install-network-ui
+fi
