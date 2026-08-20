@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+
+REAL_SUDO = '/usr/bin/sudo'
+STUDENT = 'lg_cs_cont'
+POLL_SECONDS = 1.0
+
+
+def run(cmd, env=None):
+    return subprocess.run(cmd, text=True, capture_output=True, env=env)
+
+
+def main():
+    # Admin/root keep normal sudo behavior. Only the classroom student is routed
+    # through LGHS approval.
+    if os.environ.get('USER') != STUDENT:
+        os.execv(REAL_SUDO, [REAL_SUDO] + sys.argv[1:])
+
+    argv = sys.argv[1:]
+    if not argv:
+        print('LGHS managed sudo: enter a command, for example: sudo apt install python3-numpy')
+        return 1
+    if argv[0].startswith('-'):
+        print('LGHS managed sudo does not accept sudo options. Request the command itself.', file=sys.stderr)
+        return 2
+
+    env = dict(os.environ)
+    env['LGHS_REQUEST_CWD'] = os.getcwd()
+    req = run([REAL_SUDO, '-n', '/usr/local/sbin/lghs-sudo-broker', 'request', '--'] + argv, env=env)
+    if req.returncode != 0:
+        sys.stderr.write(req.stderr or req.stdout)
+        return req.returncode
+    rid = req.stdout.strip().splitlines()[-1]
+    print(f'LGHS sudo request {rid[:8]} submitted.')
+    print(f'Waiting for teacher approval: {shlex.join(argv)}')
+    print('Press Ctrl+C to stop waiting; the request will expire automatically.')
+
+    try:
+        while True:
+            time.sleep(POLL_SECONDS)
+            p = run([REAL_SUDO, '-n', '/usr/local/sbin/lghs-sudo-broker', 'status', rid])
+            if p.returncode != 0:
+                sys.stderr.write(p.stderr or p.stdout)
+                return p.returncode
+            try:
+                state = json.loads(p.stdout).get('status')
+            except Exception:
+                continue
+            if state == 'pending':
+                continue
+            if state == 'approved':
+                print('Approved. Running command...')
+                return subprocess.call([REAL_SUDO, '-n', '/usr/local/sbin/lghs-approved-exec', rid, '--'] + argv)
+            if state == 'denied':
+                print('LGHS sudo request denied.', file=sys.stderr)
+                return 126
+            if state == 'expired':
+                print('LGHS sudo request expired. Submit it again if still needed.', file=sys.stderr)
+                return 124
+            print(f'LGHS sudo request ended with state: {state}', file=sys.stderr)
+            return 126
+    except KeyboardInterrupt:
+        print('\nStopped waiting. The pending request will expire automatically.')
+        return 130
+
+if __name__ == '__main__':
+    raise SystemExit(main())
