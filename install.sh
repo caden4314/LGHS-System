@@ -75,12 +75,20 @@ if [[ "$ROLE" == "controller" ]]; then
   install -d -m 0755 /usr/local/libexec
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/libexec/lghsctl-real
   install -m 0755 "$ROOT_DIR/controller/lghsctl-wrapper" /usr/local/sbin/lghsctl
-  install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/sbin/lghs-console
+
+  # Keep the complete original console implementation as a module and install a
+  # thin responsive launcher that performs discovery/SSH refresh in background
+  # workers instead of blocking curses keyboard input.
+  install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-base
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-responsive" /usr/local/sbin/lghs-console
+  install -m 0755 "$ROOT_DIR/controller/lghs-fleet-notify" /usr/local/sbin/lghs-fleet-notify
+  install -m 0644 "$ROOT_DIR/systemd/lghs-fleet-notify.service" /etc/systemd/system/lghs-fleet-notify.service
+
   install -m 0755 "$ROOT_DIR/controller/lghs-audit-sync" /usr/local/sbin/lghs-audit-sync
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.service" /etc/systemd/system/lghs-audit-sync.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.timer" /etc/systemd/system/lghs-audit-sync.timer
 
-  CTRL_PKGS=(avahi-daemon avahi-utils)
+  CTRL_PKGS=(avahi-daemon avahi-utils libnotify-bin)
   MISSING_PKGS=()
   for pkg in "${CTRL_PKGS[@]}"; do dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg"); done
   if (( ${#MISSING_PKGS[@]} )); then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"; fi
@@ -160,17 +168,22 @@ fi
 
 visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
-systemctl enable lghs-update.service lghs-update.timer lghs-firstboot-provision.service lghs-reconcile.timer lghs-netqueue.timer avahi-daemon.service
-if [[ "$ROLE" == "student" ]]; then systemctl enable lghs-policy.service lghs-agent.service ssh; else systemctl enable lghs-audit-sync.timer; fi
+
+# Enable AND start timers immediately. Using only `enable` left fresh installs
+# showing inactive timers until a later reboot.
+systemctl enable lghs-update.service lghs-firstboot-provision.service avahi-daemon.service
+systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
+if [[ "$ROLE" == "student" ]]; then
+  systemctl enable --now lghs-policy.service lghs-agent.service ssh.service
+else
+  systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service
+fi
 
 /usr/local/sbin/lghs-access-enforce
 
 if systemctl is-system-running --quiet 2>/dev/null || systemctl is-system-running 2>/dev/null | grep -Eq 'running|degraded'; then
   systemctl try-restart avahi-daemon.service || true
-  systemctl try-restart lghs-reconcile.timer || true
-  systemctl try-restart lghs-netqueue.timer || true
   systemctl start --no-block lghs-netqueue.service >/dev/null 2>&1 || true
-  if [[ "$ROLE" == "student" ]]; then systemctl try-restart lghs-policy.service lghs-agent.service ssh.service || true; else systemctl try-restart lghs-audit-sync.timer || true; fi
 fi
 
 echo "LGHS $ROLE installation completed."
