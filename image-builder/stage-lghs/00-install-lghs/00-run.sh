@@ -38,6 +38,9 @@ on_chroot <<EOF
 set -e
 cd ${CHROOT_SOURCE}
 /bin/bash ./install.sh ${LGHS_ROLE}
+if [[ "${LGHS_ROLE}" == "student" ]]; then
+    /bin/bash ./student/lghs-install-network-ui
+fi
 EOF
 
 # Classroom development environment shared by both roles.
@@ -115,5 +118,9 @@ EOF
 
 rm -rf "${ROOTFS_DIR}${CHROOT_SOURCE}"
 echo "LGHS: ${LGHS_ROLE} role installed for ${IMAGE_HOSTNAME}."
+echo "LGHS: first-boot Imager provisioning enabled."
 echo "LGHS: fleet SSH enrollment configured."
+if [[ "$LGHS_ROLE" == "student" ]]; then
+    echo "LGHS: restricted NetworkManager panel UI installed for lg_cs_cont."
+fi
 echo "LGHS: VS Code opens ~/CS2 with hello.py and classroom folders ready."
