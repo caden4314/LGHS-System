@@ -1,0 +1,46 @@
+name: LGHS Validate
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax
+        run: |
+          python3 -m py_compile \
+            controller/lghs-console \
+            controller/lghsctl \
+            controller/lghs-audit-sync \
+            student/lghs-sudo-broker \
+            student/lghs-approved-exec \
+            student/lghs-sudo-admin \
+            student/lghs-audit-export \
+            student/sudo
+
+      - name: Shell syntax
+        run: |
+          bash -n install.sh
+          bash -n updater/lghs-update
+          bash -n updater/lghs-os-update
+          bash -n updater/lghs-autologin-apply
+          bash -n updater/lghs-reconcile
+          bash -n updater/lghs-access-enforce
+          bash -n student/lghs-enforce
+          bash -n student/lghs-check
+          bash -n student/lghs-agent
+          bash -n student/lghs-firstboot-provision
+          bash -n student/lghs-install-network-ui
+          bash -n student/lghs-network-ui-apply
+          bash -n student/lghs-dev-setup
+
+      - name: Sudoers syntax
+        run: |
+          sudo visudo -cf policies/sudoers/89-lghs-audit
+          sudo visudo -cf policies/sudoers/90-lghs-student
