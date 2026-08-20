@@ -1,0 +1,12 @@
+[Unit]
+Description=Collect LGHS fleet audit logs periodically
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+Persistent=true
+RandomizedDelaySec=10s
+Unit=lghs-audit-sync.service
+
+[Install]
+WantedBy=timers.target
