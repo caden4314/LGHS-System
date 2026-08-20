@@ -3,8 +3,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PI_GEN_DIR="${PI_GEN_DIR:-$HOME/pi-gen}"
-KEY_STORE="${LGHS_KEY_STORE:-$HOME/.config/lghs/image-secrets}"
-FLEET_KEY="${KEY_STORE}/controller_ed25519"
 MODE="auto"
 TARGET_HOSTNAME=""
 
@@ -17,8 +15,9 @@ Modes:
   --fresh  Rebuild Raspberry Pi OS and LGHS from scratch
   --fast   Reuse completed stage0-stage4 cache and rebuild LGHS + export only
 
-The first run creates a persistent fleet SSH key under ~/.config/lghs/image-secrets.
-Controller images receive the private key; student images receive only its public key.
+Published LGHS images are fleet-key neutral. The Control Pi generates its
+Ed25519 fleet key locally; Student Pis are enrolled once with their per-device
+cs_admin password and then switch to public-key-only fleet SSH.
 EOF
 }
 
@@ -42,7 +41,6 @@ fi
 
 HOST_LOWER="$(printf '%s' "$TARGET_HOSTNAME" | tr '[:upper:]' '[:lower:]')"
 [[ "$HOST_LOWER" == *cont* ]] && EXPECTED_ROLE="controller" || EXPECTED_ROLE="student"
-
 IMG_NAME="LGHS-${TARGET_HOSTNAME}"
 WORK_DIR="${PI_GEN_DIR}/work/${IMG_NAME}"
 BASE_CACHE="${WORK_DIR}/stage4/rootfs"
@@ -53,6 +51,7 @@ printf '  Target hostname: %s\n' "$TARGET_HOSTNAME"
 printf '  Expected role:   %s\n' "$EXPECTED_ROLE"
 printf '  LGHS commit:     %s\n' "$SOURCE_COMMIT"
 printf '  pi-gen:          %s\n' "$PI_GEN_DIR"
+printf '  Fleet secrets:   none baked into image\n'
 
 if [[ ! -d "${PI_GEN_DIR}/.git" ]]; then
     git clone --branch arm64 https://github.com/RPi-Distro/pi-gen.git "$PI_GEN_DIR"
@@ -62,33 +61,19 @@ else
     git -C "$PI_GEN_DIR" pull --ff-only origin arm64
 fi
 
-# One persistent classroom fleet keypair is reused for all images built here.
-install -d -m 0700 "$KEY_STORE"
-if [[ ! -f "$FLEET_KEY" ]]; then
-    echo "Creating LGHS fleet SSH keypair in $KEY_STORE"
-    ssh-keygen -q -t ed25519 -N '' -C 'LGHS fleet controller' -f "$FLEET_KEY"
-fi
-chmod 0600 "$FLEET_KEY"
-chmod 0644 "$FLEET_KEY.pub"
-printf '  Fleet key:       %s\n' "$FLEET_KEY.pub"
-
 chmod +x "$REPO_ROOT/image-builder/stage-lghs/prerun.sh"
 chmod +x "$REPO_ROOT/image-builder/stage-lghs/00-install-lghs/00-run.sh"
 
 STAGE_FILES="$REPO_ROOT/image-builder/stage-lghs/00-install-lghs/files"
 STAGED_SOURCE="$STAGE_FILES/LGHS-System"
-STAGED_KEYS="$STAGE_FILES/fleet-keys"
-rm -rf "$STAGED_SOURCE" "$STAGED_KEYS"
-mkdir -p "$STAGED_SOURCE" "$STAGED_KEYS"
-
+rm -rf "$STAGED_SOURCE" "$STAGE_FILES/fleet-keys"
+mkdir -p "$STAGED_SOURCE"
 rsync -a --delete \
     --exclude '.git/' \
     --exclude 'image-builder/stage-lghs/00-install-lghs/files/' \
     --exclude 'work/' --exclude 'deploy/' \
     "$REPO_ROOT/" "$STAGED_SOURCE/"
 printf '%s\n' "$SOURCE_COMMIT" > "$STAGED_SOURCE/.lghs-source-commit"
-install -m 0600 "$FLEET_KEY" "$STAGED_KEYS/controller_ed25519"
-install -m 0644 "$FLEET_KEY.pub" "$STAGED_KEYS/controller_ed25519.pub"
 
 # Only export the final LGHS stage.
 touch "$PI_GEN_DIR/stage2/SKIP_IMAGES" "$PI_GEN_DIR/stage4/SKIP_IMAGES" "$PI_GEN_DIR/stage5/SKIP_IMAGES"
@@ -118,7 +103,6 @@ SKIP_FILES=()
 cleanup() {
     local f
     for f in "${SKIP_FILES[@]:-}"; do rm -f "$f"; done
-    rm -rf "$STAGED_KEYS"
 }
 trap cleanup EXIT INT TERM
 
@@ -126,8 +110,6 @@ if [[ "$MODE" == "fast" ]]; then
     [[ -f "$BASE_CACHE/etc/os-release" ]] || { echo "No completed stage4 cache; run --fresh once." >&2; exit 1; }
     echo
     echo "FAST REBUILD MODE"
-    echo "  Reusing completed Raspberry Pi OS stage0-stage4 cache."
-    echo "  Rebuilding LGHS customization and final image export."
     for stage in stage0 stage1 stage2 stage3 stage4; do
         skip_file="$PI_GEN_DIR/$stage/SKIP"
         if [[ ! -e "$skip_file" ]]; then touch "$skip_file"; SKIP_FILES+=("$skip_file"); fi
@@ -143,10 +125,7 @@ fi
 find "$PI_GEN_DIR/deploy" -maxdepth 1 -type f \
     \( -name "*${IMG_NAME}*" -o -name "*${TARGET_HOSTNAME}*" \) -delete 2>/dev/null || true
 
-printf '\nBuild mode: %s\n' "$MODE"
-printf 'Fleet SSH enrollment: enabled\n'
-printf 'Compression level: 1\n\n'
-
+printf '\nBuild mode: %s\n\n' "$MODE"
 cd "$PI_GEN_DIR"
 sudo env "${BUILD_ENV[@]}" ./build.sh -c config.lghs
 
