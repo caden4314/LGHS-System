@@ -63,16 +63,20 @@ decode_secret() {
 DEVICE_ID="$(read_value DEVICE_ID "$PUBLIC_CONF")"
 TARGET_HOSTNAME="$(read_value TARGET_HOSTNAME "$PUBLIC_CONF")"
 ROLE="$(read_value ROLE "$PUBLIC_CONF")"
-USER_NAME="$(read_value USER_NAME "$SECRET_CONF")"
-ADMIN_NAME="$(read_value ADMIN_NAME "$SECRET_CONF")"
-ROOT_NAME="$(read_value ROOT_NAME "$SECRET_CONF")"
+USER_NAME="$(read_value USER_ACCOUNT "$PUBLIC_CONF")"
+ADMIN_NAME="$(read_value ADMIN_ACCOUNT "$PUBLIC_CONF")"
+ROOT_NAME="$(read_value ROOT_ACCOUNT "$PUBLIC_CONF")"
+ROOT_SAME_AS_ADMIN="$(read_value ROOT_SAME_AS_ADMIN "$PUBLIC_CONF")"
+ENCODING="$(read_value ENCODING "$SECRET_CONF")"
 
 require_simple_value DEVICE_ID "$DEVICE_ID"
 require_simple_value TARGET_HOSTNAME "$TARGET_HOSTNAME"
 require_simple_value ROLE "$ROLE"
-require_simple_value USER_NAME "$USER_NAME"
-require_simple_value ADMIN_NAME "$ADMIN_NAME"
-require_simple_value ROOT_NAME "$ROOT_NAME"
+require_simple_value USER_ACCOUNT "$USER_NAME"
+require_simple_value ADMIN_ACCOUNT "$ADMIN_NAME"
+require_simple_value ROOT_ACCOUNT "$ROOT_NAME"
+[[ "$ROOT_SAME_AS_ADMIN" == "0" || "$ROOT_SAME_AS_ADMIN" == "1" ]] || { log "Invalid ROOT_SAME_AS_ADMIN value"; exit 1; }
+[[ "$ENCODING" == "base64-utf8" ]] || { log "Unsupported secret encoding: $ENCODING"; exit 1; }
 
 [[ "$ROLE" == "student" || "$ROLE" == "controller" ]] || { log "Invalid role: $ROLE"; exit 1; }
 [[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,62}$ ]] || { log "Invalid hostname: $TARGET_HOSTNAME"; exit 1; }
@@ -87,6 +91,10 @@ ROOT_PASSWORD="$(decode_secret ROOT_PASSWORD_B64)"
 [[ -n "$USER_PASSWORD" ]] || { log "User password is empty"; exit 1; }
 [[ -n "$ADMIN_PASSWORD" ]] || { log "Admin password is empty"; exit 1; }
 [[ -n "$ROOT_PASSWORD" ]] || { log "Root password is empty"; exit 1; }
+if [[ "$ROOT_SAME_AS_ADMIN" == "1" && "$ROOT_PASSWORD" != "$ADMIN_PASSWORD" ]]; then
+    log "Root/Admin password-link verification failed"
+    exit 1
+fi
 
 # Ensure the expected accounts exist before applying credentials.
 if ! id "$STUDENT_USER" >/dev/null 2>&1; then
