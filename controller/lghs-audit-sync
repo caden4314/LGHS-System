@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+SERVICE = '_lghs._tcp'
+SSH_USER = 'cs_admin'
+KEY_FILE = '/etc/lghs/secrets/controller_ed25519'
+KNOWN_HOSTS = '/var/lib/lghs/ssh_known_hosts'
+CONTROL_DIR = '/run/lghs-ssh'
+BASE = Path('/var/log/lghs-fleet')
+STATE = Path('/var/lib/lghs/audit-sync-state.json')
+KINDS = ('sudo', 'audit', 'update', 'os-update')
+
+
+def run(cmd):
+    return subprocess.run(cmd, text=True, capture_output=True)
+
+
+def ensure_dirs():
+    BASE.mkdir(parents=True, exist_ok=True)
+    os.chmod(BASE, 0o750)
+    Path(CONTROL_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def discover():
+    if not shutil.which('avahi-browse'):
+        return []
+    p = run(['avahi-browse', '-rtp', SERVICE])
+    out, seen = [], set()
+    for line in p.stdout.splitlines():
+        if not line.startswith('='):
+            continue
+        f = line.split(';')
+        if len(f) < 9 or f[4] != SERVICE:
+            continue
+        addr = f[7]
+        if addr in seen:
+            continue
+        seen.add(addr)
+        out.append({'name': f[3], 'host': f[6], 'addr': addr})
+    return out
+
+
+def ssh_args(addr):
+    return [
+        'ssh', '-i', KEY_FILE, '-o', 'IdentitiesOnly=yes',
+        '-o', f'UserKnownHostsFile={KNOWN_HOSTS}', '-o', 'StrictHostKeyChecking=yes',
+        '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
+        '-o', 'BatchMode=yes', '-o', 'ForwardAgent=no', '-o', 'ForwardX11=no',
+        '-o', 'ClearAllForwardings=yes', '-o', 'ConnectTimeout=3',
+        '-o', 'ControlMaster=auto', '-o', 'ControlPersist=90',
+        '-o', f'ControlPath={CONTROL_DIR}/%C', f'{SSH_USER}@{addr}'
+    ]
+
+
+def remote(addr, *args):
+    cmd = 'sudo -n /usr/local/sbin/lghs-audit-export ' + ' '.join(args)
+    return run(ssh_args(addr) + [cmd])
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE)
+
+
+def device_id(addr):
+    p = run(ssh_args(addr) + ["sed -n 's/^DEVICE_ID=//p' /etc/lghs/device.conf | head -n1 || hostname"])
+    value = (p.stdout or '').strip().splitlines()
+    return value[0] if value else addr.replace(':', '_')
+
+
+def append_lines(path, text, prefix=None):
+    if not text:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', encoding='utf-8') as f:
+        for line in text.splitlines():
+            if prefix:
+                f.write(f'[{prefix}] {line}\n')
+            else:
+                f.write(line + '\n')
+    os.chmod(path, 0o640)
+    try:
+        import grp
+        os.chown(path, 0, grp.getgrnam('adm').gr_gid)
+    except Exception:
+        pass
+
+
+def sync_kind(state, dev, kind):
+    addr, did = dev['addr'], dev['device_id']
+    key = f'{did}:{kind}'
+    old = state.get(key, {'offset': 0, 'head_sha256': ''})
+    meta_p = remote(addr, 'meta', kind)
+    if meta_p.returncode != 0:
+        return
+    try:
+        meta = json.loads(meta_p.stdout)
+        size = int(meta.get('size', 0))
+        head = str(meta.get('head_sha256', ''))
+    except Exception:
+        return
+
+    offset = int(old.get('offset', 0))
+    # Rotation/truncation detection: if the file shrank or its beginning changed,
+    # restart from byte zero so the controller never silently skips a new file.
+    if size < offset or (old.get('head_sha256') and head and old.get('head_sha256') != head):
+        offset = 0
+    if size <= offset:
+        state[key] = {'offset': size, 'head_sha256': head}
+        return
+
+    read_p = remote(addr, 'read', kind, str(offset))
+    if read_p.returncode != 0:
+        return
+    text = read_p.stdout or ''
+    per_device_name = {
+        'sudo': 'sudo.log', 'audit': 'audit.jsonl',
+        'update': 'update.log', 'os-update': 'os-update.log'
+    }[kind]
+    append_lines(BASE / did / per_device_name, text)
+    append_lines(BASE / per_device_name, text, did)
+    state[key] = {'offset': size, 'head_sha256': head}
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Run as root')
+    ensure_dirs()
+    state = load_state()
+    for dev in discover():
+        # Only already-enrolled machines are collected. Do not silently TOFU here.
+        if run(['ssh-keygen', '-F', dev['addr'], '-f', KNOWN_HOSTS]).returncode != 0:
+            continue
+        dev['device_id'] = device_id(dev['addr'])
+        for kind in KINDS:
+            sync_kind(state, dev, kind)
+    save_state(state)
+
+
+if __name__ == '__main__':
+    main()
