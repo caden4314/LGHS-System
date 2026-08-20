@@ -6,110 +6,47 @@ set -euo pipefail
 # Both "Edit Connections..." entries are omitted only for lg_cs_cont.
 
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
-
 SRC=/usr/local/src/lghs-pplug-netman
 COMMIT=9064d7b4f9c3c841bfd195dae9e0bf8110412d0f
 HARDENED=/usr/local/lib/lghs/libnetman.so.hardened
-BUILD_PKGS=(
-  meson ninja-build
-  libgtk-3-dev libgtkmm-3.0-dev
-  lxpanel-pi-dev wf-panel-pi-dev
-  libgtk-layer-shell-dev libglm-dev
-  libsecret-1-dev libnm-dev libnma-dev
-)
+VERSION_FILE=/usr/local/lib/lghs/libnetman.package-version
+BUILD_PKGS=(meson ninja-build libgtk-3-dev libgtkmm-3.0-dev lxpanel-pi-dev wf-panel-pi-dev libgtk-layer-shell-dev libglm-dev libsecret-1-dev libnm-dev libnma-dev)
 
-if [[ -f "$HARDENED" ]]; then
-    if [[ -x /usr/local/sbin/lghs-network-ui-apply ]]; then
-        /usr/local/sbin/lghs-network-ui-apply
-    fi
-    echo 'LGHS: hardened student network UI is already available.'
-    exit 0
+if [[ -f "$HARDENED" ]];then
+  /usr/local/sbin/lghs-network-ui-apply || true
+  [[ -f "$HARDENED" ]] && { echo 'LGHS: hardened student network UI is already current.';exit 0; }
 fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends "${BUILD_PKGS[@]}"
-
-rm -rf "$SRC"
-git clone --quiet https://github.com/raspberrypi-ui/pplug-netman.git "$SRC"
-git -C "$SRC" checkout --quiet "$COMMIT"
+rm -rf "$SRC";git clone --quiet https://github.com/raspberrypi-ui/pplug-netman.git "$SRC";git -C "$SRC" checkout --quiet "$COMMIT"
 
 python3 - "$SRC/src/applet.c" <<'PY'
 from pathlib import Path
-import re
-import sys
-
-p = Path(sys.argv[1])
-s = p.read_text(encoding='utf-8')
-
-include_old = '#include <unistd.h>\n#include <sys/socket.h>'
-include_new = '#include <unistd.h>\n#include <pwd.h>\n#include <sys/socket.h>'
-if include_old not in s:
-    raise SystemExit('LGHS patch failed: include anchor not found')
-s = s.replace(include_old, include_new, 1)
-
-anchor = 'G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN'
-helper = '''G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN\nstatic gboolean lghs_restricted_student (void)\n{\n    struct passwd *pw = getpwuid (geteuid ());\n    return pw && pw->pw_name && strcmp (pw->pw_name, "lg_cs_cont") == 0;\n}\n#endif\n\n#ifdef LXPANEL_PLUGIN'''
-if anchor not in s:
-    raise SystemExit('LGHS patch failed: type anchor not found')
-s = s.replace(anchor, helper, 1)
-
-pattern = re.compile(
-    r"(?P<indent>\t)/\* 'Edit Connections\.\.\.' item \*/\n"
-    r"(?P<body>\tapplet->connections_menu_item = gtk_menu_item_new_with_mnemonic \(_\(\"Edit Connections…\"\)\);\n"
-    r"\tg_signal_connect \(applet->connections_menu_item,\n"
-    r"\s*\"activate\",\n"
-    r"\s*G_CALLBACK \(nma_edit_connections_cb\),\n"
-    r"\s*applet\);\n"
-    r"\tgtk_menu_shell_append \([^\n]+, applet->connections_menu_item\);)"
-)
-
-def replace_block(match):
-    body = match.group('body')
-    body = '\n'.join('\t' + line for line in body.splitlines())
-    return (
-        "\t/* 'Edit Connections...' item - hidden for LGHS student */\n"
-        "\tif (!lghs_restricted_student ())\n"
-        "\t{\n" + body + "\n\t}\n"
-        "\telse\n"
-        "\t{\n"
-        "\t\tapplet->connections_menu_item = NULL;\n"
-        "\t}"
-    )
-
-s, count = pattern.subn(replace_block, s)
-if count != 2:
-    raise SystemExit(f'LGHS patch failed: expected 2 Edit Connections blocks, patched {count}')
-
-p.write_text(s, encoding='utf-8')
-print('LGHS: patched both Edit Connections menu entries.')
+import re,sys
+p=Path(sys.argv[1]);s=p.read_text(encoding='utf-8')
+include_old='#include <unistd.h>\n#include <sys/socket.h>';include_new='#include <unistd.h>\n#include <pwd.h>\n#include <sys/socket.h>'
+if include_old not in s:raise SystemExit('LGHS patch failed: include anchor not found')
+s=s.replace(include_old,include_new,1)
+anchor='G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN'
+helper='''G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN\nstatic gboolean lghs_restricted_student (void)\n{\n    struct passwd *pw = getpwuid (geteuid ());\n    return pw && pw->pw_name && strcmp (pw->pw_name, "lg_cs_cont") == 0;\n}\n#endif\n\n#ifdef LXPANEL_PLUGIN'''
+if anchor not in s:raise SystemExit('LGHS patch failed: type anchor not found')
+s=s.replace(anchor,helper,1)
+pattern=re.compile(r"(?P<indent>\t)/\* 'Edit Connections\.\.\.' item \*/\n(?P<body>\tapplet->connections_menu_item = gtk_menu_item_new_with_mnemonic \(_\(\"Edit Connections…\"\)\);\n\tg_signal_connect \(applet->connections_menu_item,\n\s*\"activate\",\n\s*G_CALLBACK \(nma_edit_connections_cb\),\n\s*applet\);\n\tgtk_menu_shell_append \([^\n]+, applet->connections_menu_item\);)")
+def repl(m):
+    body='\n'.join('\t'+line for line in m.group('body').splitlines())
+    return "\t/* 'Edit Connections...' item - hidden for LGHS student */\n\tif (!lghs_restricted_student ())\n\t{\n"+body+"\n\t}\n\telse\n\t{\n\t\tapplet->connections_menu_item = NULL;\n\t}"
+s,count=pattern.subn(repl,s)
+if count!=2:raise SystemExit(f'LGHS patch failed: expected 2 Edit Connections blocks, patched {count}')
+p.write_text(s,encoding='utf-8');print('LGHS: patched both Edit Connections menu entries.')
 PY
 
-rm -rf "$SRC/build"
-meson setup "$SRC/build" "$SRC" --prefix=/usr --libdir=/usr/lib/aarch64-linux-gnu
-meson compile -C "$SRC/build"
-meson install -C "$SRC/build"
-
-NETMAN_LIB="$(find /usr/lib/aarch64-linux-gnu -type f -path '*/wf-panel-pi/libnetman.so' -print -quit 2>/dev/null || true)"
-if [[ -z "$NETMAN_LIB" ]]; then
-    NETMAN_LIB="$(find /usr/lib/aarch64-linux-gnu -type f -name 'libnetman.so' -print -quit 2>/dev/null || true)"
-fi
-[[ -n "$NETMAN_LIB" && -f "$NETMAN_LIB" ]] || {
-    echo 'LGHS: patched wf-panel-pi network plugin install verification failed' >&2
-    exit 1
-}
-
-install -d -m 0755 /usr/local/lib/lghs
-install -m 0644 "$NETMAN_LIB" "$HARDENED"
-
-if [[ -x /usr/local/sbin/lghs-network-ui-apply ]]; then
-    /usr/local/sbin/lghs-network-ui-apply
-fi
-
-rm -rf "$SRC"
-apt-get purge -y "${BUILD_PKGS[@]}" || true
-apt-get autoremove -y || true
-apt-get clean
-rm -rf /var/lib/apt/lists/*
-
-echo 'LGHS: restricted student network UI installed and self-heal copy saved.'
+rm -rf "$SRC/build";meson setup "$SRC/build" "$SRC" --prefix=/usr --libdir=/usr/lib/aarch64-linux-gnu;meson compile -C "$SRC/build";meson install -C "$SRC/build"
+NETMAN_LIB="$(find /usr/lib/aarch64-linux-gnu -type f -path '*/wf-panel-pi/libnetman.so' -print -quit 2>/dev/null||true)";[[ -n "$NETMAN_LIB" ]]||NETMAN_LIB="$(find /usr/lib/aarch64-linux-gnu -type f -name 'libnetman.so' -print -quit 2>/dev/null||true)"
+[[ -n "$NETMAN_LIB" && -f "$NETMAN_LIB" ]] || { echo 'LGHS: patched wf-panel-pi network plugin install verification failed' >&2;exit 1; }
+install -d -m 0755 /usr/local/lib/lghs;install -m 0644 "$NETMAN_LIB" "$HARDENED"
+dpkg-query -W -f='${Version}\n' wfplug-netman 2>/dev/null > "$VERSION_FILE" || echo unknown > "$VERSION_FILE";chmod 0644 "$VERSION_FILE"
+/usr/local/sbin/lghs-network-ui-apply || true
+rm -rf "$SRC";apt-get purge -y "${BUILD_PKGS[@]}" || true;apt-get autoremove -y || true;apt-get clean;rm -rf /var/lib/apt/lists/*
+echo 'LGHS: restricted student network UI installed and package-version tracked.'
