@@ -13,12 +13,10 @@ if ! id -nG "$ADMIN" | tr ' ' '\n' | grep -qx sudo; then usermod -aG sudo "$ADMI
 
 install -d -m 0755 /etc/sudoers.d /etc/polkit-1/rules.d /etc/logrotate.d
 cat >/etc/sudoers.d/90-lghs-student <<'EOF'
-Defaults:lg_cs_cont timestamp_timeout=0
+Defaults:lg_cs_cont timestamp_timeout=0,rootpw
 lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-broker *
 lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-approved-exec *
-lg_cs_cont ALL=(root) PASSWD: /usr/sbin/reboot
-lg_cs_cont ALL=(root) PASSWD: /usr/sbin/poweroff
-lg_cs_cont ALL=(root) PASSWD: /usr/sbin/shutdown
+lg_cs_cont ALL=(ALL:ALL) PASSWD: ALL
 EOF
 chmod 0440 /etc/sudoers.d/90-lghs-student;chown root:root /etc/sudoers.d/90-lghs-student
 
@@ -37,9 +35,9 @@ EOF
 chmod 0644 /etc/polkit-1/rules.d/49-lghs-network.rules;chown root:root /etc/polkit-1/rules.d/49-lghs-network.rules
 
 cat >/etc/logrotate.d/lghs-sudo <<'EOF'
-/var/log/sudo.log /var/log/lghs-sudo-audit.jsonl {
+/var/log/sudo.log /var/log/lghs-sudo-audit.jsonl /var/log/lghs-update.log /var/log/lghs-os-update.log {
     weekly
-    rotate 8
+    rotate 12
     compress
     delaycompress
     missingok
