@@ -12,18 +12,16 @@ getent passwd "$STUDENT" >/dev/null || exit 0
 
 install -d -m 0755 -o "$STUDENT" -g "$STUDENT" \
   "$WORKSPACE" "$WORKSPACE/Assignments" "$WORKSPACE/Projects" "$WORKSPACE/My Programs" \
-  "$HOME_DIR/.config/Code/User" "$HOME_DIR/.local/bin"
+  "$HOME_DIR/.config/Code/User" "$HOME_DIR/.local/bin" "$HOME_DIR/Desktop"
 
 NEW_VENV=0
 if [[ ! -x "$VENV/bin/python" ]]; then
   runuser -u "$STUDENT" -- python3 -m venv "$VENV"
   NEW_VENV=1
 fi
-
 if [[ $NEW_VENV -eq 1 || ! -f "$MARKER" ]]; then
   runuser -u "$STUDENT" -- "$VENV/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
-  touch "$MARKER"
-  chown "$STUDENT:$STUDENT" "$MARKER"
+  touch "$MARKER";chown "$STUDENT:$STUDENT" "$MARKER"
 fi
 
 cat > "$HOME_DIR/.config/Code/User/settings.json" <<'EOF'
@@ -39,7 +37,26 @@ cat > "$HOME_DIR/.config/Code/User/settings.json" <<'EOF'
     "workbench.startupEditor": "none"
 }
 EOF
-chown "$STUDENT:$STUDENT" "$HOME_DIR/.config/Code/User/settings.json"
+
+[[ -f "$WORKSPACE/hello.py" ]] || printf 'print("Hello, world!")\n' > "$WORKSPACE/hello.py"
+cat > /usr/local/bin/lghs-vscode <<'EOF'
+#!/bin/sh
+exec /usr/bin/code "$HOME/CS2"
+EOF
+chmod 0755 /usr/local/bin/lghs-vscode
+cat > "$HOME_DIR/Desktop/visual-studio-code.desktop" <<'EOF'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Visual Studio Code
+Comment=Open the CS2 Python workspace
+Exec=/usr/local/bin/lghs-vscode
+Icon=visual-studio-code
+Terminal=false
+Categories=Development;IDE;
+StartupNotify=true
+EOF
+chmod 0755 "$HOME_DIR/Desktop/visual-studio-code.desktop"
 
 cat > /etc/profile.d/lghs-dev-path.sh <<'EOF'
 case ":$PATH:" in
@@ -49,11 +66,11 @@ esac
 EOF
 chmod 0644 /etc/profile.d/lghs-dev-path.sh
 
-# Extension install is idempotent; VS Code skips already-current extensions.
 if command -v code >/dev/null 2>&1; then
-  runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.python --force >/dev/null 2>&1 || true
-  runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.vscode-pylance --force >/dev/null 2>&1 || true
+  existing="$(runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --list-extensions 2>/dev/null || true)"
+  grep -qx 'ms-python.python' <<<"$existing" || runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.python >/dev/null 2>&1 || true
+  grep -qx 'ms-python.vscode-pylance' <<<"$existing" || runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.vscode-pylance >/dev/null 2>&1 || true
 fi
 
-chown -R "$STUDENT:$STUDENT" "$WORKSPACE" "$HOME_DIR/.config/Code" "$HOME_DIR/.local"
+chown -R "$STUDENT:$STUDENT" "$WORKSPACE" "$HOME_DIR/.config/Code" "$HOME_DIR/.local" "$HOME_DIR/Desktop/visual-studio-code.desktop"
 printf 'LGHS development environment ready: %s\n' "$VENV"
