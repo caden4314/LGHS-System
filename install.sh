@@ -47,16 +47,23 @@ if (( ${#MISSING_PKGS[@]} )); then
   DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"
 fi
 
-# Dedicated fleet administrator. The account is unlocked so OpenSSH permits
-# public-key login, but password and keyboard-interactive SSH are disabled for it.
+# Dedicated administrator. Interactive sudo uses the admin password, while the
+# controller's narrow fleet-management commands remain passwordless.
 if ! id cs_admin >/dev/null 2>&1; then
   useradd -m -s /bin/bash cs_admin
 fi
 usermod -aG sudo cs_admin
-passwd -d cs_admin >/dev/null 2>&1 || true
 install -d -m 0700 -o cs_admin -g cs_admin /home/cs_admin/.ssh
 cat > /etc/sudoers.d/91-lghs-admin <<'EOF'
-cs_admin ALL=(ALL) NOPASSWD: ALL
+Defaults:cs_admin timestamp_timeout=5
+cs_admin ALL=(ALL:ALL) ALL
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-report *
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-update
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-check
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-enforce
+cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
+cs_admin ALL=(root) NOPASSWD: /usr/sbin/poweroff
+cs_admin ALL=(root) NOPASSWD: /usr/sbin/shutdown
 EOF
 chmod 0440 /etc/sudoers.d/91-lghs-admin
 visudo -cf /etc/sudoers >/dev/null
@@ -89,6 +96,7 @@ else
   install -m 0755 "$ROOT_DIR/student/lghs-enforce" /usr/local/sbin/lghs-enforce
   install -m 0755 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
   install -m 0755 "$ROOT_DIR/student/lghs-agent" /usr/local/sbin/lghs-agent
+  install -m 0755 "$ROOT_DIR/student/lghs-network-ui-apply" /usr/local/sbin/lghs-network-ui-apply
 
   install -m 0440 "$ROOT_DIR/policies/sudoers/90-lghs-student" /etc/sudoers.d/90-lghs-student
   install -m 0644 "$ROOT_DIR/policies/polkit/49-lghs-network.rules" /etc/polkit-1/rules.d/49-lghs-network.rules
@@ -126,6 +134,8 @@ EOF
 
   install -m 0644 "$ROOT_DIR/systemd/lghs-policy.service" /etc/systemd/system/lghs-policy.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
+
+  /usr/local/sbin/lghs-network-ui-apply || true
 fi
 
 systemctl daemon-reload
