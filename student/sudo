@@ -15,20 +15,20 @@ def run(cmd, env=None):
     return subprocess.run(cmd, text=True, capture_output=True, env=env)
 
 
-def main():
-    # Admin/root keep normal sudo behavior. Only the classroom student is routed
-    # through LGHS approval.
-    if os.environ.get('USER') != STUDENT:
-        os.execv(REAL_SUDO, [REAL_SUDO] + sys.argv[1:])
+def choose_auth():
+    if not sys.stdin.isatty():
+        return 'fleet'
+    print('LGHS managed sudo')
+    print('  [Enter/F] Request teacher approval from fleet')
+    print('  [P]       Enter the Root password locally')
+    try:
+        choice = input('Authorization method [F]: ').strip().lower()
+    except EOFError:
+        return 'fleet'
+    return 'password' if choice in ('p', 'password', 'local') else 'fleet'
 
-    argv = sys.argv[1:]
-    if not argv:
-        print('LGHS managed sudo: enter a command, for example: sudo apt install python3-numpy')
-        return 1
-    if argv[0].startswith('-'):
-        print('LGHS managed sudo does not accept sudo options. Request the command itself.', file=sys.stderr)
-        return 2
 
+def fleet_request(argv):
     env = dict(os.environ)
     env['LGHS_REQUEST_CWD'] = os.getcwd()
     req = run([REAL_SUDO, '-n', '/usr/local/sbin/lghs-sudo-broker', 'request', '--'] + argv, env=env)
@@ -38,7 +38,7 @@ def main():
     rid = req.stdout.strip().splitlines()[-1]
     print(f'LGHS sudo request {rid[:8]} submitted.')
     print(f'Waiting for teacher approval: {shlex.join(argv)}')
-    print('Press Ctrl+C to stop waiting; the request will expire automatically.')
+    print('Press Ctrl+C to stop waiting; the request expires automatically.')
 
     try:
         while True:
@@ -67,6 +67,36 @@ def main():
     except KeyboardInterrupt:
         print('\nStopped waiting. The pending request will expire automatically.')
         return 130
+
+
+def main():
+    user = os.environ.get('USER') or os.environ.get('LOGNAME')
+    if user != STUDENT:
+        os.execv(REAL_SUDO, [REAL_SUDO] + sys.argv[1:])
+
+    argv = sys.argv[1:]
+    if not argv:
+        print('LGHS managed sudo: enter a command, for example: sudo apt install python3-numpy')
+        return 1
+
+    # Explicit escape hatch for a teacher physically present at the Student Pi.
+    # The sudoers policy uses rootpw, so the student's own password cannot satisfy it.
+    if argv and argv[0] in ('--local-password', '--root-password'):
+        argv = argv[1:]
+        if not argv:
+            print('A command is required after --local-password.', file=sys.stderr)
+            return 2
+        return subprocess.call([REAL_SUDO] + argv)
+
+    if argv[0].startswith('-'):
+        print('LGHS managed sudo accepts command arguments only. Use --local-password for local Root-password authorization.', file=sys.stderr)
+        return 2
+
+    if choose_auth() == 'password':
+        print('Enter the LGHS Root password when sudo prompts.')
+        return subprocess.call([REAL_SUDO] + argv)
+    return fleet_request(argv)
+
 
 if __name__ == '__main__':
     raise SystemExit(main())
