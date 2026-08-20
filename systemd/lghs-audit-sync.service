@@ -1,0 +1,11 @@
+[Unit]
+Description=LGHS controller fleet audit synchronization
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+ConditionPathExists=/etc/lghs/role
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lghs-audit-sync
+Nice=10
+IOSchedulingClass=idle
