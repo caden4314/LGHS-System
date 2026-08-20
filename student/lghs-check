@@ -17,7 +17,26 @@ if [[ -d /etc/NetworkManager/system-connections ]]; then
 fi
 if [[ -z "$BAD" ]]; then pass "NetworkManager profile permissions"; else fail "NetworkManager profile permissions"; fi
 
+if [[ -x /usr/local/sbin/lghs-network-ui-apply ]]; then pass "network UI enforcement installed"; else fail "network UI enforcement installed"; fi
+if [[ -f /usr/local/lib/lghs/libnetman.so.hardened ]]; then pass "hardened network panel plugin staged"; else fail "hardened network panel plugin staged"; fi
+if [[ -x /usr/bin/lp-connection-editor ]] && grep -q 'LGHS_NETWORK_EDITOR_GUARD' /usr/bin/lp-connection-editor 2>/dev/null; then
+  pass "advanced network editor guarded"
+else
+  fail "advanced network editor guarded"
+fi
+
+NETMAN_LIB="$(dpkg -L wfplug-netman 2>/dev/null | grep -E '/wf-panel-pi/libnetman\.so$' | head -n1 || true)"
+if [[ -z "$NETMAN_LIB" ]]; then
+  NETMAN_LIB="$(find /usr/lib -type f -path '*/wf-panel-pi/libnetman.so' -print -quit 2>/dev/null || true)"
+fi
+if [[ -n "$NETMAN_LIB" && -f "$NETMAN_LIB" && -f /usr/local/lib/lghs/libnetman.so.hardened ]] && cmp -s "$NETMAN_LIB" /usr/local/lib/lghs/libnetman.so.hardened; then
+  pass "Edit Connections hidden in student network panel"
+else
+  fail "Edit Connections hidden in student network panel"
+fi
+
 if systemctl is-enabled lghs-policy.service >/dev/null 2>&1; then pass "policy service enabled"; else fail "policy service enabled"; fi
 if systemctl is-active NetworkManager >/dev/null 2>&1; then pass "NetworkManager active"; else fail "NetworkManager active"; fi
+if systemctl is-enabled lghs-firstboot-provision.service >/dev/null 2>&1; then pass "first-boot provisioner enabled"; else fail "first-boot provisioner enabled"; fi
 
 exit "$FAIL"
