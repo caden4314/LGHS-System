@@ -7,6 +7,7 @@ CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
 STATE_DIR=/var/lib/lghs/update
 ROLE="$(cat /etc/lghs/role 2>/dev/null || true)"
 LOCK_FILE=/run/lock/lghs-update.lock
+LOG=/var/log/lghs-update.log
 
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
 [[ "$ROLE" == "controller" || "$ROLE" == "student" ]] || { echo "Invalid or missing LGHS role" >&2; exit 1; }
@@ -30,6 +31,11 @@ TARGET_COMMIT="$(git rev-parse "origin/$BRANCH")"
 
 if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
     git reset --hard "$TARGET_COMMIT" >/dev/null
+    # Even with no new LGHS commit, reconcile the managed state. This repairs
+    # files or services that a Raspberry Pi OS/package update may have replaced.
+    if [[ -x /usr/local/sbin/lghs-reconcile ]]; then
+        /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true
+    fi
     echo "LGHS is already current at ${TARGET_COMMIT:0:12}."
     exit 0
 fi
@@ -45,21 +51,31 @@ chmod 0755 install.sh updater/lghs-update 2>/dev/null || true
 
 apply_install() {
     /bin/bash ./install.sh "$ROLE"
-
     if [[ "$ROLE" == "student" ]]; then
         /usr/local/sbin/lghs-check
     else
         /usr/local/sbin/lghsctl --help >/dev/null
         [[ "$(cat /etc/lghs/role)" == "controller" ]]
     fi
-
     systemctl daemon-reload
+}
+
+record_success() {
+    local version submodel
+    version="$(tr -d '[:space:]' < /etc/lghs/version 2>/dev/null || echo unknown)"
+    if [[ "$ROLE" == "student" ]]; then submodel="Student"; else submodel="Controller"; fi
+    touch "$LOG"
+    chown root:adm "$LOG" 2>/dev/null || true
+    chmod 0640 "$LOG"
+    printf 'LGHS %s updated to V%s\n' "$submodel" "$version" >> "$LOG"
+    logger -t LGHS-UPDATE "LGHS $submodel updated to V$version"
 }
 
 if apply_install; then
     printf '%s\n' "$TARGET_COMMIT" > "$STATE_DIR/current-commit"
     printf '%s\n' "$TARGET_COMMIT" > /etc/lghs/source-commit
     rm -f "$STATE_DIR/pending-commit"
+    record_success
     echo "LGHS update applied successfully: ${TARGET_COMMIT:0:12}"
     exit 0
 fi
