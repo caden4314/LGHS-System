@@ -72,10 +72,12 @@ fi
 IMG_NAME="LGHS-${TARGET_HOSTNAME}"
 WORK_DIR="${PI_GEN_DIR}/work/${IMG_NAME}"
 BASE_CACHE="${WORK_DIR}/stage4/rootfs"
+SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 
 printf 'LGHS image build\n'
 printf '  Target hostname: %s\n' "${TARGET_HOSTNAME}"
 printf '  Expected role:   %s\n' "${EXPECTED_ROLE}"
+printf '  LGHS commit:     %s\n' "${SOURCE_COMMIT}"
 printf '  pi-gen:          %s\n' "${PI_GEN_DIR}"
 
 if [[ ! -d "${PI_GEN_DIR}/.git" ]]; then
@@ -102,6 +104,7 @@ rsync -a \
     --exclude 'work/' \
     --exclude 'deploy/' \
     "${REPO_ROOT}/" "${STAGED_SOURCE}/"
+printf '%s\n' "$SOURCE_COMMIT" > "${STAGED_SOURCE}/.lghs-source-commit"
 
 # Only export the final LGHS stage, never intermediate stock images.
 touch "${PI_GEN_DIR}/stage2/SKIP_IMAGES"
@@ -173,7 +176,6 @@ else
     BUILD_ENV=(CLEAN=0)
 fi
 
-# Remove previous exported files for this image name so the result is unambiguous.
 find "${PI_GEN_DIR}/deploy" -maxdepth 1 -type f \
     \( -name "*${IMG_NAME}*" -o -name "*${TARGET_HOSTNAME}*" \) \
     -delete 2>/dev/null || true
