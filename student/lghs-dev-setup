@@ -10,6 +10,13 @@ MARKER=$VENV/.lghs-initialized
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 getent passwd "$STUDENT" >/dev/null || exit 0
 
+# Existing Pis should converge to the same development environment as newly
+# flashed images. Install VS Code live if this older system does not have it.
+if ! command -v code >/dev/null 2>&1; then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y code
+fi
+
 install -d -m 0755 -o "$STUDENT" -g "$STUDENT" \
   "$WORKSPACE" "$WORKSPACE/Assignments" "$WORKSPACE/Projects" "$WORKSPACE/My Programs" \
   "$HOME_DIR/.config/Code/User" "$HOME_DIR/.local/bin" "$HOME_DIR/Desktop"
@@ -66,11 +73,9 @@ esac
 EOF
 chmod 0644 /etc/profile.d/lghs-dev-path.sh
 
-if command -v code >/dev/null 2>&1; then
-  existing="$(runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --list-extensions 2>/dev/null || true)"
-  grep -qx 'ms-python.python' <<<"$existing" || runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.python >/dev/null 2>&1 || true
-  grep -qx 'ms-python.vscode-pylance' <<<"$existing" || runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.vscode-pylance >/dev/null 2>&1 || true
-fi
+existing="$(runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --list-extensions 2>/dev/null || true)"
+grep -qx 'ms-python.python' <<<"$existing" || runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.python >/dev/null 2>&1 || true
+grep -qx 'ms-python.vscode-pylance' <<<"$existing" || runuser -u "$STUDENT" -- env HOME="$HOME_DIR" code --install-extension ms-python.vscode-pylance >/dev/null 2>&1 || true
 
 chown -R "$STUDENT:$STUDENT" "$WORKSPACE" "$HOME_DIR/.config/Code" "$HOME_DIR/.local" "$HOME_DIR/Desktop/visual-studio-code.desktop"
 printf 'LGHS development environment ready: %s\n' "$VENV"
