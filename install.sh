@@ -26,6 +26,7 @@ install -m 0755 "$ROOT_DIR/updater/lghs-autologin-apply" /usr/local/sbin/lghs-au
 install -m 0755 "$ROOT_DIR/updater/lghs-reconcile" /usr/local/sbin/lghs-reconcile
 install -m 0755 "$ROOT_DIR/updater/lghs-access-enforce" /usr/local/sbin/lghs-access-enforce
 install -m 0755 "$ROOT_DIR/updater/lghs-netqueue" /usr/local/sbin/lghs-netqueue
+install -m 0755 "$ROOT_DIR/updater/lghs-install-success-notify" /usr/local/sbin/lghs-install-success-notify
 install -m 0755 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
 install -m 0755 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
 install -m 0755 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
@@ -36,6 +37,7 @@ install -m 0644 "$ROOT_DIR/systemd/lghs-reconcile.service" /etc/systemd/system/l
 install -m 0644 "$ROOT_DIR/systemd/lghs-reconcile.timer" /etc/systemd/system/lghs-reconcile.timer
 install -m 0644 "$ROOT_DIR/systemd/lghs-netqueue.service" /etc/systemd/system/lghs-netqueue.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-netqueue.timer" /etc/systemd/system/lghs-netqueue.timer
+install -m 0644 "$ROOT_DIR/systemd/lghs-install-success-notify.service" /etc/systemd/system/lghs-install-success-notify.service
 install -d -m 0755 /etc/NetworkManager/dispatcher.d
 install -m 0755 "$ROOT_DIR/systemd/90-lghs-netqueue" /etc/NetworkManager/dispatcher.d/90-lghs-netqueue
 install -m 0440 "$ROOT_DIR/policies/sudoers/89-lghs-audit" /etc/sudoers.d/89-lghs-audit
@@ -44,7 +46,7 @@ touch /var/log/lghs-netqueue.log
 chown root:adm /var/log/lghs-netqueue.log 2>/dev/null || true
 chmod 0640 /var/log/lghs-netqueue.log
 
-COMMON_PKGS=(git curl python3 openssh-client sudo logrotate)
+COMMON_PKGS=(git curl python3 openssh-client sudo logrotate libnotify-bin)
 if ! command -v flock >/dev/null 2>&1; then COMMON_PKGS+=(util-linux); fi
 MISSING_PKGS=()
 for pkg in "${COMMON_PKGS[@]}"; do dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg"); done
@@ -88,7 +90,7 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.service" /etc/systemd/system/lghs-audit-sync.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.timer" /etc/systemd/system/lghs-audit-sync.timer
 
-  CTRL_PKGS=(avahi-daemon avahi-utils libnotify-bin)
+  CTRL_PKGS=(avahi-daemon avahi-utils)
   MISSING_PKGS=()
   for pkg in "${CTRL_PKGS[@]}"; do dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg"); done
   if (( ${#MISSING_PKGS[@]} )); then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"; fi
@@ -178,6 +180,12 @@ if [[ "$ROLE" == "student" ]]; then
 else
   systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service
 fi
+
+# Start this asynchronously: it deliberately waits for the outer first-boot
+# bootstrap to create /var/lib/lghs/bootstrap-complete, then waits for the
+# desktop D-Bus session and shows the one-time all-good notification.
+systemctl enable lghs-install-success-notify.service
+systemctl start --no-block lghs-install-success-notify.service >/dev/null 2>&1 || true
 
 /usr/local/sbin/lghs-access-enforce
 
