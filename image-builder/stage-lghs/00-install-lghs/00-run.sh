@@ -57,6 +57,80 @@ cd /tmp/LGHS-System
 /bin/bash ./install.sh ${LGHS_ROLE}
 EOF
 
+# Classroom development environment shared by both roles.
+# VS Code is distributed through the Raspberry Pi OS APT repositories.
+on_chroot <<'EOF'
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    code \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    pipx \
+    git \
+    build-essential
+EOF
+
+# Default VS Code settings for current and future classroom users.
+install -d -m 0755 "${ROOTFS_DIR}/etc/skel/.config/Code/User"
+cat > "${ROOTFS_DIR}/etc/skel/.config/Code/User/settings.json" <<'EOF'
+{
+    "python.defaultInterpreterPath": "/usr/bin/python3",
+    "python.terminal.activateEnvironment": true,
+    "python.createEnvironment.trigger": "off",
+    "terminal.integrated.defaultProfile.linux": "bash",
+    "files.autoSave": "afterDelay",
+    "files.autoSaveDelay": 1000,
+    "editor.formatOnSave": false,
+    "workbench.startupEditor": "welcomePage"
+}
+EOF
+
+# Put a clear VS Code launcher on the desktop. This is also placed in /etc/skel
+# so any users created later receive it automatically.
+install -d -m 0755 "${ROOTFS_DIR}/etc/skel/Desktop"
+cat > "${ROOTFS_DIR}/etc/skel/Desktop/visual-studio-code.desktop" <<'EOF'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Visual Studio Code
+Comment=Write and run code
+Exec=/usr/bin/code
+Icon=visual-studio-code
+Terminal=false
+Categories=Development;IDE;
+StartupNotify=true
+EOF
+chmod 0755 "${ROOTFS_DIR}/etc/skel/Desktop/visual-studio-code.desktop"
+
+# Apply the defaults to users that pi-gen has already created.
+for HOME_DIR in "${ROOTFS_DIR}"/home/*; do
+    [[ -d "${HOME_DIR}" ]] || continue
+    USER_NAME="$(basename "${HOME_DIR}")"
+
+    install -d -m 0755 "${HOME_DIR}/.config/Code/User" "${HOME_DIR}/Desktop"
+    cp "${ROOTFS_DIR}/etc/skel/.config/Code/User/settings.json" "${HOME_DIR}/.config/Code/User/settings.json"
+    cp "${ROOTFS_DIR}/etc/skel/Desktop/visual-studio-code.desktop" "${HOME_DIR}/Desktop/visual-studio-code.desktop"
+    chmod 0755 "${HOME_DIR}/Desktop/visual-studio-code.desktop"
+
+    USER_UID="$(chroot "${ROOTFS_DIR}" id -u "${USER_NAME}" 2>/dev/null || true)"
+    USER_GID="$(chroot "${ROOTFS_DIR}" id -g "${USER_NAME}" 2>/dev/null || true)"
+    if [[ -n "${USER_UID}" && -n "${USER_GID}" ]]; then
+        chown -R "${USER_UID}:${USER_GID}" "${HOME_DIR}/.config/Code" "${HOME_DIR}/Desktop/visual-studio-code.desktop"
+    fi
+done
+
+# Preinstall the Microsoft Python extension for the primary classroom account.
+# Extension installation is non-fatal so a temporary Marketplace outage cannot
+# invalidate an otherwise-good OS image. Students still have Python immediately.
+on_chroot <<'EOF'
+if id lg_cs_cont >/dev/null 2>&1 && command -v code >/dev/null 2>&1; then
+    runuser -u lg_cs_cont -- env HOME=/home/lg_cs_cont code --install-extension ms-python.python --force || true
+fi
+EOF
+
 rm -rf "${ROOTFS_DIR}/tmp/LGHS-System"
 
 echo "LGHS: ${LGHS_ROLE} role installed for ${IMAGE_HOSTNAME}."
+echo "LGHS: VS Code, Python, pip, venv, Git, and build tools installed."
