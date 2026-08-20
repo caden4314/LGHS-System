@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_TAG="LGHS-FIRSTBOOT"
+STATE_DIR=/var/lib/lghs
+STAMP="$STATE_DIR/provisioned"
+STUDENT_USER="lg_cs_cont"
+ADMIN_USER="cs_admin"
+
+log() {
+    logger -t "$LOG_TAG" "$*" 2>/dev/null || true
+    printf '[LGHS first boot] %s\n' "$*"
+}
+
+[[ $EUID -eq 0 ]] || { echo "Must run as root" >&2; exit 1; }
+mkdir -p "$STATE_DIR" /etc/lghs
+
+if [[ -f "$STAMP" ]]; then
+    exit 0
+fi
+
+BOOT_DIR=""
+for candidate in /boot/firmware /boot; do
+    if [[ -f "$candidate/lghs-provision.conf" || -f "$candidate/lghs-provision-secrets.conf" ]]; then
+        BOOT_DIR="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$BOOT_DIR" ]]; then
+    log "No LGHS provisioning files found; leaving service ready for next boot."
+    exit 0
+fi
+
+PUBLIC_CONF="$BOOT_DIR/lghs-provision.conf"
+SECRET_CONF="$BOOT_DIR/lghs-provision-secrets.conf"
+[[ -f "$PUBLIC_CONF" ]] || { log "Missing $PUBLIC_CONF"; exit 1; }
+[[ -f "$SECRET_CONF" ]] || { log "Missing $SECRET_CONF"; exit 1; }
+
+read_value() {
+    local key="$1" file="$2"
+    awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+require_simple_value() {
+    local name="$1" value="$2"
+    [[ -n "$value" ]] || { log "Missing required value: $name"; exit 1; }
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || { log "Invalid newline in $name"; exit 1; }
+}
+
+decode_secret() {
+    local key="$1" encoded decoded
+    encoded="$(read_value "$key" "$SECRET_CONF")"
+    [[ -n "$encoded" ]] || { log "Missing secret field: $key"; exit 1; }
+    if ! decoded="$(printf '%s' "$encoded" | base64 --decode 2>/dev/null)"; then
+        log "Invalid base64 for $key"
+        exit 1
+    fi
+    [[ "$decoded" != *$'\n'* && "$decoded" != *$'\r'* ]] || { log "Newlines are not allowed in passwords"; exit 1; }
+    printf '%s' "$decoded"
+}
+
+DEVICE_ID="$(read_value DEVICE_ID "$PUBLIC_CONF")"
+TARGET_HOSTNAME="$(read_value TARGET_HOSTNAME "$PUBLIC_CONF")"
+ROLE="$(read_value ROLE "$PUBLIC_CONF")"
+USER_NAME="$(read_value USER_NAME "$SECRET_CONF")"
+ADMIN_NAME="$(read_value ADMIN_NAME "$SECRET_CONF")"
+ROOT_NAME="$(read_value ROOT_NAME "$SECRET_CONF")"
+
+require_simple_value DEVICE_ID "$DEVICE_ID"
+require_simple_value TARGET_HOSTNAME "$TARGET_HOSTNAME"
+require_simple_value ROLE "$ROLE"
+require_simple_value USER_NAME "$USER_NAME"
+require_simple_value ADMIN_NAME "$ADMIN_NAME"
+require_simple_value ROOT_NAME "$ROOT_NAME"
+
+[[ "$ROLE" == "student" || "$ROLE" == "controller" ]] || { log "Invalid role: $ROLE"; exit 1; }
+[[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,62}$ ]] || { log "Invalid hostname: $TARGET_HOSTNAME"; exit 1; }
+[[ "$USER_NAME" == "$STUDENT_USER" ]] || { log "Unexpected user account: $USER_NAME"; exit 1; }
+[[ "$ADMIN_NAME" == "$ADMIN_USER" ]] || { log "Unexpected admin account: $ADMIN_NAME"; exit 1; }
+[[ "$ROOT_NAME" == "root" ]] || { log "Unexpected root account: $ROOT_NAME"; exit 1; }
+
+USER_PASSWORD="$(decode_secret USER_PASSWORD_B64)"
+ADMIN_PASSWORD="$(decode_secret ADMIN_PASSWORD_B64)"
+ROOT_PASSWORD="$(decode_secret ROOT_PASSWORD_B64)"
+
+[[ -n "$USER_PASSWORD" ]] || { log "User password is empty"; exit 1; }
+[[ -n "$ADMIN_PASSWORD" ]] || { log "Admin password is empty"; exit 1; }
+[[ -n "$ROOT_PASSWORD" ]] || { log "Root password is empty"; exit 1; }
+
+# Ensure the expected accounts exist before applying credentials.
+if ! id "$STUDENT_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$STUDENT_USER"
+fi
+if ! id "$ADMIN_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$ADMIN_USER"
+fi
+usermod -aG sudo "$ADMIN_USER"
+
+# chpasswd reads the password on stdin rather than exposing it in process arguments.
+printf '%s:%s\n' "$STUDENT_USER" "$USER_PASSWORD" | chpasswd
+printf '%s:%s\n' "$ADMIN_USER" "$ADMIN_PASSWORD" | chpasswd
+printf '%s:%s\n' root "$ROOT_PASSWORD" | chpasswd
+
+# Verify each account now has a non-empty, non-locked shadow password hash.
+verify_password_state() {
+    local account="$1" hash
+    hash="$(getent shadow "$account" | cut -d: -f2)"
+    [[ -n "$hash" && "$hash" != '!'* && "$hash" != '*'* ]] || {
+        log "Password verification failed for $account"
+        exit 1
+    }
+}
+verify_password_state "$STUDENT_USER"
+verify_password_state "$ADMIN_USER"
+verify_password_state root
+
+# Apply identity from the Imager.
+printf '%s\n' "$TARGET_HOSTNAME" > /etc/hostname
+if grep -qE '^127\.0\.1\.1[[:space:]]+' /etc/hosts; then
+    sed -i -E "s/^127\.0\.1\.1[[:space:]].*/127.0.1.1\t${TARGET_HOSTNAME}/" /etc/hosts
+else
+    printf '127.0.1.1\t%s\n' "$TARGET_HOSTNAME" >> /etc/hosts
+fi
+hostnamectl set-hostname "$TARGET_HOSTNAME" 2>/dev/null || hostname "$TARGET_HOSTNAME" || true
+
+cat > /etc/lghs/device.conf <<EOF
+DEVICE_ID=$DEVICE_ID
+ROLE=$ROLE
+HOSTNAME=$TARGET_HOSTNAME
+BOARD=Raspberry Pi 5
+MEMORY_GB=8
+ARCH=arm64
+EOF
+chmod 0644 /etc/lghs/device.conf
+printf '%s\n' "$ROLE" > /etc/lghs/role
+
+# Keep a non-secret provisioning audit record locally.
+install -m 0600 "$PUBLIC_CONF" "$STATE_DIR/provisioned.conf"
+printf '%s\n' "$(date -u +%FT%TZ)" > "$STAMP"
+chmod 0600 "$STAMP"
+
+# Best-effort overwrite/removal of the temporary secret file. Flash media may
+# remap blocks, so this is not a forensic secure erase; the important property
+# is that the file is no longer exposed on the mounted boot filesystem.
+if command -v shred >/dev/null 2>&1; then
+    shred -u -z -n 2 "$SECRET_CONF" 2>/dev/null || rm -f "$SECRET_CONF"
+else
+    size="$(stat -c %s "$SECRET_CONF" 2>/dev/null || echo 0)"
+    if [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]]; then
+        dd if=/dev/zero of="$SECRET_CONF" bs=1 count="$size" conv=notrunc status=none 2>/dev/null || true
+        sync
+    fi
+    rm -f "$SECRET_CONF"
+fi
+rm -f "$PUBLIC_CONF"
+sync
+
+unset USER_PASSWORD ADMIN_PASSWORD ROOT_PASSWORD
+log "Provisioning complete for $DEVICE_ID ($ROLE)."
