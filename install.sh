@@ -27,6 +27,7 @@ else
   install -m 0755 "$ROOT_DIR/student/lghs-enforce" /usr/local/sbin/lghs-enforce
   install -m 0755 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
   install -m 0755 "$ROOT_DIR/student/lghs-agent" /usr/local/sbin/lghs-agent
+  install -m 0755 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
 
   install -m 0440 "$ROOT_DIR/policies/sudoers/90-lghs-student" /etc/sudoers.d/90-lghs-student
   install -m 0644 "$ROOT_DIR/policies/polkit/49-lghs-network.rules" /etc/polkit-1/rules.d/49-lghs-network.rules
@@ -35,12 +36,14 @@ else
 
   install -m 0644 "$ROOT_DIR/systemd/lghs-policy.service" /etc/systemd/system/lghs-policy.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
+  install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
+  install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
 
   apt-get update
-  apt-get install -y openssh-server network-manager policykit-1 avahi-daemon avahi-utils python3
+  apt-get install -y openssh-server network-manager policykit-1 avahi-daemon avahi-utils python3 curl
 
   systemctl daemon-reload
-  systemctl enable lghs-policy.service lghs-agent.service avahi-daemon ssh
+  systemctl enable lghs-policy.service lghs-agent.service lghs-update.timer avahi-daemon ssh
 fi
 
 echo "LGHS $ROLE installation completed."
