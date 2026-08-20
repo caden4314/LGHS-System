@@ -1,0 +1,9 @@
+/var/log/sudo.log /var/log/lghs-sudo-audit.jsonl {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
