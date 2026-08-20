@@ -26,8 +26,6 @@ install -d -m 0700 "${ROOTFS_DIR}/etc/lghs/secrets"
 printf '%s\n' "$IMAGE_HOSTNAME" > "${ROOTFS_DIR}/etc/lghs/build-hostname"
 printf '%s\n' "$LGHS_ROLE" > "${ROOTFS_DIR}/etc/lghs/build-role"
 
-# Public key is present on every LGHS image. Only a controller image receives
-# the private half of the keypair.
 install -m 0644 "$KEY_DIR/controller_ed25519.pub" "${ROOTFS_DIR}/etc/lghs/controller_ed25519.pub"
 if [[ "$LGHS_ROLE" == "controller" ]]; then
     install -m 0600 "$KEY_DIR/controller_ed25519" "${ROOTFS_DIR}/etc/lghs/secrets/controller_ed25519"
@@ -43,7 +41,6 @@ if [[ "${LGHS_ROLE}" == "student" ]]; then
 fi
 EOF
 
-# Classroom development environment shared by both roles.
 on_chroot <<'EOF'
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -53,9 +50,10 @@ EOF
 install -d -m 0755 "${ROOTFS_DIR}/etc/skel/.config/Code/User"
 cat > "${ROOTFS_DIR}/etc/skel/.config/Code/User/settings.json" <<'EOF'
 {
-    "python.defaultInterpreterPath": "/usr/bin/python3",
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
     "python.terminal.activateEnvironment": true,
     "python.createEnvironment.trigger": "off",
+    "python.analysis.autoImportCompletions": true,
     "terminal.integrated.defaultProfile.linux": "bash",
     "files.autoSave": "afterDelay",
     "files.autoSaveDelay": 1000,
@@ -64,11 +62,7 @@ cat > "${ROOTFS_DIR}/etc/skel/.config/Code/User/settings.json" <<'EOF'
 }
 EOF
 
-install -d -m 0755 \
-    "${ROOTFS_DIR}/etc/skel/CS2" \
-    "${ROOTFS_DIR}/etc/skel/CS2/Assignments" \
-    "${ROOTFS_DIR}/etc/skel/CS2/Projects" \
-    "${ROOTFS_DIR}/etc/skel/CS2/My Programs"
+install -d -m 0755 "${ROOTFS_DIR}/etc/skel/CS2" "${ROOTFS_DIR}/etc/skel/CS2/Assignments" "${ROOTFS_DIR}/etc/skel/CS2/Projects" "${ROOTFS_DIR}/etc/skel/CS2/My Programs"
 cat > "${ROOTFS_DIR}/etc/skel/CS2/hello.py" <<'EOF'
 print("Hello, world!")
 EOF
@@ -97,21 +91,20 @@ chmod 0755 "${ROOTFS_DIR}/etc/skel/Desktop/visual-studio-code.desktop"
 for HOME_DIR in "${ROOTFS_DIR}"/home/*; do
     [[ -d "$HOME_DIR" ]] || continue
     USER_NAME="$(basename "$HOME_DIR")"
-    install -d -m 0755 "$HOME_DIR/.config/Code/User" "$HOME_DIR/Desktop" \
-        "$HOME_DIR/CS2" "$HOME_DIR/CS2/Assignments" "$HOME_DIR/CS2/Projects" "$HOME_DIR/CS2/My Programs"
+    install -d -m 0755 "$HOME_DIR/.config/Code/User" "$HOME_DIR/Desktop" "$HOME_DIR/CS2" "$HOME_DIR/CS2/Assignments" "$HOME_DIR/CS2/Projects" "$HOME_DIR/CS2/My Programs"
     cp "${ROOTFS_DIR}/etc/skel/.config/Code/User/settings.json" "$HOME_DIR/.config/Code/User/settings.json"
     cp "${ROOTFS_DIR}/etc/skel/Desktop/visual-studio-code.desktop" "$HOME_DIR/Desktop/visual-studio-code.desktop"
     cp "${ROOTFS_DIR}/etc/skel/CS2/hello.py" "$HOME_DIR/CS2/hello.py"
     chmod 0755 "$HOME_DIR/Desktop/visual-studio-code.desktop"
     USER_UID="$(chroot "$ROOTFS_DIR" id -u "$USER_NAME" 2>/dev/null || true)"
     USER_GID="$(chroot "$ROOTFS_DIR" id -g "$USER_NAME" 2>/dev/null || true)"
-    if [[ -n "$USER_UID" && -n "$USER_GID" ]]; then
-        chown -R "$USER_UID:$USER_GID" "$HOME_DIR/.config/Code" "$HOME_DIR/Desktop/visual-studio-code.desktop" "$HOME_DIR/CS2"
-    fi
+    if [[ -n "$USER_UID" && -n "$USER_GID" ]]; then chown -R "$USER_UID:$USER_GID" "$HOME_DIR/.config/Code" "$HOME_DIR/Desktop/visual-studio-code.desktop" "$HOME_DIR/CS2"; fi
 done
 
-on_chroot <<'EOF'
-if id lg_cs_cont >/dev/null 2>&1 && command -v code >/dev/null 2>&1; then
+on_chroot <<EOF
+if [[ "${LGHS_ROLE}" == "student" ]]; then
+    /usr/local/sbin/lghs-dev-setup
+elif command -v code >/dev/null 2>&1 && id lg_cs_cont >/dev/null 2>&1; then
     runuser -u lg_cs_cont -- env HOME=/home/lg_cs_cont code --install-extension ms-python.python --force || true
 fi
 EOF
@@ -122,5 +115,7 @@ echo "LGHS: first-boot Imager provisioning enabled."
 echo "LGHS: fleet SSH enrollment configured."
 if [[ "$LGHS_ROLE" == "student" ]]; then
     echo "LGHS: restricted NetworkManager panel UI installed for lg_cs_cont."
+    echo "LGHS: teacher-approved sudo queue and audit logging installed."
+    echo "LGHS: student Python venv/pip and VS Code environment prepared."
 fi
 echo "LGHS: VS Code opens ~/CS2 with hello.py and classroom folders ready."
