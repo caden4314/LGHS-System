@@ -1,7 +1,6 @@
 [Unit]
 Description=LGHS controller fleet audit synchronization
-After=network-online.target avahi-daemon.service
-Wants=network-online.target
+After=avahi-daemon.service
 ConditionPathExists=/etc/lghs/role
 
 [Service]
