@@ -20,6 +20,8 @@ fi
 install -d -m 0755 /etc/sudoers.d /etc/polkit-1/rules.d
 cat >/etc/sudoers.d/90-lghs-student <<'EOF'
 Defaults:lg_cs_cont timestamp_timeout=0
+lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-broker *
+lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-approved-exec *
 lg_cs_cont ALL=(root) PASSWD: /usr/sbin/reboot
 lg_cs_cont ALL=(root) PASSWD: /usr/sbin/poweroff
 lg_cs_cont ALL=(root) PASSWD: /usr/sbin/shutdown
