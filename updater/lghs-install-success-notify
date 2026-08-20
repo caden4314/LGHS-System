@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+COMPLETE=/var/lib/lghs/bootstrap-complete
+NOTIFIED=/var/lib/lghs/install-success-notified
+
+[[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
+[[ -f "$NOTIFIED" ]] && exit 0
+
+# The installer starts this helper before the outer stock-bootstrap wrapper can
+# write bootstrap-complete. Wait for that marker so the message can only mean
+# the entire LGHS installation finished successfully.
+for _ in $(seq 1 300); do
+    [[ -f "$COMPLETE" ]] && break
+    sleep 2
+done
+[[ -f "$COMPLETE" ]] || { echo 'LGHS completion marker not available yet.' >&2; exit 1; }
+
+ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
+VERSION="$(cat /etc/lghs/version 2>/dev/null || echo unknown)"
+HOST="$(hostname)"
+USER_NAME="$(cat /etc/lghs/autologin-user 2>/dev/null || true)"
+if [[ -z "$USER_NAME" ]]; then
+    [[ "$ROLE" == controller ]] && USER_NAME=cs_admin || USER_NAME=lg_cs_cont
+fi
+id "$USER_NAME" >/dev/null 2>&1 || { echo "LGHS desktop user missing: $USER_NAME" >&2; exit 1; }
+command -v notify-send >/dev/null 2>&1 || { echo 'notify-send is not installed.' >&2; exit 1; }
+
+UID_NUM="$(id -u "$USER_NAME")"
+RUNTIME="/run/user/$UID_NUM"
+BUS="$RUNTIME/bus"
+
+# The graphical login can become ready a little after installation. Wait rather
+# than losing the all-good message during a fast first boot.
+for _ in $(seq 1 150); do
+    [[ -S "$BUS" ]] && break
+    sleep 2
+done
+[[ -S "$BUS" ]] || { echo "Desktop notification bus not ready for $USER_NAME." >&2; exit 1; }
+
+MEMORY="$(sed -n 's/^MEMORY_GB=//p' /etc/lghs/device.conf 2>/dev/null | head -n1)"
+DETAIL="LGHS V${VERSION} installed successfully. ${HOST} is ready."
+[[ "$MEMORY" == 4 || "$MEMORY" == 8 ]] && DETAIL="LGHS V${VERSION} installed successfully. ${HOST} (Pi 5 ${MEMORY} GB) is ready."
+
+runuser -u "$USER_NAME" -- env \
+    XDG_RUNTIME_DIR="$RUNTIME" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS" \
+    notify-send -a 'LGHS Setup' -u normal -t 12000 \
+    'LGHS Setup Complete — All Good' "$DETAIL"
+
+install -d -m 0750 -o root -g lghs-admin /var/lib/lghs 2>/dev/null || true
+touch "$NOTIFIED"
+chown root:lghs-admin "$NOTIFIED" 2>/dev/null || chown root:root "$NOTIFIED"
+chmod 0640 "$NOTIFIED"
+logger -t LGHS-INSTALL "All-good notification delivered to $USER_NAME: $HOST V$VERSION"
