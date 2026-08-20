@@ -97,6 +97,7 @@ else
   install -m 0755 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
   install -m 0755 "$ROOT_DIR/student/lghs-agent" /usr/local/sbin/lghs-agent
   install -m 0755 "$ROOT_DIR/student/lghs-network-ui-apply" /usr/local/sbin/lghs-network-ui-apply
+  install -m 0755 "$ROOT_DIR/student/lghs-install-network-ui" /usr/local/sbin/lghs-install-network-ui
 
   install -m 0440 "$ROOT_DIR/policies/sudoers/90-lghs-student" /etc/sudoers.d/90-lghs-student
   install -m 0644 "$ROOT_DIR/policies/polkit/49-lghs-network.rules" /etc/polkit-1/rules.d/49-lghs-network.rules
@@ -135,7 +136,13 @@ EOF
   install -m 0644 "$ROOT_DIR/systemd/lghs-policy.service" /etc/systemd/system/lghs-policy.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
 
-  /usr/local/sbin/lghs-network-ui-apply || true
+  # Fresh images and already-running student Pis converge on the same hardened
+  # panel. Compilation happens only when the cached hardened plugin is absent.
+  if [[ ! -f /usr/local/lib/lghs/libnetman.so.hardened ]]; then
+    /usr/local/sbin/lghs-install-network-ui
+  else
+    /usr/local/sbin/lghs-network-ui-apply
+  fi
 fi
 
 systemctl daemon-reload
