@@ -18,6 +18,14 @@ BUILD_PKGS=(
   libsecret-1-dev libnm-dev libnma-dev
 )
 
+if [[ -f "$HARDENED" ]]; then
+    if [[ -x /usr/local/sbin/lghs-network-ui-apply ]]; then
+        /usr/local/sbin/lghs-network-ui-apply
+    fi
+    echo 'LGHS: hardened student network UI is already available.'
+    exit 0
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends "${BUILD_PKGS[@]}"
@@ -46,9 +54,6 @@ if anchor not in s:
     raise SystemExit('LGHS patch failed: type anchor not found')
 s = s.replace(anchor, helper, 1)
 
-# There are two Edit Connections menu entries in the upstream applet: one in
-# the VPN/advanced menu and one in the normal menu. Wrap each block so only
-# lg_cs_cont loses the editor entry; cs_admin/root keep the stock UI.
 pattern = re.compile(
     r"(?P<indent>\t)/\* 'Edit Connections\.\.\.' item \*/\n"
     r"(?P<body>\tapplet->connections_menu_item = gtk_menu_item_new_with_mnemonic \(_\(\"Edit Connections…\"\)\);\n"
@@ -97,7 +102,6 @@ fi
 install -d -m 0755 /usr/local/lib/lghs
 install -m 0644 "$NETMAN_LIB" "$HARDENED"
 
-# Install/refresh the direct advanced-editor guard and root-only NM profiles.
 if [[ -x /usr/local/sbin/lghs-network-ui-apply ]]; then
     /usr/local/sbin/lghs-network-ui-apply
 fi
