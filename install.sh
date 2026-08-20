@@ -29,15 +29,22 @@ if [[ -n "$SOURCE_COMMIT" && "$SOURCE_COMMIT" != "unknown" ]]; then
   printf '%s\n' "$SOURCE_COMMIT" > /var/lib/lghs/update/current-commit
 fi
 
+# Common live-management components. All are reinstalled on every LGHS update,
+# so functionality can evolve without reflashing the SD card.
 install -m 0755 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
+install -m 0755 "$ROOT_DIR/updater/lghs-os-update" /usr/local/sbin/lghs-os-update
+install -m 0755 "$ROOT_DIR/updater/lghs-autologin-apply" /usr/local/sbin/lghs-autologin-apply
+install -m 0755 "$ROOT_DIR/updater/lghs-reconcile" /usr/local/sbin/lghs-reconcile
 install -m 0755 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
 install -m 0755 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
 install -m 0644 "$ROOT_DIR/systemd/lghs-firstboot-provision.service" /etc/systemd/system/lghs-firstboot-provision.service
+install -m 0644 "$ROOT_DIR/systemd/lghs-reconcile.service" /etc/systemd/system/lghs-reconcile.service
+install -m 0644 "$ROOT_DIR/systemd/lghs-reconcile.timer" /etc/systemd/system/lghs-reconcile.timer
 install -m 0440 "$ROOT_DIR/policies/sudoers/89-lghs-audit" /etc/sudoers.d/89-lghs-audit
 
-COMMON_PKGS=(git curl python3 openssh-client)
+COMMON_PKGS=(git curl python3 openssh-client sudo logrotate)
 if ! command -v flock >/dev/null 2>&1; then COMMON_PKGS+=(util-linux); fi
 MISSING_PKGS=()
 for pkg in "${COMMON_PKGS[@]}"; do
@@ -58,9 +65,12 @@ Defaults:cs_admin timestamp_timeout=5
 cs_admin ALL=(ALL:ALL) ALL
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-report *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-update
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-os-update
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-os-update --reboot
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-check
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-enforce
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-export *
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/poweroff
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/shutdown
@@ -70,6 +80,9 @@ chmod 0440 /etc/sudoers.d/91-lghs-admin
 if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/sbin/lghsctl
   install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/sbin/lghs-console
+  install -m 0755 "$ROOT_DIR/controller/lghs-audit-sync" /usr/local/sbin/lghs-audit-sync
+  install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.service" /etc/systemd/system/lghs-audit-sync.service
+  install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.timer" /etc/systemd/system/lghs-audit-sync.timer
 
   CTRL_PKGS=(avahi-daemon avahi-utils)
   MISSING_PKGS=()
@@ -91,6 +104,20 @@ if [[ "$ROLE" == "controller" ]]; then
   install -d -m 0755 /var/lib/lghs
   touch /var/lib/lghs/ssh_known_hosts
   chmod 0644 /var/lib/lghs/ssh_known_hosts
+  install -d -m 0750 -o root -g adm /var/log/lghs-fleet
+
+  cat > /etc/logrotate.d/lghs-fleet <<'EOF'
+/var/log/lghs-fleet/*.log /var/log/lghs-fleet/*.jsonl /var/log/lghs-fleet/*/*.log /var/log/lghs-fleet/*/*.jsonl {
+    weekly
+    rotate 16
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
+EOF
+  chmod 0644 /etc/logrotate.d/lghs-fleet
 else
   install -m 0755 "$ROOT_DIR/student/lghs-enforce" /usr/local/sbin/lghs-enforce
   install -m 0755 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
@@ -100,12 +127,13 @@ else
   install -m 0755 "$ROOT_DIR/student/lghs-sudo-broker" /usr/local/sbin/lghs-sudo-broker
   install -m 0755 "$ROOT_DIR/student/lghs-approved-exec" /usr/local/sbin/lghs-approved-exec
   install -m 0755 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
+  install -m 0755 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
   install -m 0755 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
   install -m 0755 "$ROOT_DIR/student/sudo" /usr/local/bin/sudo
   install -d -m 0700 /var/lib/lghs/sudo-requests
-  touch /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log
-  chown root:adm /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log 2>/dev/null || true
-  chmod 0640 /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log
+  touch /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log /var/log/lghs-update.log /var/log/lghs-os-update.log
+  chown root:adm /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log /var/log/lghs-update.log /var/log/lghs-os-update.log 2>/dev/null || true
+  chmod 0640 /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log /var/log/lghs-update.log /var/log/lghs-os-update.log
 
   install -m 0440 "$ROOT_DIR/policies/sudoers/90-lghs-student" /etc/sudoers.d/90-lghs-student
   install -m 0644 "$ROOT_DIR/policies/polkit/49-lghs-network.rules" /etc/polkit-1/rules.d/49-lghs-network.rules
@@ -151,17 +179,26 @@ EOF
   /usr/local/sbin/lghs-dev-setup || true
 fi
 
+# Role-aware desktop autologin is re-applied on every install/update so distro
+# changes to LightDM/labwc do not silently revert classroom behavior.
+/usr/local/sbin/lghs-autologin-apply || true
+
 visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
-systemctl enable lghs-update.service lghs-update.timer lghs-firstboot-provision.service avahi-daemon.service
+systemctl enable lghs-update.service lghs-update.timer lghs-firstboot-provision.service lghs-reconcile.timer avahi-daemon.service
 if [[ "$ROLE" == "student" ]]; then
   systemctl enable lghs-policy.service lghs-agent.service ssh
+else
+  systemctl enable lghs-audit-sync.timer
 fi
 
 if systemctl is-system-running --quiet 2>/dev/null || systemctl is-system-running 2>/dev/null | grep -Eq 'running|degraded'; then
   systemctl try-restart avahi-daemon.service || true
+  systemctl try-restart lghs-reconcile.timer || true
   if [[ "$ROLE" == "student" ]]; then
     systemctl try-restart lghs-policy.service lghs-agent.service ssh.service || true
+  else
+    systemctl try-restart lghs-audit-sync.timer || true
   fi
 fi
 
