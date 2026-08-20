@@ -14,9 +14,9 @@ if ! id -nG "$ADMIN" | tr ' ' '\n' | grep -qx sudo; then usermod -aG sudo "$ADMI
 install -d -m 0755 /etc/sudoers.d /etc/polkit-1/rules.d /etc/logrotate.d
 cat >/etc/sudoers.d/90-lghs-student <<'EOF'
 Defaults:lg_cs_cont timestamp_timeout=0,rootpw
+lg_cs_cont ALL=(ALL:ALL) PASSWD: ALL
 lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-broker *
 lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-approved-exec *
-lg_cs_cont ALL=(ALL:ALL) PASSWD: ALL
 EOF
 chmod 0440 /etc/sudoers.d/90-lghs-student;chown root:root /etc/sudoers.d/90-lghs-student
 
