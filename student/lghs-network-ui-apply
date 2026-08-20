@@ -35,14 +35,11 @@ if [[ -f "$HARDENED_LIB" ]]; then
 fi
 
 # Defense in depth: even if a menu/launcher reaches the advanced editor,
-# lg_cs_cont is denied while cs_admin/root retain normal access.
+# lg_cs_cont is denied while cs_admin/root retain normal access. If a package
+# update replaces our wrapper, preserve the newly installed real editor first.
 if [[ -x "$EDITOR" && ! -L "$EDITOR" ]]; then
     if ! grep -q 'LGHS_NETWORK_EDITOR_GUARD' "$EDITOR" 2>/dev/null; then
-        if [[ ! -e "$EDITOR_REAL" ]]; then
-            mv "$EDITOR" "$EDITOR_REAL"
-        else
-            rm -f "$EDITOR"
-        fi
+        mv -f "$EDITOR" "$EDITOR_REAL"
         cat > "$EDITOR" <<'EOF'
 #!/bin/sh
 # LGHS_NETWORK_EDITOR_GUARD
@@ -52,8 +49,8 @@ if [ "$(id -un 2>/dev/null)" = "lg_cs_cont" ]; then
 fi
 exec /usr/lib/lghs/lp-connection-editor.real "$@"
 EOF
-        chmod 0755 "$EDITOR"
-        chown root:root "$EDITOR"
+        chmod 0755 "$EDITOR" "$EDITOR_REAL"
+        chown root:root "$EDITOR" "$EDITOR_REAL"
         log "Installed advanced network editor guard for $STUDENT_USER."
     fi
 fi
