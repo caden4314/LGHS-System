@@ -17,7 +17,8 @@ MAX_BACKOFF = 900
 ALLOWED_FLEET_ACTIONS = {
     'update': ['update'],
     'os-update': ['os-update'],
-    'os-update-reboot': ['os-update', '--reboot'],
+    # Queued fleet maintenance never schedules a surprise delayed reboot.
+    'os-update-reboot': ['os-update'],
     'enforce': ['enforce'],
 }
 
@@ -130,8 +131,7 @@ def command_for(job):
         return ['/usr/local/sbin/lghs-update']
     if kind == 'os-update':
         cmd = ['/usr/local/sbin/lghs-os-update']
-        if params.get('reboot'):
-            cmd.append('--reboot')
+        # A requested reboot is performed only after the job file is removed.
         return cmd
     if kind == 'fleet':
         target = str(params.get('target', '')).strip()
@@ -172,7 +172,13 @@ def drain():
             continue
         if rc == 0:
             log(f'completed id={jid} kind={job.get("kind")}')
+            reboot_after = job.get('kind') == 'os-update' and bool(job.get('params', {}).get('reboot'))
             path.unlink(missing_ok=True)
+            if reboot_after:
+                os.sync()
+                log(f'reboot requested after completed id={jid}')
+                subprocess.Popen(['systemctl', 'reboot'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return 0
             continue
         attempts = int(job.get('attempts', 0)) + 1
         backoff = min(MAX_BACKOFF, max(30, 30 * (2 ** min(attempts - 1, 5))))
