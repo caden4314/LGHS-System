@@ -8,6 +8,7 @@ STATE_DIR=/var/lib/lghs/update
 ROLE="$(cat /etc/lghs/role 2>/dev/null || true)"
 LOCK_FILE=/run/lock/lghs-update.lock
 LOG=/var/log/lghs-update.log
+NETQUEUE=/usr/local/sbin/lghs-netqueue
 
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
 [[ "$ROLE" == "controller" || "$ROLE" == "student" ]] || { echo "Invalid or missing LGHS role" >&2; exit 1; }
@@ -16,23 +17,45 @@ install -d -m 0755 "$STATE_DIR" /opt/lghs
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "Another LGHS update is already running."; exit 0; }
 
+queue_for_network() {
+    local reason="$1"
+    echo "LGHS updater: $reason"
+    if [[ "${LGHS_NETQUEUE_RUNNING:-0}" == "1" ]]; then
+        return 75
+    fi
+    if [[ -x "$NETQUEUE" ]]; then
+        "$NETQUEUE" enqueue local-update >/dev/null
+        echo "LGHS updater: network work queued persistently."
+        return 0
+    fi
+    return 75
+}
+
+# Probe the exact upstream this operation needs. Do not make boot or local LGHS
+# functionality depend on Wi-Fi/internet availability.
+if ! GIT_TERMINAL_PROMPT=0 timeout 12 git ls-remote --heads "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
+    if queue_for_network "Git repository is currently unreachable; deferring update."; then exit 0; else exit 75; fi
+fi
+
 INSTALLED_COMMIT="$(cat "$STATE_DIR/current-commit" 2>/dev/null || cat /etc/lghs/source-commit 2>/dev/null || echo unknown)"
 
 if [[ ! -d "$CHECKOUT/.git" ]]; then
     echo "LGHS updater: creating local checkout..."
     rm -rf "$CHECKOUT"
-    git clone --branch "$BRANCH" "$REPO_URL" "$CHECKOUT"
+    if ! GIT_TERMINAL_PROMPT=0 git clone --branch "$BRANCH" "$REPO_URL" "$CHECKOUT"; then
+        if queue_for_network "clone failed; deferring update."; then exit 0; else exit 75; fi
+    fi
 fi
 
 cd "$CHECKOUT"
 git remote set-url origin "$REPO_URL"
-git fetch --prune origin "$BRANCH"
+if ! GIT_TERMINAL_PROMPT=0 git fetch --prune origin "$BRANCH"; then
+    if queue_for_network "fetch failed; deferring update."; then exit 0; else exit 75; fi
+fi
 TARGET_COMMIT="$(git rev-parse "origin/$BRANCH")"
 
 if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
     git reset --hard "$TARGET_COMMIT" >/dev/null
-    # Even with no new LGHS commit, reconcile the managed state. This repairs
-    # files or services that a Raspberry Pi OS/package update may have replaced.
     if [[ -x /usr/local/sbin/lghs-reconcile ]]; then
         /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true
     fi
