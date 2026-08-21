@@ -132,7 +132,9 @@ else
   install -m 0440 "$ROOT_DIR/policies/sudoers/90-lghs-student" /etc/sudoers.d/90-lghs-student
   install -m 0644 "$ROOT_DIR/policies/polkit/49-lghs-network.rules" /etc/polkit-1/rules.d/49-lghs-network.rules
 
-  STUDENT_PKGS=(openssh-server network-manager policykit-1 avahi-daemon avahi-utils)
+  # Debian 13/Trixie split the former policykit-1 package. The PolicyKit daemon
+  # package is polkitd; requesting policykit-1 has no installation candidate.
+  STUDENT_PKGS=(openssh-server network-manager polkitd avahi-daemon avahi-utils)
   MISSING_PKGS=()
   for pkg in "${STUDENT_PKGS[@]}"; do dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg"); done
   if (( ${#MISSING_PKGS[@]} )); then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"; fi
@@ -171,15 +173,10 @@ systemctl enable --now avahi-daemon.service
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
   systemctl enable --now lghs-policy.service lghs-agent.service ssh.service
-  # The units are oneshot/RemainAfterExit, so enable --now does not rerun them
-  # after an update. Explicit restart applies new policy code and refreshes the
-  # Avahi TXT advertisement/version immediately.
   systemctl restart lghs-policy.service lghs-agent.service
   systemctl try-restart ssh.service >/dev/null 2>&1 || true
 else
   systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service
-  # Replace the running notifier process with the just-installed code so a live
-  # update never reports the new version while an old daemon is still running.
   systemctl try-restart lghs-fleet-notify.service
 fi
 
