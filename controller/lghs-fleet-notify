@@ -24,13 +24,34 @@ mod=load_base()
 
 
 def notify(title,body,urgency="normal"):
-    if not shutil.which("notify-send"): return
     try:user=pwd.getpwnam("cs_admin")
     except KeyError:return
-    bus=f"/run/user/{user.pw_uid}/bus"
+    runtime=f"/run/user/{user.pw_uid}"
+    bus=f"{runtime}/bus"
     if not os.path.exists(bus):return
+    env=[
+        "env",
+        f"HOME={user.pw_dir}",
+        f"XDG_RUNTIME_DIR={runtime}",
+        f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}",
+    ]
+    message=f"{title}: {body}"
     try:
-        subprocess.run(["runuser","-u","cs_admin","--","env",f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}","notify-send","-a","LGHS Fleet","-u",urgency,title,body],timeout=5,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+        # Raspberry Pi OS Trixie/labwc uses wf-panel-pi for its native desktop
+        # notifications and does not necessarily provide the standard
+        # org.freedesktop.Notifications daemon expected by notify-send.
+        if shutil.which("wfpanelctl"):
+            action="critical" if urgency=="critical" else "notify"
+            p=subprocess.run(
+                ["runuser","-u","cs_admin","--",*env,"wfpanelctl",action,message],
+                timeout=5,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False,
+            )
+            if p.returncode==0:return
+        if shutil.which("notify-send"):
+            subprocess.run(
+                ["runuser","-u","cs_admin","--",*env,"notify-send","-a","LGHS Fleet","-u",urgency,title,body],
+                timeout=5,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False,
+            )
     except Exception:pass
 
 
