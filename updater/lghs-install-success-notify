@@ -28,6 +28,9 @@ id "$USER_NAME" >/dev/null 2>&1 || { echo "LGHS desktop user missing: $USER_NAME
 HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 USER_STATE="$HOME_DIR/.local/state/lghs"
 USER_NOTIFIED="$USER_STATE/install-success-shown"
+UID_NUM="$(id -u "$USER_NAME")"
+RUNTIME="/run/user/$UID_NUM"
+BUS="$RUNTIME/bus"
 
 mark_system_notified() {
     install -d -m 0750 -o root -g lghs-admin /var/lib/lghs 2>/dev/null || true
@@ -36,22 +39,9 @@ mark_system_notified() {
     chmod 0640 "$NOTIFIED"
 }
 
-# The XDG-autostart progress window runs inside the real desktop session and is
-# the preferred success signal. Give it a short grace period after the system
-# completion marker so it can display ALL GOOD and write its user marker. This
-# avoids duplicate notifications while preserving a system-service fallback.
-for _ in $(seq 1 10); do
-    if [[ -f "$USER_NOTIFIED" ]]; then
-        mark_system_notified
-        logger -t LGHS-INSTALL "Desktop progress UI reported success to $USER_NAME: $HOST V$VERSION"
-        exit 0
-    fi
-    sleep 2
-done
-
-UID_NUM="$(id -u "$USER_NAME")"
-RUNTIME="/run/user/$UID_NUM"
-BUS="$RUNTIME/bus"
+# The progress window and the panel notification are intentionally independent:
+# the window provides continuous first-boot feedback, while this service emits
+# one passive completion notification after the whole install succeeds.
 for _ in $(seq 1 150); do
     [[ -S "$BUS" ]] && break
     sleep 2
@@ -88,7 +78,9 @@ if [[ $DELIVERED -eq 0 ]] && command -v notify-send >/dev/null 2>&1; then
 fi
 [[ $DELIVERED -eq 1 ]] || { echo 'No supported desktop notification path succeeded.' >&2; exit 1; }
 
+# Also create the per-user marker used by the XDG progress launcher to avoid
+# reopening the first-boot progress window on later logins.
 runuser -u "$USER_NAME" -- mkdir -p "$USER_STATE"
 runuser -u "$USER_NAME" -- touch "$USER_NOTIFIED"
 mark_system_notified
-logger -t LGHS-INSTALL "Fallback all-good notification delivered to $USER_NAME: $HOST V$VERSION"
+logger -t LGHS-INSTALL "All-good panel notification delivered to $USER_NAME: $HOST V$VERSION"
