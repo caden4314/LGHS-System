@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import datetime as dt
+import fcntl
 import json
 import os
 import subprocess
@@ -22,8 +23,7 @@ def atomic_write(path, data):
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(data, f, separators=(',', ':'))
-            f.write('\n')
-            f.flush(); os.fsync(f.fileno())
+            f.write('\n'); f.flush(); os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     finally:
@@ -33,6 +33,7 @@ def atomic_write(path, data):
 
 def audit(event, **fields):
     record = {'time': now_iso(), 'event': event, **fields}
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
     try:
         os.write(fd, (json.dumps(record, separators=(',', ':')) + '\n').encode())
@@ -50,6 +51,16 @@ def fail(msg):
     raise SystemExit(126)
 
 
+def clean_env():
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith('SUDO_') or key in {'PYTHONPATH','PYTHONHOME','LD_PRELOAD','LD_LIBRARY_PATH'}:
+            env.pop(key, None)
+    env['HOME'] = '/root'; env['USER'] = 'root'; env['LOGNAME'] = 'root'
+    env['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    return env
+
+
 def main():
     if os.geteuid() != 0 or os.environ.get('SUDO_USER') != STUDENT:
         fail('approved executor may only be called by the student through sudo')
@@ -59,65 +70,67 @@ def main():
     rid = sys.argv[1]
     argv = sys.argv[3:]
     path = REQUEST_DIR / f'{rid}.json'
-    try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-    except Exception:
-        fail('approval record not found')
+    lock_path = REQUEST_DIR / f'{rid}.lock'
 
-    if data.get('requester') != STUDENT:
-        fail('request owner mismatch')
-    if data.get('status') != 'approved':
-        fail(f"request is {data.get('status', 'not approved')}")
-    if time.time() > float(data.get('expires_epoch', 0)):
-        data['status'] = 'expired'; data['resolved_at'] = now_iso(); atomic_write(path, data)
-        fail('approval expired')
-    if data.get('argv') != argv:
-        audit('execution_mismatch', request_id=rid, requested=data.get('argv'), supplied=argv)
-        fail('command no longer matches the approved request')
+    with lock_path.open('a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            fail('approval record not found')
+        if data.get('requester') != STUDENT:
+            fail('request owner mismatch')
+        if data.get('argv') != argv:
+            audit('execution_mismatch', request_id=rid, authorization='fleet', requested=data.get('argv'), supplied=argv)
+            fail('command no longer matches the approved request')
+        if time.time() > float(data.get('expires_epoch', 0)):
+            if data.get('status') in ('pending', 'approved'):
+                data['status'] = 'expired'; data['resolved_at'] = now_iso(); atomic_write(path, data)
+                audit('expired', request_id=rid, device_id=data.get('device_id'), requester=STUDENT,
+                      command=data.get('command'), authorization='fleet')
+            fail('approval expired')
+        if data.get('status') != 'approved':
+            audit('execution_rejected', request_id=rid, device_id=data.get('device_id'), requester=STUDENT,
+                  authorization='fleet', current_status=data.get('status'), command=data.get('command'))
+            fail(f"request is {data.get('status', 'not approved')}")
 
-    cwd = data.get('cwd') or f'/home/{STUDENT}'
-    home = Path(f'/home/{STUDENT}')
-    try:
-        resolved = Path(cwd).resolve()
-        if not (resolved == home or home in resolved.parents):
+        cwd = data.get('cwd') or f'/home/{STUDENT}'
+        home = Path(f'/home/{STUDENT}')
+        try:
+            resolved = Path(cwd).resolve()
+            if not (resolved == home or home in resolved.parents):
+                cwd = str(home)
+        except Exception:
             cwd = str(home)
-    except Exception:
-        cwd = str(home)
 
-    data['status'] = 'executing'
-    data['started_at'] = now_iso()
-    atomic_write(path, data)
-    audit('executing', request_id=rid, device_id=data.get('device_id'), requester=STUDENT,
-          approved_by=data.get('approved_by'), cwd=cwd, argv=argv)
-
-    env = dict(os.environ)
-    for key in list(env):
-        if key.startswith('SUDO_') or key in {'PYTHONPATH','PYTHONHOME','LD_PRELOAD','LD_LIBRARY_PATH'}:
-            env.pop(key, None)
-    env['HOME'] = '/root'
-    env['USER'] = 'root'
-    env['LOGNAME'] = 'root'
-    env['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+        data['status'] = 'executing'
+        data['started_at'] = now_iso()
+        data['authorization'] = 'fleet'
+        atomic_write(path, data)
+        audit('executing', request_id=rid, device_id=data.get('device_id'), requester=STUDENT,
+              approved_by=data.get('approved_by'), cwd=cwd, command=data.get('command'), argv=argv,
+              authorization='fleet', requested_at=data.get('requested_at'), resolved_at=data.get('resolved_at'))
 
     try:
-        rc = subprocess.run(argv, cwd=cwd, env=env).returncode
+        rc = subprocess.run(argv, cwd=cwd, env=clean_env()).returncode
     except FileNotFoundError:
-        print(f'LGHS sudo: command not found: {argv[0]}', file=sys.stderr)
-        rc = 127
+        print(f'LGHS sudo: command not found: {argv[0]}', file=sys.stderr); rc = 127
     except Exception as exc:
-        print(f'LGHS sudo: execution failed: {exc}', file=sys.stderr)
-        rc = 126
+        print(f'LGHS sudo: execution failed: {exc}', file=sys.stderr); rc = 126
 
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
         data['status'] = 'completed'
         data['completed_at'] = now_iso()
         data['exit_code'] = rc
+        data['authorization'] = 'fleet'
         atomic_write(path, data)
     finally:
         audit('completed', request_id=rid, device_id=data.get('device_id'), requester=STUDENT,
-              argv=argv, exit_code=rc)
+              approved_by=data.get('approved_by'), command=data.get('command'), argv=argv,
+              exit_code=rc, authorization='fleet')
     raise SystemExit(rc)
+
 
 if __name__ == '__main__':
     main()
