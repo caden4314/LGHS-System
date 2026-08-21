@@ -166,7 +166,8 @@ fi
 visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
 
-systemctl enable lghs-update.service lghs-firstboot-provision.service avahi-daemon.service
+systemctl enable lghs-update.service lghs-firstboot-provision.service
+systemctl enable --now avahi-daemon.service
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
   systemctl enable --now lghs-policy.service lghs-agent.service ssh.service
