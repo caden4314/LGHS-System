@@ -4,7 +4,7 @@ LGHS is a classroom Raspberry Pi management system for one Control Pi and a flee
 
 ## Current deployment baseline
 
-The current runtime release is **V0206**. The active Windows LGHS Imager supports Raspberry Pi 5 **4 GB and 8 GB** hardware profiles using the same Raspberry Pi OS arm64 base.
+The current runtime release is **V0207**. The active Windows LGHS Imager supports Raspberry Pi 5 **4 GB and 8 GB** hardware profiles using the same Raspberry Pi OS arm64 base.
 
 ## Goals
 
@@ -14,7 +14,7 @@ The current runtime release is **V0206**. The active Windows LGHS Imager support
 - Restricted student sudo with exact-command Fleet approval and Root-password local fallback.
 - Protected NetworkManager profiles and student network UI restrictions.
 - Versioned policy/software updates with validation, persistent offline retry, and rollback hooks.
-- Responsive Fleet console with Needs Attention, activity history, and desktop notifications.
+- Responsive Fleet console with Needs Attention, activity history, desktop notifications, and live aggregate network rates.
 - No student passwords, Wi-Fi passwords, private keys, or tokens committed to Git.
 
 ## Layout
