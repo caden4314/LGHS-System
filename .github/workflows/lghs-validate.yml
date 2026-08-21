@@ -16,6 +16,8 @@ jobs:
         run: |
           python3 -m py_compile \
             controller/lghs-console \
+            controller/lghs-console-responsive \
+            controller/lghs-fleet-notify \
             controller/lghsctl \
             controller/lghs-audit-sync \
             updater/lghs-netqueue \
@@ -27,24 +29,45 @@ jobs:
 
       - name: Shell syntax
         run: |
-          bash -n install.sh
-          bash -n updater/lghs-update
-          bash -n updater/lghs-os-update
-          bash -n updater/lghs-autologin-apply
-          bash -n updater/lghs-reconcile
-          bash -n updater/lghs-access-enforce
-          bash -n controller/lghsctl-wrapper
-          bash -n systemd/90-lghs-netqueue
-          bash -n student/lghs-enforce
-          bash -n student/lghs-check
-          bash -n student/lghs-agent
-          bash -n student/lghs-report
-          bash -n student/lghs-firstboot-provision
-          bash -n student/lghs-install-network-ui
-          bash -n student/lghs-network-ui-apply
-          bash -n student/lghs-dev-setup
+          for file in \
+            install.sh \
+            updater/lghs-update \
+            updater/lghs-os-update \
+            updater/lghs-autologin-apply \
+            updater/lghs-reconcile \
+            updater/lghs-access-enforce \
+            updater/lghs-install-success-notify \
+            controller/lghsctl-wrapper \
+            systemd/90-lghs-netqueue \
+            student/lghs-enforce \
+            student/lghs-check \
+            student/lghs-agent \
+            student/lghs-report \
+            student/lghs-firstboot-provision \
+            student/lghs-install-network-ui \
+            student/lghs-network-ui-apply \
+            student/lghs-dev-setup \
+            image-builder/build-image.sh \
+            image-builder/stage-lghs/prerun.sh \
+            image-builder/stage-lghs/00-install-lghs/00-run.sh
+          do
+            bash -n "$file"
+          done
 
       - name: Sudoers syntax
         run: |
           sudo visudo -cf policies/sudoers/89-lghs-audit
           sudo visudo -cf policies/sudoers/90-lghs-student
+
+      - name: Release invariants
+        run: |
+          grep -Eq '^[0-9]{4}$' VERSION
+          grep -q 'controller/lghs-console-responsive' install.sh
+          grep -q 'lghs-fleet-notify.service' install.sh
+          grep -q 'lghs-install-success-notify.service' install.sh
+          grep -q 'MEMORY_GB="$(read_value MEMORY_GB' student/lghs-firstboot-provision
+          grep -q '"$MEMORY_GB" == "4" || "$MEMORY_GB" == "8"' student/lghs-firstboot-provision
+          test -f systemd/lghs-update.timer
+          test -f systemd/lghs-reconcile.timer
+          test -f systemd/lghs-netqueue.timer
+          test -f systemd/lghs-install-success-notify.service
