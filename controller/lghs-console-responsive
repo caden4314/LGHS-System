@@ -114,6 +114,41 @@ def traffic_text():
     return f"DOWN {format_rate(TRAFFIC.get('down_bps', 0.0))} | UP {format_rate(TRAFFIC.get('up_bps', 0.0))}"
 
 
+def load_known_devices():
+    try:
+        data = json.loads(NOTIFY_STATE.read_text(encoding="utf-8"))
+        devices = data.get("devices", {})
+        return devices if isinstance(devices, dict) else {}
+    except Exception:
+        return {}
+
+
+def merge_known_devices(live_devices):
+    """Keep previously seen fleet members visible after they vanish from mDNS."""
+    out = list(live_devices)
+    seen = {str(d.get("addr", "")) for d in live_devices if d.get("addr")}
+    for addr, remembered in load_known_devices().items():
+        if not addr or addr in seen or not isinstance(remembered, dict):
+            continue
+        host = remembered.get("host") or addr
+        out.append({
+            "addr": addr,
+            "host": host,
+            "hostname": host,
+            "role": remembered.get("role", "student"),
+            "online": False,
+            "sudo_requests": [],
+            "last_seen": remembered.get("last_seen", 0),
+        })
+    return sorted(
+        out,
+        key=lambda d: (
+            not d.get("online", False),
+            (d.get("hostname") or d.get("host") or d.get("addr", "")).lower(),
+        ),
+    )
+
+
 def _harvest(state):
     now = time.time()
     future = state.get("_discovery_future")
@@ -128,8 +163,9 @@ def _harvest(state):
     future = state.get("_refresh_future")
     if future is not None and future.done():
         try:
-            devices = future.result()
-            update_traffic(devices, now)
+            live_devices = future.result()
+            update_traffic(live_devices, now)
+            devices = merge_known_devices(live_devices)
             state["devices"] = devices
             if devices:
                 state["selected"] = min(state.get("selected", 0), len(devices) - 1)
@@ -156,6 +192,9 @@ def refresh_state_async(state, force=False):
         if discovered:
             state["_refresh_future"] = workers.submit(mod.refresh_fleet, discovered)
         elif state.get("_discovery_future") is None:
+            # Even when no device is currently advertising, keep the durable
+            # registry visible so previously seen Pis remain OFFLINE in the UI.
+            state["devices"] = merge_known_devices([])
             state["last_refresh"] = now
 
 
@@ -173,11 +212,11 @@ def notify_last_seen(addr):
 def device_issues(device):
     out = []
     if not device.get("online"):
-        last = notify_last_seen(device.get("addr", ""))
+        last = number(device.get("last_seen")) or notify_last_seen(device.get("addr", ""))
         age = time.time() - last if last else None
         detail = "not responding"
         if age is not None:
-            detail += f"; last seen {int(age)}s ago"
+            detail += f"; last seen {int(max(0, age))}s ago"
         out.append(("CRITICAL", "SSH/OFFLINE", detail))
         return out
 
