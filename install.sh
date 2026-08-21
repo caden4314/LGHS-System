@@ -77,15 +77,10 @@ if [[ "$ROLE" == "controller" ]]; then
   install -d -m 0755 /usr/local/libexec
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/libexec/lghsctl-real
   install -m 0755 "$ROOT_DIR/controller/lghsctl-wrapper" /usr/local/sbin/lghsctl
-
-  # Keep the complete original console implementation as a module and install a
-  # thin responsive launcher that performs discovery/SSH refresh in background
-  # workers instead of blocking curses keyboard input.
   install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-base
   install -m 0755 "$ROOT_DIR/controller/lghs-console-responsive" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-notify" /usr/local/sbin/lghs-fleet-notify
   install -m 0644 "$ROOT_DIR/systemd/lghs-fleet-notify.service" /etc/systemd/system/lghs-fleet-notify.service
-
   install -m 0755 "$ROOT_DIR/controller/lghs-audit-sync" /usr/local/sbin/lghs-audit-sync
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.service" /etc/systemd/system/lghs-audit-sync.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.timer" /etc/systemd/system/lghs-audit-sync.timer
@@ -171,19 +166,22 @@ fi
 visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
 
-# Enable AND start timers immediately. Using only `enable` left fresh installs
-# showing inactive timers until a later reboot.
 systemctl enable lghs-update.service lghs-firstboot-provision.service avahi-daemon.service
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
   systemctl enable --now lghs-policy.service lghs-agent.service ssh.service
+  # The units are oneshot/RemainAfterExit, so enable --now does not rerun them
+  # after an update. Explicit restart applies new policy code and refreshes the
+  # Avahi TXT advertisement/version immediately.
+  systemctl restart lghs-policy.service lghs-agent.service
+  systemctl try-restart ssh.service >/dev/null 2>&1 || true
 else
   systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service
+  # Replace the running notifier process with the just-installed code so a live
+  # update never reports the new version while an old daemon is still running.
+  systemctl try-restart lghs-fleet-notify.service
 fi
 
-# Start this asynchronously: it deliberately waits for the outer first-boot
-# bootstrap to create /var/lib/lghs/bootstrap-complete, then waits for the
-# desktop D-Bus session and shows the one-time all-good notification.
 systemctl enable lghs-install-success-notify.service
 systemctl start --no-block lghs-install-success-notify.service >/dev/null 2>&1 || true
 
