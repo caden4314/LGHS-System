@@ -4,7 +4,7 @@ LGHS is a classroom Raspberry Pi management system for one Control Pi and a flee
 
 ## Current deployment baseline
 
-The current runtime release is **V0207**. The active Windows LGHS Imager supports Raspberry Pi 5 **4 GB and 8 GB** hardware profiles using the same Raspberry Pi OS arm64 base.
+The current runtime release is **V0208**. The active Windows LGHS Imager supports Raspberry Pi 5 **4 GB and 8 GB** hardware profiles using the same Raspberry Pi OS arm64 base.
 
 ## Goals
 
@@ -15,6 +15,7 @@ The current runtime release is **V0207**. The active Windows LGHS Imager support
 - Protected NetworkManager profiles and student network UI restrictions.
 - Versioned policy/software updates with validation, persistent offline retry, and rollback hooks.
 - Responsive Fleet console with Needs Attention, activity history, desktop notifications, and live aggregate network rates.
+- Visible first-boot setup progress with a clear ALL GOOD completion state.
 - No student passwords, Wi-Fi passwords, private keys, or tokens committed to Git.
 
 ## Layout
@@ -28,7 +29,9 @@ The current runtime release is **V0207**. The active Windows LGHS Imager support
 
 ## Runtime model
 
-A stock-bootstrap deployment stages role/account/network information on the boot partition, uses cloud-init to establish early SSH recovery, then hands local provisioning to `lghs-stage2-bootstrap.service`. Stage 2 installs the deployment Fleet identity and launches the online LGHS-System bootstrap. The full install writes `/var/lib/lghs/bootstrap-complete`; the one-time desktop notifier only reports success after that marker exists.
+A stock-bootstrap deployment stages role/account/network information on the boot partition, uses cloud-init to establish early SSH recovery and the first-boot progress launcher, then hands local provisioning to `lghs-stage2-bootstrap.service`. Stage 2 installs the deployment Fleet identity and launches the online LGHS-System bootstrap. The desktop progress window follows the local/online setup phases and reports ALL GOOD when installation finishes. The full install writes `/var/lib/lghs/bootstrap-complete`; the one-time success notifier only reports success after that marker exists.
+
+On Raspberry Pi OS Trixie/labwc, LGHS prefers the native `wfpanelctl notify` / `wfpanelctl critical` path used by `wf-panel-pi`. `notify-send` remains a fallback for desktops that provide the standard freedesktop notification daemon.
 
 Live LGHS updates pull the configured branch over HTTPS/Git, reinstall managed files, validate the resulting Student or Control role, and roll back to the previous commit when validation fails. Reconcile periodically reapplies managed configuration after package or OS changes.
 
