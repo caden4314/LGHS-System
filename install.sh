@@ -121,6 +121,7 @@ else
   install -m 0755 "$ROOT_DIR/student/lghs-install-network-ui" /usr/local/sbin/lghs-install-network-ui
   install -m 0755 "$ROOT_DIR/student/lghs-sudo-broker" /usr/local/sbin/lghs-sudo-broker
   install -m 0755 "$ROOT_DIR/student/lghs-approved-exec" /usr/local/sbin/lghs-approved-exec
+  install -m 0755 "$ROOT_DIR/student/lghs-local-exec" /usr/local/sbin/lghs-local-exec
   install -m 0755 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
   install -m 0755 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
   install -m 0755 "$ROOT_DIR/student/sudo" /usr/local/bin/sudo
