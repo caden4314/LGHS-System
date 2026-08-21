@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import datetime as dt
+import fcntl
 import json
 import os
 import secrets
@@ -31,8 +32,10 @@ def atomic_write(path, data):
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     finally:
-        try: os.unlink(tmp)
-        except FileNotFoundError: pass
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def audit(event, **fields):
@@ -99,7 +102,7 @@ def request(argv):
     print(rid)
 
 
-def status(rid):
+def load_owned(rid):
     user, uid = caller()
     path = REQUEST_DIR / f'{rid}.json'
     try:
@@ -108,13 +111,42 @@ def status(rid):
         raise SystemExit('Unknown LGHS sudo request.')
     if data.get('requester') != user or int(data.get('requester_uid', -2)) != uid:
         raise SystemExit('Request does not belong to this user.')
+    return user, uid, path, data
+
+
+def status(rid):
+    user, uid, path, data = load_owned(rid)
     if data.get('status') == 'pending' and time.time() > float(data.get('expires_epoch', 0)):
-        data['status'] = 'expired'
-        data['resolved_at'] = now_iso()
-        atomic_write(path, data)
-        audit('expired', request_id=rid, device_id=data.get('device_id'), requester=user)
+        lock_path = REQUEST_DIR / f'{rid}.lock'
+        with lock_path.open('a+') as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            data = json.loads(path.read_text(encoding='utf-8'))
+            if data.get('status') == 'pending' and time.time() > float(data.get('expires_epoch', 0)):
+                data['status'] = 'expired'
+                data['resolved_at'] = now_iso()
+                atomic_write(path, data)
+                audit('expired', request_id=rid, device_id=data.get('device_id'), requester=user)
     print(json.dumps({'id': rid, 'status': data.get('status', 'unknown'),
                       'command': data.get('command', ''), 'reason': data.get('reason', '')}))
+
+
+def cancel(rid):
+    user, uid, path, data = load_owned(rid)
+    lock_path = REQUEST_DIR / f'{rid}.lock'
+    with lock_path.open('a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if data.get('requester') != user or int(data.get('requester_uid', -2)) != uid:
+            raise SystemExit('Request does not belong to this user.')
+        if data.get('status') != 'pending':
+            print(json.dumps({'id': rid, 'status': data.get('status', 'unknown')}))
+            return
+        data['status'] = 'cancelled'
+        data['resolved_at'] = now_iso()
+        data['reason'] = 'requester_cancelled'
+        atomic_write(path, data)
+        audit('cancelled', request_id=rid, device_id=data.get('device_id'), requester=user)
+    print(json.dumps({'id': rid, 'status': 'cancelled'}))
 
 
 def read_device_id():
@@ -129,16 +161,20 @@ def read_device_id():
 
 def main():
     if len(sys.argv) < 2:
-        raise SystemExit('Usage: lghs-sudo-broker request -- command... | status ID')
+        raise SystemExit('Usage: lghs-sudo-broker request -- command... | status ID | cancel ID')
     action = sys.argv[1]
     if action == 'request':
         args = sys.argv[2:]
-        if args and args[0] == '--': args = args[1:]
+        if args and args[0] == '--':
+            args = args[1:]
         request(args)
     elif action == 'status' and len(sys.argv) == 3:
         status(sys.argv[2])
+    elif action == 'cancel' and len(sys.argv) == 3:
+        cancel(sys.argv[2])
     else:
         raise SystemExit('Invalid LGHS sudo broker request.')
+
 
 if __name__ == '__main__':
     main()
