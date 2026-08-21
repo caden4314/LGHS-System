@@ -14,6 +14,12 @@ REQUEST_DIR = Path('/var/lib/lghs/sudo-requests')
 AUDIT_LOG = Path('/var/log/lghs-sudo-audit.jsonl')
 STUDENT = 'lg_cs_cont'
 TTL = 600
+CLIENT_EVENTS = {
+    'password_prompt_opened',
+    'password_prompt_ended',
+    'waiting_for_fleet',
+    'requester_cancelled_wait',
+}
 
 
 def now_iso():
@@ -32,10 +38,8 @@ def atomic_write(path, data):
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
 
 
 def audit(event, **fields):
@@ -98,7 +102,8 @@ def request(argv):
     os.chmod(REQUEST_DIR, 0o700)
     atomic_write(REQUEST_DIR / f'{rid}.json', data)
     audit('requested', request_id=rid, device_id=data['device_id'], requester=user,
-          cwd=data['cwd'], argv=argv)
+          requester_uid=uid, cwd=data['cwd'], command=data['command'], argv=argv,
+          expires_epoch=data['expires_epoch'])
     print(rid)
 
 
@@ -125,7 +130,8 @@ def status(rid):
                 data['status'] = 'expired'
                 data['resolved_at'] = now_iso()
                 atomic_write(path, data)
-                audit('expired', request_id=rid, device_id=data.get('device_id'), requester=user)
+                audit('expired', request_id=rid, device_id=data.get('device_id'), requester=user,
+                      command=data.get('command'), argv=data.get('argv'))
     print(json.dumps({'id': rid, 'status': data.get('status', 'unknown'),
                       'command': data.get('command', ''), 'reason': data.get('reason', '')}))
 
@@ -145,8 +151,18 @@ def cancel(rid):
         data['resolved_at'] = now_iso()
         data['reason'] = 'requester_cancelled'
         atomic_write(path, data)
-        audit('cancelled', request_id=rid, device_id=data.get('device_id'), requester=user)
+        audit('cancelled', request_id=rid, device_id=data.get('device_id'), requester=user,
+              command=data.get('command'), argv=data.get('argv'), reason='requester_cancelled')
     print(json.dumps({'id': rid, 'status': 'cancelled'}))
+
+
+def client_event(rid, event):
+    if event not in CLIENT_EVENTS:
+        raise SystemExit('Invalid client audit event.')
+    user, uid, path, data = load_owned(rid)
+    audit(event, request_id=rid, device_id=data.get('device_id'), requester=user,
+          requester_uid=uid, cwd=data.get('cwd'), command=data.get('command'), argv=data.get('argv'),
+          status=data.get('status'))
 
 
 def read_device_id():
@@ -161,17 +177,18 @@ def read_device_id():
 
 def main():
     if len(sys.argv) < 2:
-        raise SystemExit('Usage: lghs-sudo-broker request -- command... | status ID | cancel ID')
+        raise SystemExit('Usage: lghs-sudo-broker request -- command... | status ID | cancel ID | event ID NAME')
     action = sys.argv[1]
     if action == 'request':
         args = sys.argv[2:]
-        if args and args[0] == '--':
-            args = args[1:]
+        if args and args[0] == '--': args = args[1:]
         request(args)
     elif action == 'status' and len(sys.argv) == 3:
         status(sys.argv[2])
     elif action == 'cancel' and len(sys.argv) == 3:
         cancel(sys.argv[2])
+    elif action == 'event' and len(sys.argv) == 4:
+        client_event(sys.argv[2], sys.argv[3])
     else:
         raise SystemExit('Invalid LGHS sudo broker request.')
 
