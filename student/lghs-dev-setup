@@ -47,6 +47,24 @@ find_code_icon() {
   printf '%s\n' visual-studio-code
 }
 
+trust_desktop_file() {
+  local user="$1" home="$2" file="$3" uid runtime bus
+  command -v gio >/dev/null 2>&1 || return 0
+  uid="$(id -u "$user")"
+  runtime="/run/user/$uid"
+  bus="$runtime/bus"
+  if [[ -S "$bus" ]]; then
+    runuser -u "$user" -- env \
+      HOME="$home" \
+      XDG_RUNTIME_DIR="$runtime" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+      gio set "$file" metadata::trusted true >/dev/null 2>&1 || true
+  else
+    runuser -u "$user" -- env HOME="$home" \
+      gio set "$file" metadata::trusted true >/dev/null 2>&1 || true
+  fi
+}
+
 setup_user() {
   local user="$1" home workspace venv marker existing uid gid code_icon desktop_file
   getent passwd "$user" >/dev/null 2>&1 || return 0
@@ -108,14 +126,7 @@ StartupWMClass=Code
 EOF
   chown "$uid:$gid" "$desktop_file"
   chmod 0755 "$desktop_file"
-
-  # Raspberry Pi OS's file manager treats executable .desktop launchers as
-  # untrusted until this metadata is set. Without it, the desktop can show the
-  # literal filename and prompt how/where to execute the file.
-  if command -v gio >/dev/null 2>&1; then
-    runuser -u "$user" -- env HOME="$home" \
-      gio set "$desktop_file" metadata::trusted true >/dev/null 2>&1 || true
-  fi
+  trust_desktop_file "$user" "$home" "$desktop_file"
 
   existing="$(runuser -u "$user" -- env HOME="$home" code --list-extensions 2>/dev/null || true)"
   grep -qx 'ms-python.python' <<<"$existing" || runuser -u "$user" -- env HOME="$home" code --install-extension ms-python.python >/dev/null 2>&1 || true
@@ -155,13 +166,7 @@ EOF
   install -m 0755 -o cs_admin -g cs_admin \
     /usr/share/applications/lghs-fleet-control.desktop \
     "$ADMIN_HOME/Desktop/LGHS-Fleet-Control.desktop"
-
-  # Some desktop shells use this metadata to suppress an "untrusted launcher"
-  # prompt. Failure is harmless because the executable .desktop file still works.
-  if command -v gio >/dev/null 2>&1; then
-    runuser -u cs_admin -- env HOME="$ADMIN_HOME" \
-      gio set "$ADMIN_HOME/Desktop/LGHS-Fleet-Control.desktop" metadata::trusted true 2>/dev/null || true
-  fi
+  trust_desktop_file cs_admin "$ADMIN_HOME" "$ADMIN_HOME/Desktop/LGHS-Fleet-Control.desktop"
 
   echo "LGHS Fleet Control desktop launcher installed for cs_admin."
 else
