@@ -67,6 +67,11 @@ jobs:
           grep -q 'lghs-install-success-notify.service' install.sh
           grep -q 'MEMORY_GB="$(read_value MEMORY_GB' student/lghs-firstboot-provision
           grep -q '"$MEMORY_GB" == "4" || "$MEMORY_GB" == "8"' student/lghs-firstboot-provision
+          grep -q 'Visual Studio Code.desktop' student/lghs-dev-setup
+          grep -q 'metadata::trusted true' student/lghs-dev-setup
+          grep -q 'find_code_icon' student/lghs-dev-setup
+          grep -q 'wfpanelctl notify' updater/lghs-install-success-notify
+          grep -q 'wfpanelctl' controller/lghs-fleet-notify
           test -f systemd/lghs-update.timer
           test -f systemd/lghs-reconcile.timer
           test -f systemd/lghs-netqueue.timer
