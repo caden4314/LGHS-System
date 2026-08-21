@@ -8,6 +8,7 @@ Type=oneshot
 ExecStart=/usr/local/sbin/lghs-install-success-notify
 Restart=on-failure
 RestartSec=30
+TimeoutStartSec=20min
 
 [Install]
 WantedBy=multi-user.target
