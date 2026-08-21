@@ -24,7 +24,6 @@ if [[ -z "$USER_NAME" ]]; then
     [[ "$ROLE" == controller ]] && USER_NAME=cs_admin || USER_NAME=lg_cs_cont
 fi
 id "$USER_NAME" >/dev/null 2>&1 || { echo "LGHS desktop user missing: $USER_NAME" >&2; exit 1; }
-command -v notify-send >/dev/null 2>&1 || { echo 'notify-send is not installed.' >&2; exit 1; }
 
 HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 USER_STATE="$HOME_DIR/.local/state/lghs"
@@ -53,9 +52,6 @@ done
 UID_NUM="$(id -u "$USER_NAME")"
 RUNTIME="/run/user/$UID_NUM"
 BUS="$RUNTIME/bus"
-
-# The graphical login can become ready a little after installation. Wait rather
-# than losing the all-good message during a fast first boot.
 for _ in $(seq 1 150); do
     [[ -S "$BUS" ]] && break
     sleep 2
@@ -65,15 +61,32 @@ done
 MEMORY="$(sed -n 's/^MEMORY_GB=//p' /etc/lghs/device.conf 2>/dev/null | head -n1)"
 DETAIL="LGHS V${VERSION} installed successfully. ${HOST} is ready."
 [[ "$MEMORY" == 4 || "$MEMORY" == 8 ]] && DETAIL="LGHS V${VERSION} installed successfully. ${HOST} (Pi 5 ${MEMORY} GB) is ready."
+MESSAGE="LGHS Setup Complete — All Good: $DETAIL"
 
-# Fallback path for systems where the progress window was not launched by XDG
-# autostart. Run notify-send as the desktop user on that user's session bus.
-runuser -u "$USER_NAME" -- env \
-    HOME="$HOME_DIR" \
-    XDG_RUNTIME_DIR="$RUNTIME" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS" \
-    notify-send -a 'LGHS Setup' -u normal -t 12000 \
-    'LGHS Setup Complete — All Good' "$DETAIL"
+# Raspberry Pi OS Trixie/labwc uses wf-panel-pi for native panel notifications.
+# Prefer wfpanelctl because a standard org.freedesktop.Notifications daemon is
+# not guaranteed to exist. notify-send remains a fallback for other desktops.
+DELIVERED=0
+if command -v wfpanelctl >/dev/null 2>&1; then
+    if runuser -u "$USER_NAME" -- env \
+        HOME="$HOME_DIR" \
+        XDG_RUNTIME_DIR="$RUNTIME" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS" \
+        wfpanelctl notify "$MESSAGE"; then
+        DELIVERED=1
+    fi
+fi
+if [[ $DELIVERED -eq 0 ]] && command -v notify-send >/dev/null 2>&1; then
+    if runuser -u "$USER_NAME" -- env \
+        HOME="$HOME_DIR" \
+        XDG_RUNTIME_DIR="$RUNTIME" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS" \
+        notify-send -a 'LGHS Setup' -u normal -t 12000 \
+        'LGHS Setup Complete — All Good' "$DETAIL"; then
+        DELIVERED=1
+    fi
+fi
+[[ $DELIVERED -eq 1 ]] || { echo 'No supported desktop notification path succeeded.' >&2; exit 1; }
 
 runuser -u "$USER_NAME" -- mkdir -p "$USER_STATE"
 runuser -u "$USER_NAME" -- touch "$USER_NOTIFIED"
