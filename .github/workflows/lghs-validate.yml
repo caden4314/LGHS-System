@@ -71,3 +71,22 @@ jobs:
           test -f systemd/lghs-reconcile.timer
           test -f systemd/lghs-netqueue.timer
           test -f systemd/lghs-install-success-notify.service
+
+      - name: Fleet transport security invariants
+        run: |
+          grep -q 'https://github.com/caden4314/LGHS-System.git' updater/lghs-update
+          grep -q 'StrictHostKeyChecking=yes' controller/lghsctl
+          grep -q 'PasswordAuthentication=no' controller/lghsctl
+          grep -q 'KbdInteractiveAuthentication=no' controller/lghsctl
+          grep -q 'ForwardAgent=no' controller/lghsctl
+          grep -q 'ForwardX11=no' controller/lghsctl
+          grep -q 'ClearAllForwardings=yes' controller/lghsctl
+          grep -q 'AuthenticationMethods publickey' install.sh
+          grep -q 'PasswordAuthentication no' install.sh
+          grep -q 'AllowAgentForwarding no' install.sh
+          grep -q 'AllowTcpForwarding no' install.sh
+          grep -q 'PermitTunnel no' install.sh
+          if grep -R -n 'StrictHostKeyChecking=no' controller updater student; then
+            echo 'Unsafe SSH host-key checking found.' >&2
+            exit 1
+          fi
