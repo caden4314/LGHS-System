@@ -20,9 +20,7 @@ flock -n 9 || { echo "Another LGHS update is already running."; exit 0; }
 queue_for_network() {
     local reason="$1"
     echo "LGHS updater: $reason"
-    if [[ "${LGHS_NETQUEUE_RUNNING:-0}" == "1" ]]; then
-        return 75
-    fi
+    if [[ "${LGHS_NETQUEUE_RUNNING:-0}" == "1" ]]; then return 75; fi
     if [[ -x "$NETQUEUE" ]]; then
         "$NETQUEUE" enqueue local-update >/dev/null
         echo "LGHS updater: network work queued persistently."
@@ -31,8 +29,6 @@ queue_for_network() {
     return 75
 }
 
-# Probe the exact upstream this operation needs. Do not make boot or local LGHS
-# functionality depend on Wi-Fi/internet availability.
 if ! GIT_TERMINAL_PROMPT=0 timeout 12 git ls-remote --heads "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
     if queue_for_network "Git repository is currently unreachable; deferring update."; then exit 0; else exit 75; fi
 fi
@@ -56,9 +52,7 @@ TARGET_COMMIT="$(git rev-parse "origin/$BRANCH")"
 
 if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
     git reset --hard "$TARGET_COMMIT" >/dev/null
-    if [[ -x /usr/local/sbin/lghs-reconcile ]]; then
-        /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true
-    fi
+    if [[ -x /usr/local/sbin/lghs-reconcile ]]; then /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true; fi
     echo "LGHS is already current at ${TARGET_COMMIT:0:12}."
     exit 0
 fi
@@ -72,15 +66,31 @@ git reset --hard "$TARGET_COMMIT"
 printf '%s\n' "$TARGET_COMMIT" > .lghs-source-commit
 chmod 0755 install.sh updater/lghs-update 2>/dev/null || true
 
+validate_controller() {
+    [[ "$(cat /etc/lghs/role)" == "controller" ]]
+    /usr/local/sbin/lghsctl --help >/dev/null
+    python3 -m py_compile \
+        /usr/local/sbin/lghs-console \
+        /usr/local/sbin/lghs-fleet-notify \
+        /usr/local/sbin/lghs-audit-sync \
+        /usr/local/libexec/lghs-console-base \
+        /usr/local/libexec/lghsctl-real
+    systemctl is-active --quiet lghs-update.timer
+    systemctl is-active --quiet lghs-reconcile.timer
+    systemctl is-active --quiet lghs-audit-sync.timer
+    systemctl is-active --quiet lghs-fleet-notify.service
+    [[ -s /etc/lghs/secrets/controller_ed25519 ]]
+    [[ "$(stat -c %a /etc/lghs/secrets/controller_ed25519 2>/dev/null)" == "600" ]]
+}
+
 apply_install() {
     /bin/bash ./install.sh "$ROLE"
+    systemctl daemon-reload
     if [[ "$ROLE" == "student" ]]; then
         /usr/local/sbin/lghs-check
     else
-        /usr/local/sbin/lghsctl --help >/dev/null
-        [[ "$(cat /etc/lghs/role)" == "controller" ]]
+        validate_controller
     fi
-    systemctl daemon-reload
 }
 
 record_success() {
