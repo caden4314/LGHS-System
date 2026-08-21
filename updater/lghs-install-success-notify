@@ -26,6 +26,22 @@ fi
 id "$USER_NAME" >/dev/null 2>&1 || { echo "LGHS desktop user missing: $USER_NAME" >&2; exit 1; }
 command -v notify-send >/dev/null 2>&1 || { echo 'notify-send is not installed.' >&2; exit 1; }
 
+HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+USER_STATE="$HOME_DIR/.local/state/lghs"
+USER_NOTIFIED="$USER_STATE/install-success-shown"
+
+# The first-boot progress window runs inside the real desktop session and is the
+# preferred success signal. If it already displayed ALL GOOD, simply mirror its
+# user marker into the system marker and avoid a duplicate notification.
+if [[ -f "$USER_NOTIFIED" ]]; then
+    install -d -m 0750 -o root -g lghs-admin /var/lib/lghs 2>/dev/null || true
+    touch "$NOTIFIED"
+    chown root:lghs-admin "$NOTIFIED" 2>/dev/null || chown root:root "$NOTIFIED"
+    chmod 0640 "$NOTIFIED"
+    logger -t LGHS-INSTALL "Desktop progress UI already reported success to $USER_NAME: $HOST V$VERSION"
+    exit 0
+fi
+
 UID_NUM="$(id -u "$USER_NAME")"
 RUNTIME="/run/user/$UID_NUM"
 BUS="$RUNTIME/bus"
@@ -42,11 +58,18 @@ MEMORY="$(sed -n 's/^MEMORY_GB=//p' /etc/lghs/device.conf 2>/dev/null | head -n1
 DETAIL="LGHS V${VERSION} installed successfully. ${HOST} is ready."
 [[ "$MEMORY" == 4 || "$MEMORY" == 8 ]] && DETAIL="LGHS V${VERSION} installed successfully. ${HOST} (Pi 5 ${MEMORY} GB) is ready."
 
+# Run notify-send as the desktop user, on that user's real session bus. This is
+# a fallback for systems where the progress window was not launched by XDG
+# autostart. The progress window itself also sends the success notice directly.
 runuser -u "$USER_NAME" -- env \
+    HOME="$HOME_DIR" \
     XDG_RUNTIME_DIR="$RUNTIME" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=$BUS" \
     notify-send -a 'LGHS Setup' -u normal -t 12000 \
     'LGHS Setup Complete — All Good' "$DETAIL"
+
+runuser -u "$USER_NAME" -- mkdir -p "$USER_STATE"
+runuser -u "$USER_NAME" -- touch "$USER_NOTIFIED"
 
 install -d -m 0750 -o root -g lghs-admin /var/lib/lghs 2>/dev/null || true
 touch "$NOTIFIED"
