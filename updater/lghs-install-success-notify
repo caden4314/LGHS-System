@@ -30,17 +30,25 @@ HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 USER_STATE="$HOME_DIR/.local/state/lghs"
 USER_NOTIFIED="$USER_STATE/install-success-shown"
 
-# The first-boot progress window runs inside the real desktop session and is the
-# preferred success signal. If it already displayed ALL GOOD, simply mirror its
-# user marker into the system marker and avoid a duplicate notification.
-if [[ -f "$USER_NOTIFIED" ]]; then
+mark_system_notified() {
     install -d -m 0750 -o root -g lghs-admin /var/lib/lghs 2>/dev/null || true
     touch "$NOTIFIED"
     chown root:lghs-admin "$NOTIFIED" 2>/dev/null || chown root:root "$NOTIFIED"
     chmod 0640 "$NOTIFIED"
-    logger -t LGHS-INSTALL "Desktop progress UI already reported success to $USER_NAME: $HOST V$VERSION"
-    exit 0
-fi
+}
+
+# The XDG-autostart progress window runs inside the real desktop session and is
+# the preferred success signal. Give it a short grace period after the system
+# completion marker so it can display ALL GOOD and write its user marker. This
+# avoids duplicate notifications while preserving a system-service fallback.
+for _ in $(seq 1 10); do
+    if [[ -f "$USER_NOTIFIED" ]]; then
+        mark_system_notified
+        logger -t LGHS-INSTALL "Desktop progress UI reported success to $USER_NAME: $HOST V$VERSION"
+        exit 0
+    fi
+    sleep 2
+done
 
 UID_NUM="$(id -u "$USER_NAME")"
 RUNTIME="/run/user/$UID_NUM"
@@ -58,9 +66,8 @@ MEMORY="$(sed -n 's/^MEMORY_GB=//p' /etc/lghs/device.conf 2>/dev/null | head -n1
 DETAIL="LGHS V${VERSION} installed successfully. ${HOST} is ready."
 [[ "$MEMORY" == 4 || "$MEMORY" == 8 ]] && DETAIL="LGHS V${VERSION} installed successfully. ${HOST} (Pi 5 ${MEMORY} GB) is ready."
 
-# Run notify-send as the desktop user, on that user's real session bus. This is
-# a fallback for systems where the progress window was not launched by XDG
-# autostart. The progress window itself also sends the success notice directly.
+# Fallback path for systems where the progress window was not launched by XDG
+# autostart. Run notify-send as the desktop user on that user's session bus.
 runuser -u "$USER_NAME" -- env \
     HOME="$HOME_DIR" \
     XDG_RUNTIME_DIR="$RUNTIME" \
@@ -70,9 +77,5 @@ runuser -u "$USER_NAME" -- env \
 
 runuser -u "$USER_NAME" -- mkdir -p "$USER_STATE"
 runuser -u "$USER_NAME" -- touch "$USER_NOTIFIED"
-
-install -d -m 0750 -o root -g lghs-admin /var/lib/lghs 2>/dev/null || true
-touch "$NOTIFIED"
-chown root:lghs-admin "$NOTIFIED" 2>/dev/null || chown root:root "$NOTIFIED"
-chmod 0640 "$NOTIFIED"
-logger -t LGHS-INSTALL "All-good notification delivered to $USER_NAME: $HOST V$VERSION"
+mark_system_notified
+logger -t LGHS-INSTALL "Fallback all-good notification delivered to $USER_NAME: $HOST V$VERSION"
