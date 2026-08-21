@@ -43,7 +43,9 @@ def load_state():
 
 def save_state(s):
     STATE.parent.mkdir(parents=True,exist_ok=True);tmp=STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(s,sort_keys=True),encoding="utf-8");os.replace(tmp,STATE)
+    tmp.write_text(json.dumps(s,sort_keys=True),encoding="utf-8")
+    os.chmod(tmp,0o600)
+    os.replace(tmp,STATE)
 
 
 def activity(severity,event,host,detail=""):
@@ -93,11 +95,20 @@ def main():
     s=load_state()
     while True:
         try:
+            previous=s.get("devices",{}) if isinstance(s.get("devices"),dict) else {}
             devices=mod.refresh_fleet(mod.discover_devices());current={};seen=set(s.get("sudo_seen",[]))
+            now=time.time()
             for d in devices:
-                addr=d.get("addr","?");host=d.get("hostname") or d.get("host") or addr;online=bool(d.get("online"));prev=s.get("devices",{}).get(addr,{})
+                addr=d.get("addr","?");host=d.get("hostname") or d.get("host") or addr;online=bool(d.get("online"));prev=previous.get(addr,{})
                 curissues={k:[sev,msg] for sev,k,msg in issues(d)};oldissues=prev.get("issues",{}) if isinstance(prev,dict) else {}
-                current[addr]={"host":host,"online":online,"last_seen":time.time() if online else prev.get("last_seen",0),"issues":curissues}
+                current[addr]={
+                    "addr":addr,
+                    "host":host,
+                    "role":d.get("role","student"),
+                    "online":online,
+                    "last_seen":now if online else prev.get("last_seen",0),
+                    "issues":curissues,
+                }
                 if s.get("initialized") and prev and prev.get("online")!=online:
                     if online:emit(s,f"online:{addr}","normal","LGHS Pi online",f"{host} ({addr}) is back online.",host,"Pi online")
                     else:emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) is offline or SSH is unreachable.",host,"Pi offline")
@@ -109,6 +120,29 @@ def main():
                     if rid and s.get("initialized") and rk not in seen:
                         emit(s,f"sudo:{rk}","warning","LGHS sudo request",f"{host}: {req.get('command','sudo request')}",host,"Sudo requested")
                     if rid:seen.add(rk)
+
+            # Avahi only returns devices that are presently advertising. Preserve
+            # previously seen members that vanish from mDNS so an unplugged or
+            # crashed Pi becomes OFFLINE instead of disappearing from the fleet.
+            for addr,prev in previous.items():
+                if addr in current or not isinstance(prev,dict):
+                    continue
+                host=prev.get("host") or addr
+                last_seen=float(prev.get("last_seen",0) or 0)
+                msg=f"{host} is not responding over fleet SSH"
+                if last_seen:
+                    msg += f"; last seen {int(max(0,now-last_seen))}s ago"
+                current[addr]={
+                    "addr":addr,
+                    "host":host,
+                    "role":prev.get("role","student"),
+                    "online":False,
+                    "last_seen":last_seen,
+                    "issues":{"ssh":["critical",msg]},
+                }
+                if s.get("initialized") and prev.get("online"):
+                    emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) went offline or stopped advertising.",host,"Pi offline")
+
             s["sudo_seen"]=list(seen)[-500:];s["devices"]=current
             for name,path in (("LGHS update",UPDATE_LOG),("Raspberry Pi OS update",OS_UPDATE_LOG)):
                 line=newest(path);old=s["logs"].get(name,"")
