@@ -28,8 +28,27 @@ esac
 EOF
 chmod 0644 /etc/profile.d/lghs-dev-path.sh
 
+# Resolve the real icon installed by the Raspberry Pi/Debian VS Code package.
+# A full file path is preferred so the desktop does not depend on icon-theme
+# lookup. Fall back to the standard icon name when packaging layout changes.
+find_code_icon() {
+  local candidate
+  for candidate in \
+    /usr/share/pixmaps/visual-studio-code.png \
+    /usr/share/pixmaps/code.png \
+    /usr/share/icons/hicolor/512x512/apps/visual-studio-code.png \
+    /usr/share/icons/hicolor/512x512/apps/com.visualstudio.code.png \
+    /usr/share/icons/hicolor/256x256/apps/visual-studio-code.png \
+    /usr/share/icons/hicolor/256x256/apps/com.visualstudio.code.png \
+    /usr/share/code/resources/app/resources/linux/code.png
+  do
+    [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  printf '%s\n' visual-studio-code
+}
+
 setup_user() {
-  local user="$1" home workspace venv marker existing uid gid
+  local user="$1" home workspace venv marker existing uid gid code_icon desktop_file
   getent passwd "$user" >/dev/null 2>&1 || return 0
   home="$(getent passwd "$user" | cut -d: -f6)"
   [[ -n "$home" && -d "$home" ]] || return 0
@@ -65,25 +84,44 @@ setup_user() {
 EOF
 
   [[ -f "$workspace/hello.py" ]] || printf 'print("Hello, world!")\n' > "$workspace/hello.py"
-  cat > "$home/Desktop/visual-studio-code.desktop" <<'EOF'
+
+  code_icon="$(find_code_icon)"
+  desktop_file="$home/Desktop/Visual Studio Code.desktop"
+
+  # Remove the old raw-filename launcher so existing Pis are repaired by the
+  # next update/reconcile pass rather than ending up with duplicate shortcuts.
+  rm -f "$home/Desktop/visual-studio-code.desktop"
+
+  cat > "$desktop_file" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Visual Studio Code
-Comment=Open the CS2 Python workspace
+GenericName=Code Editor
+Comment=Open the LGHS CS2 Python workspace
 Exec=/usr/local/bin/lghs-vscode
-Icon=visual-studio-code
+Icon=$code_icon
 Terminal=false
 Categories=Development;IDE;
 StartupNotify=true
+StartupWMClass=Code
 EOF
-  chmod 0755 "$home/Desktop/visual-studio-code.desktop"
+  chown "$uid:$gid" "$desktop_file"
+  chmod 0755 "$desktop_file"
+
+  # Raspberry Pi OS's file manager treats executable .desktop launchers as
+  # untrusted until this metadata is set. Without it, the desktop can show the
+  # literal filename and prompt how/where to execute the file.
+  if command -v gio >/dev/null 2>&1; then
+    runuser -u "$user" -- env HOME="$home" \
+      gio set "$desktop_file" metadata::trusted true >/dev/null 2>&1 || true
+  fi
 
   existing="$(runuser -u "$user" -- env HOME="$home" code --list-extensions 2>/dev/null || true)"
   grep -qx 'ms-python.python' <<<"$existing" || runuser -u "$user" -- env HOME="$home" code --install-extension ms-python.python >/dev/null 2>&1 || true
   grep -qx 'ms-python.vscode-pylance' <<<"$existing" || runuser -u "$user" -- env HOME="$home" code --install-extension ms-python.vscode-pylance >/dev/null 2>&1 || true
 
-  chown -R "$uid:$gid" "$workspace" "$home/.config/Code" "$home/.local" "$home/Desktop/visual-studio-code.desktop"
+  chown -R "$uid:$gid" "$workspace" "$home/.config/Code" "$home/.local"
   printf 'LGHS development environment ready for %s: %s\n' "$user" "$venv"
 }
 
@@ -121,7 +159,8 @@ EOF
   # Some desktop shells use this metadata to suppress an "untrusted launcher"
   # prompt. Failure is harmless because the executable .desktop file still works.
   if command -v gio >/dev/null 2>&1; then
-    runuser -u cs_admin -- gio set "$ADMIN_HOME/Desktop/LGHS-Fleet-Control.desktop" metadata::trusted true 2>/dev/null || true
+    runuser -u cs_admin -- env HOME="$ADMIN_HOME" \
+      gio set "$ADMIN_HOME/Desktop/LGHS-Fleet-Control.desktop" metadata::trusted true 2>/dev/null || true
   fi
 
   echo "LGHS Fleet Control desktop launcher installed for cs_admin."
