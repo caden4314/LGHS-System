@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import datetime as dt
+import fcntl
 import json
 import os
 import sys
@@ -31,6 +32,7 @@ def atomic_write(path, data):
 
 def audit(event, **fields):
     record = {'time': now_iso(), 'event': event, **fields}
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
     try:
         os.write(fd, (json.dumps(record, separators=(',', ':')) + '\n').encode())
@@ -51,10 +53,19 @@ def load(path):
 
 
 def refresh_expired(path, data):
-    if data and data.get('status') == 'pending' and time.time() > float(data.get('expires_epoch', 0)):
-        data['status'] = 'expired'; data['resolved_at'] = now_iso()
-        atomic_write(path, data)
-        audit('expired', request_id=data.get('id'), device_id=data.get('device_id'), requester=data.get('requester'))
+    if not data or data.get('status') != 'pending' or time.time() <= float(data.get('expires_epoch', 0)):
+        return data
+    rid = data.get('id') or path.stem
+    lock_path = REQUEST_DIR / f'{rid}.lock'
+    with lock_path.open('a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        data = load(path)
+        if data and data.get('status') == 'pending' and time.time() > float(data.get('expires_epoch', 0)):
+            data['status'] = 'expired'
+            data['resolved_at'] = now_iso()
+            atomic_write(path, data)
+            audit('expired', request_id=rid, device_id=data.get('device_id'), requester=data.get('requester'),
+                  command=data.get('command'), argv=data.get('argv'))
     return data
 
 
@@ -64,26 +75,42 @@ def list_requests(all_states=False):
     os.chmod(REQUEST_DIR, 0o700)
     for path in sorted(REQUEST_DIR.glob('*.json')):
         data = refresh_expired(path, load(path))
-        if not data: continue
-        if all_states or data.get('status') == 'pending': out.append(data)
+        if not data:
+            continue
+        if all_states or data.get('status') == 'pending':
+            out.append(data)
     out.sort(key=lambda x: float(x.get('requested_epoch', 0)))
     return out
 
 
 def resolve(rid, decision):
     path = REQUEST_DIR / f'{rid}.json'
-    data = refresh_expired(path, load(path))
-    if not data:
-        raise SystemExit('Unknown sudo request.')
-    if data.get('status') != 'pending':
-        raise SystemExit(f"Request is already {data.get('status')}.")
+    lock_path = REQUEST_DIR / f'{rid}.lock'
     actor = os.environ.get('SUDO_USER') or os.environ.get('USER') or 'root'
-    data['status'] = decision
-    data['resolved_at'] = now_iso()
-    data['approved_by' if decision == 'approved' else 'denied_by'] = actor
-    atomic_write(path, data)
-    audit(decision, request_id=rid, device_id=data.get('device_id'), requester=data.get('requester'),
-          actor=actor, cwd=data.get('cwd'), argv=data.get('argv'))
+    with lock_path.open('a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        data = load(path)
+        if not data:
+            raise SystemExit('Unknown sudo request.')
+        if data.get('status') == 'pending' and time.time() > float(data.get('expires_epoch', 0)):
+            data['status'] = 'expired'
+            data['resolved_at'] = now_iso()
+            atomic_write(path, data)
+            audit('expired', request_id=rid, device_id=data.get('device_id'), requester=data.get('requester'),
+                  command=data.get('command'), argv=data.get('argv'))
+            raise SystemExit('Request expired.')
+        if data.get('status') != 'pending':
+            audit('resolution_rejected', request_id=rid, device_id=data.get('device_id'), actor=actor,
+                  attempted=decision, current_status=data.get('status'), command=data.get('command'))
+            raise SystemExit(f"Request is already {data.get('status')}.")
+        data['status'] = decision
+        data['resolved_at'] = now_iso()
+        data['authorization'] = 'fleet'
+        data['approved_by' if decision == 'approved' else 'denied_by'] = actor
+        atomic_write(path, data)
+        audit(decision, request_id=rid, device_id=data.get('device_id'), requester=data.get('requester'),
+              actor=actor, cwd=data.get('cwd'), command=data.get('command'), argv=data.get('argv'),
+              requested_at=data.get('requested_at'))
     print(json.dumps(data, separators=(',', ':')))
 
 
@@ -101,10 +128,11 @@ def main():
         else:
             for r in items:
                 print(f"{r.get('id')} {r.get('status')} {r.get('device_id')} {r.get('requester')} :: {r.get('command')}")
-    elif action in ('approve','deny') and len(sys.argv) == 3:
+    elif action in ('approve', 'deny') and len(sys.argv) == 3:
         resolve(sys.argv[2], 'approved' if action == 'approve' else 'denied')
     else:
         raise SystemExit('Invalid sudo admin command.')
+
 
 if __name__ == '__main__':
     main()
