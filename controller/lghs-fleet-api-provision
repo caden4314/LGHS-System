@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import secrets
+import subprocess
+import tempfile
+from pathlib import Path
+
+REGISTRY = Path("/etc/lghs/fleet.json")
+TOKENS = Path("/etc/lghs/fleet-api-tokens.json")
+CONF = Path("/etc/lghs/fleet-api.conf")
+KEY = "/etc/lghs/secrets/controller_ed25519"
+KNOWN = "/var/lib/lghs/ssh_known_hosts"
+CLOUDFLARED = "/usr/local/bin/cloudflared"
+
+
+def load(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def atomic(path, value, mode):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def api_url():
+    try:
+        for raw in CONF.read_text(encoding="utf-8").splitlines():
+            raw = raw.strip()
+            if raw.startswith("URL="):
+                return raw.split("=", 1)[1].strip().rstrip("/")
+    except Exception:
+        pass
+    raise RuntimeError(f"Set URL=https://... in {CONF}")
+
+
+def ssh_args(host):
+    return [
+        "ssh", "-i", KEY,
+        "-o", "IdentitiesOnly=yes",
+        "-o", f"UserKnownHostsFile={KNOWN}",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "BatchMode=yes",
+        "-o", f"ProxyCommand={CLOUDFLARED} access ssh --hostname %h",
+        f"cs_admin@{host}",
+    ]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Provision one enrolled Pi for HTTPS telemetry push")
+    parser.add_argument("device")
+    parser.add_argument("--rotate", action="store_true")
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        raise SystemExit("Run with sudo")
+
+    device = args.device.upper()
+    registry = load(REGISTRY, {"devices": {}})
+    entry = registry.get("devices", {}).get(device)
+    if not isinstance(entry, dict) or not entry.get("ssh_host"):
+        raise RuntimeError(f"{device} is not registered in {REGISTRY}")
+    host = entry["ssh_host"]
+    url = api_url()
+
+    token_db = load(TOKENS, {"version": 1, "devices": {}})
+    token_db.setdefault("version", 1)
+    devices = token_db.setdefault("devices", {})
+    current = devices.get(device)
+    token = current.get("token") if isinstance(current, dict) else None
+    if args.rotate or not token:
+        token = secrets.token_urlsafe(48)
+        devices[device] = {"token": token}
+        atomic(TOKENS, token_db, 0o600)
+
+    command = f"sudo -n /usr/local/sbin/lghs-telemetry-configure {url}"
+    proc = subprocess.run(ssh_args(host) + [command], text=True, input=token + "\n", capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "remote telemetry provisioning failed")
+
+    entry["telemetry"] = {"transport": "https-push", "url": url}
+    atomic(REGISTRY, registry, 0o640)
+    print(proc.stdout.strip())
+    print(f"READY {device}: telemetry -> {url}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=os.sys.stderr)
+        raise SystemExit(1)
