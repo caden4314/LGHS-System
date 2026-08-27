@@ -1,0 +1,22 @@
+[Unit]
+Description=LGHS Student Telemetry Push
+After=network.target
+ConditionPathExists=/etc/lghs/role
+ConditionPathExists=/etc/lghs/fleet-api.conf
+ConditionPathExists=/etc/lghs/secrets/fleet-api-token
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/lghs-telemetry-push
+Restart=always
+RestartSec=3
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/lghs /usr/local/sbin
+
+[Install]
+WantedBy=multi-user.target
