@@ -16,6 +16,7 @@ cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-export *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-sync
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-cloudflare-install
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-telemetry-configure https://*
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/poweroff
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/shutdown
