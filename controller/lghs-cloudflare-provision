@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API = "https://api.cloudflare.com/client/v4"
+TOKEN_FILE = Path("/etc/lghs/secrets/cloudflare-api-token")
+CONF_FILE = Path("/etc/lghs/cloudflare.conf")
+REGISTRY_FILE = Path("/etc/lghs/fleet.json")
+KEY_FILE = "/etc/lghs/secrets/controller_ed25519"
+KNOWN_HOSTS = Path("/var/lib/lghs/ssh_known_hosts")
+DEFAULT_USER = "cs_admin"
+
+
+def load_conf():
+    out = {}
+    if CONF_FILE.exists():
+        for raw in CONF_FILE.read_text(encoding="utf-8").splitlines():
+            raw = raw.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            k, v = raw.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def api(token, method, path, body=None):
+    data = None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(API + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            payload = json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.load(e)
+        except Exception:
+            payload = {"success": False, "errors": [{"message": str(e)}]}
+    if not payload.get("success"):
+        raise RuntimeError(f"Cloudflare API {method} {path} failed: {payload.get('errors')}")
+    return payload.get("result")
+
+
+def ssh_args(target, tty=False):
+    args = ["ssh"]
+    if tty:
+        args += ["-tt"]
+    args += [
+        "-i", KEY_FILE,
+        "-o", "IdentitiesOnly=yes",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "BatchMode=yes",
+        f"{DEFAULT_USER}@{target}",
+    ]
+    return args
+
+
+def run_checked(args, input_text=None):
+    p = subprocess.run(args, text=True, input=input_text, capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f"command failed: {args}")
+    return p.stdout
+
+
+def get_remote_host_key(local_target):
+    text = run_checked(ssh_args(local_target) + ["cat /etc/ssh/ssh_host_ed25519_key.pub"])
+    parts = text.strip().split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise RuntimeError("student did not return an ED25519 SSH host public key")
+    return f"{parts[0]} {parts[1]}"
+
+
+def install_student_tunnel(local_target, tunnel_token):
+    remote = "sudo -n /usr/local/sbin/lghs-cloudflare-install"
+    p = subprocess.run(ssh_args(local_target) + [remote], text=True, input=tunnel_token + "\n", capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(
+            "student tunnel install failed. Ensure the student is updated with the cloudflare-fleet-transport build. "
+            + (p.stderr.strip() or p.stdout.strip())
+        )
+    if p.stdout:
+        print(p.stdout.strip())
+
+
+def load_registry():
+    if not REGISTRY_FILE.exists():
+        return {"version": 1, "devices": {}}
+    try:
+        d = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Invalid {REGISTRY_FILE}: {exc}")
+    d.setdefault("version", 1)
+    d.setdefault("devices", {})
+    return d
+
+
+def save_registry(reg):
+    REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REGISTRY_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(reg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, REGISTRY_FILE)
+
+
+def add_known_host_alias(public_host, key):
+    KNOWN_HOSTS.parent.mkdir(parents=True, exist_ok=True)
+    KNOWN_HOSTS.touch(exist_ok=True)
+    existing = KNOWN_HOSTS.read_text(encoding="utf-8", errors="ignore").splitlines()
+    existing = [line for line in existing if not line.startswith(public_host + " ")]
+    existing.append(f"{public_host} {key}")
+    KNOWN_HOSTS.write_text("\n".join(existing) + "\n", encoding="utf-8")
+    os.chmod(KNOWN_HOSTS, 0o644)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Provision one LGHS device onto the Cloudflare control plane")
+    ap.add_argument("device", help="logical device name, e.g. CS-999")
+    ap.add_argument("local_target", help="currently reachable trusted local hostname/IP used only for provisioning")
+    ap.add_argument("--no-install", action="store_true", help="create/update Cloudflare and registry only; do not reinstall student tunnel")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0:
+        raise SystemExit("Run with sudo")
+    if not TOKEN_FILE.exists():
+        raise SystemExit(f"Missing {TOKEN_FILE}")
+
+    conf = load_conf()
+    account_id = conf.get("ACCOUNT_ID")
+    zone = conf.get("ZONE", "scenicrouteservers.com")
+    if not account_id:
+        raise SystemExit(f"Set ACCOUNT_ID in {CONF_FILE}")
+
+    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    device = args.device.upper()
+    slug = device.lower()
+    tunnel_name = f"LGHS-{device}"
+    public_host = f"ssh-{slug}.{zone}"
+
+    print(f"[1/7] Verifying trusted local SSH to {device} at {args.local_target}")
+    got = run_checked(ssh_args(args.local_target) + ["hostname"]).strip()
+    if got.upper() != device:
+        raise RuntimeError(f"Expected hostname {device}, got {got}")
+    host_key = get_remote_host_key(args.local_target)
+
+    print("[2/7] Resolving Cloudflare zone")
+    zones = api(token, "GET", "/zones?" + urllib.parse.urlencode({"name": zone}))
+    if not zones:
+        raise RuntimeError(f"Zone not found: {zone}")
+    zone_id = zones[0]["id"]
+
+    print(f"[3/7] Creating/reusing tunnel {tunnel_name}")
+    tunnels = api(token, "GET", f"/accounts/{account_id}/cfd_tunnel?is_deleted=false")
+    tunnel = next((t for t in tunnels if t.get("name") == tunnel_name), None)
+    if tunnel is None:
+        tunnel = api(token, "POST", f"/accounts/{account_id}/cfd_tunnel", {"name": tunnel_name, "config_src": "cloudflare"})
+    tunnel_id = tunnel["id"]
+
+    print(f"[4/7] Configuring {public_host} -> ssh://localhost:22")
+    api(token, "PUT", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations", {
+        "config": {
+            "ingress": [
+                {"hostname": public_host, "service": "ssh://localhost:22"},
+                {"service": "http_status:404"},
+            ]
+        }
+    })
+
+    print("[5/7] Creating/updating DNS")
+    records = api(token, "GET", f"/zones/{zone_id}/dns_records?" + urllib.parse.urlencode({"type": "CNAME", "name": public_host}))
+    record = {"type": "CNAME", "name": public_host, "content": f"{tunnel_id}.cfargotunnel.com", "proxied": True}
+    if records:
+        api(token, "PUT", f"/zones/{zone_id}/dns_records/{records[0]['id']}", record)
+    else:
+        api(token, "POST", f"/zones/{zone_id}/dns_records", record)
+
+    print("[6/7] Installing per-device tunnel")
+    if not args.no_install:
+        tunnel_token = api(token, "GET", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token")
+        install_student_tunnel(args.local_target, tunnel_token)
+        del tunnel_token
+    else:
+        print("Skipped (--no-install)")
+
+    print("[7/7] Updating controller fleet registry and SSH host trust")
+    add_known_host_alias(public_host, host_key)
+    reg = load_registry()
+    reg["devices"][device] = {
+        "transport": "cloudflare",
+        "ssh_host": public_host,
+        "tunnel_id": tunnel_id,
+        "tunnel_name": tunnel_name,
+    }
+    save_registry(reg)
+
+    print(f"READY {device}: ssh={public_host}")
+    print(f"Test: sudo lghsctl info {device}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
