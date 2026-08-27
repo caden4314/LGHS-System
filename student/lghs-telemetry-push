@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+import json
+import os
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CONF = Path("/etc/lghs/fleet-api.conf")
+TOKEN = Path("/etc/lghs/secrets/fleet-api-token")
+INTERVAL = float(os.environ.get("LGHS_TELEMETRY_SECONDS", "3"))
+TIMEOUT = float(os.environ.get("LGHS_TELEMETRY_TIMEOUT", "8"))
+
+
+def parse_conf():
+    out = {}
+    try:
+        for raw in CONF.read_text(encoding="utf-8").splitlines():
+            raw = raw.strip()
+            if raw and not raw.startswith("#") and "=" in raw:
+                key, value = raw.split("=", 1)
+                out[key.strip()] = value.strip()
+    except Exception:
+        pass
+    return out
+
+
+def run(args):
+    return subprocess.run(args, text=True, capture_output=True, timeout=10)
+
+
+def parse_kv(text):
+    out = {}
+    for line in text.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+def snapshot():
+    device = socket.gethostname().upper()
+    p = run(["/usr/local/sbin/lghs-report", "summary"])
+    data = parse_kv(p.stdout) if p.returncode == 0 else {}
+    data["device_id"] = str(data.get("hostname") or device).upper()
+    data["sent_at"] = time.time()
+    try:
+        q = run(["/usr/local/sbin/lghs-sudo-admin", "list", "--json"])
+        if q.returncode == 0:
+            requests = json.loads(q.stdout or "[]")
+            if isinstance(requests, list):
+                data["sudo_requests"] = requests
+                data["sudo_pending"] = len(requests)
+    except Exception:
+        pass
+    return data
+
+
+def send_once():
+    conf = parse_conf()
+    base = conf.get("URL", "").rstrip("/")
+    if not base or not TOKEN.exists():
+        raise RuntimeError("fleet API URL/token not provisioned")
+    token = TOKEN.read_text(encoding="utf-8").strip()
+    if not token:
+        raise RuntimeError("empty fleet API token")
+    payload = snapshot()
+    device = payload["device_id"]
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    req = urllib.request.Request(
+        f"{base}/v1/report/{device}",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "LGHS-Telemetry/1",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+        if response.status not in (200, 202, 204):
+            raise RuntimeError(f"HTTP {response.status}")
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("Run as root")
+    delay = 1.0
+    while True:
+        started = time.monotonic()
+        try:
+            send_once()
+            delay = INTERVAL
+        except (urllib.error.URLError, OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+            delay = min(max(INTERVAL, delay * 1.7), 60.0)
+        elapsed = time.monotonic() - started
+        time.sleep(max(0.25, delay - elapsed))
+
+
+if __name__ == "__main__":
+    main()
