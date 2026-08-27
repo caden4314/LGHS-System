@@ -10,6 +10,7 @@ from pathlib import Path
 
 CONF = Path("/etc/lghs/fleet-api.conf")
 TOKEN = Path("/etc/lghs/secrets/fleet-api-token")
+SUDO_REQUEST_DIR = Path("/var/lib/lghs/sudo-requests")
 INTERVAL = float(os.environ.get("LGHS_TELEMETRY_SECONDS", "3"))
 TIMEOUT = float(os.environ.get("LGHS_TELEMETRY_TIMEOUT", "8"))
 
@@ -40,21 +41,48 @@ def parse_kv(text):
     return out
 
 
+def pending_sudo_requests():
+    """Read pending requests without invoking the mutating admin helper.
+
+    lghs-sudo-admin list creates/chmods files while expiring requests. The
+    telemetry service deliberately runs with ProtectSystem=strict, so calling
+    that helper from inside the service can fail even though a manual root
+    invocation succeeds. Telemetry only needs a read-only snapshot, so read
+    the request JSON files directly and filter by status/expiry here.
+    """
+    now = time.time()
+    requests = []
+    try:
+        paths = sorted(SUDO_REQUEST_DIR.glob("*.json"))
+    except Exception:
+        return requests
+    for path in paths:
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(item, dict) or item.get("status") != "pending":
+                continue
+            expires = float(item.get("expires_epoch", 0) or 0)
+            if expires and now > expires:
+                continue
+            requests.append(item)
+        except Exception:
+            continue
+    requests.sort(key=lambda x: float(x.get("requested_epoch", 0) or 0))
+    return requests
+
+
 def snapshot():
     device = socket.gethostname().upper()
     p = run(["/usr/local/sbin/lghs-report", "summary"])
     data = parse_kv(p.stdout) if p.returncode == 0 else {}
     data["device_id"] = str(data.get("hostname") or device).upper()
     data["sent_at"] = time.time()
-    try:
-        q = run(["/usr/local/sbin/lghs-sudo-admin", "list", "--json"])
-        if q.returncode == 0:
-            requests = json.loads(q.stdout or "[]")
-            if isinstance(requests, list):
-                data["sudo_requests"] = requests
-                data["sudo_pending"] = len(requests)
-    except Exception:
-        pass
+
+    # Always overwrite the summary's sudo_pending field with the read-only
+    # queue snapshot so a sandboxed lghs-report cannot hide real requests.
+    requests = pending_sudo_requests()
+    data["sudo_requests"] = requests
+    data["sudo_pending"] = len(requests)
     return data
 
 
