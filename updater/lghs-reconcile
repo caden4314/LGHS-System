@@ -4,16 +4,29 @@ set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
 CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
+STATE_DIR=/var/lib/lghs/update
 [[ "$ROLE" == "student" || "$ROLE" == "controller" ]] || exit 0
 
-# Prefer the live checkout so every managed component and permission can be
-# reinstalled after Raspberry Pi OS/package changes without reflashing.
-if [[ -x "$CHECKOUT/install.sh" ]]; then
+# Only reinstall from the persistent checkout when it is the same commit that
+# LGHS considers installed. This prevents a stale main checkout from silently
+# overwriting a manually/test-branch installed build during boot.
+EXPECTED_COMMIT="$(cat "$STATE_DIR/current-commit" 2>/dev/null || cat /etc/lghs/source-commit 2>/dev/null || true)"
+CHECKOUT_COMMIT=""
+if [[ -d "$CHECKOUT/.git" ]]; then
+    CHECKOUT_COMMIT="$(git -c safe.directory="$CHECKOUT" -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
+fi
+
+if [[ -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && "$CHECKOUT_COMMIT" == "$EXPECTED_COMMIT" ]]; then
     /bin/bash "$CHECKOUT/install.sh" "$ROLE"
     exit 0
 fi
 
-# Minimal fallback while the checkout is temporarily unavailable.
+if [[ -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && -n "$CHECKOUT_COMMIT" && "$CHECKOUT_COMMIT" != "$EXPECTED_COMMIT" ]]; then
+    logger -t LGHS-RECONCILE "Skipping stale checkout $CHECKOUT_COMMIT; installed commit is $EXPECTED_COMMIT"
+fi
+
+# Minimal fallback while the checkout is unavailable or stale. These tools are
+# from the currently installed build, so reconciliation cannot downgrade it.
 [[ -x /usr/local/sbin/lghs-autologin-apply ]] && /usr/local/sbin/lghs-autologin-apply || true
 [[ -x /usr/local/sbin/lghs-dev-setup ]] && /usr/local/sbin/lghs-dev-setup || true
 if [[ "$ROLE" == "student" ]]; then
