@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
+URL="${1:-}"
+[[ "$URL" =~ ^https://[A-Za-z0-9._:-]+/?$ ]] || { echo 'Usage: lghs-telemetry-configure https://fleet-host.example' >&2; exit 2; }
+IFS= read -r TOKEN || true
+[[ ${#TOKEN} -ge 32 ]] || { echo 'Telemetry token missing/too short' >&2; exit 3; }
+install -d -m 0700 /etc/lghs/secrets
+umask 077
+printf '%s\n' "$TOKEN" > /etc/lghs/secrets/fleet-api-token
+chmod 0600 /etc/lghs/secrets/fleet-api-token
+cat > /etc/lghs/fleet-api.conf <<EOF
+URL=${URL%/}
+EOF
+chown root:root /etc/lghs/fleet-api.conf /etc/lghs/secrets/fleet-api-token
+chmod 0640 /etc/lghs/fleet-api.conf
+systemctl daemon-reload
+systemctl enable --now lghs-telemetry-push.service
+systemctl restart lghs-telemetry-push.service
+echo "LGHS telemetry configured for ${URL%/}"
