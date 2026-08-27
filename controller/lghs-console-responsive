@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Responsive LGHS Fleet Console with non-blocking fleet views and idle lock."""
+"""LGHS Fleet Control: responsive cache-first UI with safe keyboard navigation."""
 import curses
 import importlib.machinery
 import importlib.util
@@ -11,17 +11,15 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 BASE = "/usr/local/libexec/lghs-console-base"
+CACHE = Path("/var/lib/lghs/fleet-cache.json")
 ACTIVITY = Path("/var/log/lghs-fleet/activity.jsonl")
-NOTIFY_STATE = Path("/var/lib/lghs/fleet-notify-state.json")
 IDLE_SECONDS = max(30, int(os.environ.get("LGHS_CONSOLE_IDLE_SECONDS", "300")))
 TEMP_WARN = 80.0
 TEMP_CRIT = 85.0
 DISK_WARN = 90.0
 DISK_CRIT = 96.0
-
-TRAFFIC = {"down_bps": 0.0, "up_bps": 0.0, "samples": {}, "ready": False}
-ROOT_WINDOW = None
-APP_STATE = None
+BACK_KEYS = (curses.KEY_BACKSPACE, 127, 8, ord("b"), ord("B"))
+workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lghs-ui")
 
 
 def load_base():
@@ -33,662 +31,594 @@ def load_base():
 
 
 mod = load_base()
-# Four workers let refresh/discovery and a user action make progress together.
-# refresh_state_async still permits only one fleet refresh at a time.
-workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lghs-fleet")
 
 
-def number(value):
+def number(value, default=0.0):
     try:
         return float(value)
     except Exception:
-        return None
+        return default
 
 
-def format_rate(value):
+def hostname(d):
+    return str(d.get("hostname") or d.get("device_id") or d.get("host") or d.get("addr") or "?")
+
+
+def fmt_bytes(value):
+    n = number(value, -1)
+    if n < 0:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.0f}PB"
+
+
+def safe(win, y, x, text, attr=0):
+    mod.safe_add(win, y, x, text, attr)
+
+
+def is_back(key):
+    return key in BACK_KEYS
+
+
+def read_key(win, state, allow_lock=True):
+    if allow_lock and time.monotonic() - state["last_activity"] >= state["idle_seconds"]:
+        lock_prompt(win, state)
+    key = win.getch()
+    # Bare ESC is deliberately ignored. Arrow/function keys are commonly
+    # encoded with ESC prefixes; ESC must never mean Back in this console.
+    if key == 27:
+        return -1
+    if key != -1:
+        state["last_activity"] = time.monotonic()
+    return key
+
+
+def load_devices():
+    """Load fleet state through the cache-aware transport shim; no routine SSH."""
     try:
-        rate = max(0.0, float(value))
+        return mod.refresh_fleet(mod.discover_devices())
     except Exception:
-        return "--"
-    for unit in ("B/s", "KB/s", "MB/s", "GB/s", "TB/s"):
-        if rate < 1024.0 or unit == "TB/s":
-            if rate >= 100:
-                return f"{rate:.0f} {unit}"
-            if rate >= 10:
-                return f"{rate:.1f} {unit}"
-            return f"{rate:.2f} {unit}"
-        rate /= 1024.0
-    return "--"
+        return []
 
 
-def update_traffic(devices, sampled_at):
-    old = TRAFFIC.get("samples", {})
+def health(d):
+    if not d.get("online"):
+        return "OFFLINE"
+    expected = ["update_timer", "reconcile_timer"]
+    if d.get("role") == "student":
+        expected += ["agent", "policy", "ssh", "networkmanager"]
+    return "CHECK" if any(d.get(k) not in (None, "active") for k in expected) else "OK"
+
+
+def traffic_sample(state, devices):
+    now = time.monotonic()
+    old = state.get("traffic_samples", {})
     new = {}
-    down_bps = up_bps = 0.0
+    down = up = 0.0
     usable = 0
-    for device in devices:
-        if not device.get("online"):
+    for d in devices:
+        if not d.get("online"):
             continue
-        addr = str(device.get("addr") or device.get("hostname") or device.get("host") or "")
-        rx = number(device.get("rx_bytes"))
-        tx = number(device.get("tx_bytes"))
-        if not addr or rx is None or tx is None:
+        key = str(d.get("device_id") or hostname(d))
+        rx = number(d.get("rx_bytes"), -1)
+        tx = number(d.get("tx_bytes"), -1)
+        if rx < 0 or tx < 0:
             continue
-        rx, tx = max(0.0, rx), max(0.0, tx)
-        new[addr] = (rx, tx, sampled_at)
-        previous = old.get(addr)
-        if not previous:
+        new[key] = (rx, tx, now)
+        prev = old.get(key)
+        if not prev:
             continue
-        old_rx, old_tx, old_time = previous
-        elapsed = sampled_at - float(old_time)
-        if elapsed < 0.25 or rx < old_rx or tx < old_tx:
-            continue
-        down_bps += (rx - old_rx) / elapsed
-        up_bps += (tx - old_tx) / elapsed
-        usable += 1
-    TRAFFIC["samples"] = new
+        prx, ptx, pts = prev
+        elapsed = now - pts
+        if elapsed > 0.1 and rx >= prx and tx >= ptx:
+            down += (rx - prx) / elapsed
+            up += (tx - ptx) / elapsed
+            usable += 1
+    state["traffic_samples"] = new
     if usable:
-        TRAFFIC.update(down_bps=down_bps, up_bps=up_bps, ready=True)
-    elif not new:
-        TRAFFIC.update(down_bps=0.0, up_bps=0.0, ready=False)
+        state["down_bps"], state["up_bps"] = down, up
 
 
-def traffic_text():
-    if not TRAFFIC.get("ready"):
-        return "DOWN -- | UP --"
-    return f"DOWN {format_rate(TRAFFIC['down_bps'])} | UP {format_rate(TRAFFIC['up_bps'])}"
+def rate(value):
+    n = max(0.0, number(value))
+    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if n < 100 else f"{n:.0f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB/s"
 
 
-def load_known_devices():
-    try:
-        data = json.loads(NOTIFY_STATE.read_text(encoding="utf-8"))
-        devices = data.get("devices", {})
-        return devices if isinstance(devices, dict) else {}
-    except Exception:
-        return {}
+def refresh_cache(state, force=False):
+    now = time.monotonic()
+    if force or now - state.get("cache_loaded", 0) >= 0.5:
+        state["devices"] = load_devices()
+        state["cache_loaded"] = now
+        state["generation"] += 1
+        traffic_sample(state, state["devices"])
+    return state["devices"]
 
 
-def merge_known_devices(live_devices):
-    out = list(live_devices)
-    seen = {str(d.get("addr", "")) for d in live_devices if d.get("addr")}
-    for addr, remembered in load_known_devices().items():
-        if not addr or addr in seen or not isinstance(remembered, dict):
+def pending_requests(devices):
+    out = []
+    for d in devices:
+        for req in d.get("sudo_requests") or []:
+            if str(req.get("status", "pending")) == "pending":
+                out.append((d, req))
+    return sorted(out, key=lambda x: number(x[1].get("requested_epoch")))
+
+
+def issues(devices):
+    rows = []
+    for d in devices:
+        if not d.get("online"):
+            age = d.get("cache_age")
+            rows.append((d, "CRITICAL", "OFFLINE", "no current telemetry" if age is None else f"cache age {number(age):.1f}s"))
             continue
-        host = remembered.get("host") or addr
-        out.append({
-            "addr": addr,
-            "host": host,
-            "hostname": host,
-            "role": remembered.get("role", "student"),
-            "online": False,
-            "sudo_requests": [],
-            "last_seen": remembered.get("last_seen", 0),
-        })
-    return sorted(out, key=lambda d: (
-        not d.get("online", False),
-        (d.get("hostname") or d.get("host") or d.get("addr", "")).lower(),
-    ))
+        temp = number(d.get("temp_c"), -1)
+        disk = number(d.get("disk_pct"), -1)
+        if temp >= TEMP_CRIT:
+            rows.append((d, "CRITICAL", "TEMP", f"{temp:.1f}C"))
+        elif temp >= TEMP_WARN:
+            rows.append((d, "WARNING", "TEMP", f"{temp:.1f}C"))
+        if disk >= DISK_CRIT:
+            rows.append((d, "CRITICAL", "DISK", f"{disk:.0f}% used"))
+        elif disk >= DISK_WARN:
+            rows.append((d, "WARNING", "DISK", f"{disk:.0f}% used"))
+        if d.get("student_sudo") == "yes":
+            rows.append((d, "CRITICAL", "SECURITY", "student account is in sudo"))
+        for key, label in (("ssh", "SSH"), ("policy", "POLICY"), ("update_timer", "UPDATE"), ("reconcile_timer", "RECONCILE")):
+            value = d.get(key)
+            if value and value != "active":
+                rows.append((d, "CRITICAL" if key in ("ssh", "policy") else "WARNING", label, value))
+    return sorted(rows, key=lambda x: (x[1] != "CRITICAL", hostname(x[0]).lower(), x[2]))
 
 
-def _harvest(state):
-    now = time.time()
-    future = state.get("_discovery_future")
-    if future is not None and future.done():
-        try:
-            state["discovered"] = future.result()
-        except Exception:
-            pass
-        state["last_discovery"] = now
-        state["_discovery_future"] = None
-
-    future = state.get("_refresh_future")
-    if future is not None and future.done():
-        try:
-            live = future.result()
-            update_traffic(live, now)
-            state["devices"] = merge_known_devices(live)
-            if state["devices"]:
-                state["selected"] = min(state.get("selected", 0), len(state["devices"]) - 1)
-        except Exception:
-            pass
-        state["last_refresh"] = now
-        state["_refresh_future"] = None
-        state["_data_generation"] = state.get("_data_generation", 0) + 1
+def header(stdscr, state, title, subtitle=""):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    left = f" LGHS CONTROL | {title} "
+    right = f" DOWN {rate(state.get('down_bps', 0))} | UP {rate(state.get('up_bps', 0))} "
+    usable = max(1, w - 1)
+    top = left + (" " * max(1, usable - len(left) - len(right))) + right
+    safe(stdscr, 0, 0, top[:usable].ljust(usable), curses.A_REVERSE | curses.A_BOLD)
+    if subtitle:
+        safe(stdscr, 1, 1, subtitle)
+    safe(stdscr, h - 2, 1, "F2 Fleet F3 Telemetry F4 Sudo F5 Updates F6 Logs F7 Attention F8 Activity F10 Quit", curses.A_DIM)
+    safe(stdscr, h - 1, 1, f"Arrows move | Enter select | 1-9 quick select | Backspace/B back | R refresh | Auto-lock {max(1, state['idle_seconds']//60)}m", curses.A_DIM)
 
 
-def refresh_state_async(state, force=False):
-    _harvest(state)
-    now = time.time()
-    if (force or not state.get("discovered") or now - state.get("last_discovery", 0) >= mod.DISCOVERY_SECONDS) \
-            and state.get("_discovery_future") is None:
-        state["_discovery_future"] = workers.submit(mod.discover_devices)
-    if (force or now - state.get("last_refresh", 0) >= mod.REFRESH_SECONDS) \
-            and state.get("_refresh_future") is None:
-        discovered = list(state.get("discovered", []))
-        if discovered:
-            state["_refresh_future"] = workers.submit(mod.refresh_fleet, discovered)
-        elif state.get("_discovery_future") is None:
-            state["devices"] = merge_known_devices([])
-            state["last_refresh"] = now
-
-
-mod.refresh_state = refresh_state_async
-
-
-def validate_admin_password(password):
+def validate_password(password):
     if not password:
         return False
     try:
-        proc = subprocess.run(
+        p = subprocess.run(
             ["sudo", "-u", "cs_admin", "sudo", "-S", "-k", "-p", "", "-v"],
-            input=password + "\n",
-            text=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
+            input=password + "\n", text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
         )
-        return proc.returncode == 0
+        return p.returncode == 0
     except Exception:
         return False
 
 
 def lock_prompt(stdscr, state):
     raw = getattr(stdscr, "_raw", stdscr)
-    try:
-        raw.timeout(-1)
-    except Exception:
-        pass
-    curses.curs_set(0)
-    curses.noecho()
-    message = "Fleet console locked due to inactivity"
+    raw.timeout(-1)
     error = ""
     while True:
         raw.erase()
         h, w = raw.getmaxyx()
-        pw = min(max(54, len(message) + 10), max(20, w - 4))
-        ph = 9
-        y, x = max(0, (h - ph) // 2), max(0, (w - pw) // 2)
-        try:
-            win = curses.newwin(ph, pw, y, x)
-            win.box()
-            mod.safe_add(win, 0, 2, " LGHS FLEET LOCKED ", curses.A_REVERSE | curses.A_BOLD)
-            mod.safe_add(win, 2, 3, message, curses.A_BOLD)
-            mod.safe_add(win, 4, 3, "cs_admin password:")
-            if error:
-                mod.safe_add(win, 6, 3, error, curses.A_BOLD)
-            mod.safe_add(win, 7, 3, "Unlock requires the local cs_admin password.", curses.A_DIM)
-            win.refresh()
-        except curses.error:
-            win = raw
+        y = max(1, h // 2 - 3)
+        x = max(1, w // 2 - 20)
+        safe(raw, y, x, " LGHS FLEET LOCKED ", curses.A_REVERSE | curses.A_BOLD)
+        safe(raw, y + 2, x, "Fleet console locked due to inactivity")
+        safe(raw, y + 4, x, "cs_admin password:")
+        if error:
+            safe(raw, y + 6, x, error, curses.A_BOLD)
+        raw.refresh()
         chars = []
         while True:
-            try:
-                mod.safe_add(win, 4, 23, "*" * len(chars) + " " * 24)
-                win.refresh()
-            except Exception:
-                pass
-            key = win.getch()
+            key = raw.getch()
             if key in (10, 13):
                 break
             if key in (curses.KEY_BACKSPACE, 127, 8):
                 if chars:
                     chars.pop()
-            elif key == 27:
-                chars.clear()
-            elif 32 <= key <= 126 and len(chars) < 128:
+            elif 32 <= key <= 126 and key != 27 and len(chars) < 128:
                 chars.append(chr(key))
-        password = "".join(chars)
-        chars[:] = []
-        if validate_admin_password(password):
-            state["last_activity"] = time.monotonic()
-            state["force_refresh"] = True
-            raw.erase()
+            safe(raw, y + 4, x + 20, "*" * len(chars) + " " * 30)
             raw.refresh()
-            try:
-                raw.timeout(50)
-            except Exception:
-                pass
+        if validate_password("".join(chars)):
+            state["last_activity"] = time.monotonic()
+            raw.timeout(50)
+            raw.erase()
             return
-        error = "Incorrect password. Try again."
+        error = "Incorrect password"
 
 
-def maybe_lock(stdscr, state):
-    if time.monotonic() - state.get("last_activity", time.monotonic()) >= state.get("idle_seconds", IDLE_SECONDS):
-        lock_prompt(stdscr, state)
-
-
-class InputWindow:
-    """Proxy stdscr so inherited screens also participate in idle locking."""
-    def __init__(self, raw, state):
-        self._raw = raw
-        self._state = state
-
-    def __getattr__(self, name):
-        return getattr(self._raw, name)
-
-    def getch(self, *args):
-        maybe_lock(self, self._state)
-        key = self._raw.getch(*args)
-        if key != -1:
-            self._state["last_activity"] = time.monotonic()
-        return key
-
-
-def notify_last_seen(addr):
-    try:
-        data = json.loads(NOTIFY_STATE.read_text(encoding="utf-8"))
-        return float(data.get("devices", {}).get(addr, {}).get("last_seen", 0) or 0)
-    except Exception:
-        return 0
-
-
-def device_issues(device):
-    out = []
-    if not device.get("online"):
-        last = number(device.get("last_seen")) or notify_last_seen(device.get("addr", ""))
-        age = time.time() - last if last else None
-        detail = "not responding" + (f"; last seen {int(max(0, age))}s ago" if age is not None else "")
-        return [("CRITICAL", "SSH/OFFLINE", detail)]
-    temp, disk = number(device.get("temp_c")), number(device.get("disk_pct"))
-    if temp is not None and temp >= TEMP_CRIT:
-        out.append(("CRITICAL", "TEMP", f"{temp:.1f}C"))
-    elif temp is not None and temp >= TEMP_WARN:
-        out.append(("WARNING", "TEMP", f"{temp:.1f}C"))
-    if disk is not None and disk >= DISK_CRIT:
-        out.append(("CRITICAL", "DISK", f"{disk:.0f}% used"))
-    elif disk is not None and disk >= DISK_WARN:
-        out.append(("WARNING", "DISK", f"{disk:.0f}% used"))
-    expected = [("update_timer", "UPDATE TIMER"), ("reconcile_timer", "RECONCILE")]
-    if device.get("role") == "student":
-        expected += [("agent", "AGENT"), ("policy", "POLICY"), ("ssh", "SSH"),
-                     ("networkmanager", "NETWORK"), ("avahi", "DISCOVERY")]
-    for key, label in expected:
-        value = device.get(key)
-        if value and value != "active":
-            out.append(("CRITICAL" if key in ("ssh", "policy") else "WARNING", label, value))
-    if device.get("update_service") == "failed":
-        out.append(("CRITICAL", "UPDATE", "last update failed"))
-    if device.get("role") == "student" and device.get("student_sudo") == "yes":
-        out.append(("CRITICAL", "SECURITY", "student account is in sudo"))
-    return out
-
-
-def all_issues(devices):
-    rows = []
-    for d in devices:
-        for severity, kind, detail in device_issues(d):
-            rows.append((d, severity, kind, detail))
-    return sorted(rows, key=lambda row: (
-        row[1] != "CRITICAL",
-        (row[0].get("hostname") or row[0].get("host") or "").lower(), row[2]))
-
-
-def recent_activity(limit=80):
-    try:
-        rows = []
-        for line in reversed(ACTIVITY.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]):
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                pass
-        return rows
-    except Exception:
-        return []
-
-
-def header_ext(stdscr, title, subtitle=""):
-    stdscr.erase()
-    h, w = stdscr.getmaxyx()
-    left, right = f" LGHS CONTROL | {title} ", f" {traffic_text()} "
-    usable = max(0, w - 1)
-    if len(left) + len(right) + 1 <= usable:
-        top = left + " " * (usable - len(left) - len(right)) + right
-    else:
-        top = left[:usable]
-    mod.safe_add(stdscr, 0, 0, top.ljust(usable), curses.A_REVERSE | curses.A_BOLD)
-    if subtitle:
-        mod.safe_add(stdscr, 1, 1, subtitle)
-    mod.safe_add(stdscr, h - 2, 1,
-                 "F1 Help F2 Fleet F3 Telemetry F4 Sudo F5 Updates F6 Logs F7 Attention F8 Activity F10 Quit",
-                 curses.A_DIM)
-    mod.safe_add(stdscr, h - 1, 1,
-                 f"Arrows move | Enter select | 1-9 quick select | Esc back | R refresh | Auto-lock {state_minutes()}m",
-                 curses.A_DIM)
-
-
-def state_minutes():
-    seconds = APP_STATE.get("idle_seconds", IDLE_SECONDS) if APP_STATE else IDLE_SECONDS
-    return max(1, int(round(seconds / 60.0)))
-
-
-mod.header = header_ext
-mod._original_global_key = mod.global_key
-
-
-def global_key_ext(key):
-    if key == curses.KEY_F7:
-        return "attention"
-    if key == curses.KEY_F8:
-        return "activity"
-    return mod._original_global_key(key)
-
-
-mod.global_key = global_key_ext
-
-
-def redraw_due(signature, last_signature, last_draw):
-    return signature != last_signature or time.monotonic() - last_draw >= 1.0
-
-
-def main_menu(stdscr, state):
-    items = [("Fleet overview", "fleet"), ("Needs Attention", "attention"),
-             ("Fleet Activity", "activity"), ("Telemetry", "telemetry"),
-             ("Sudo requests", "sudo"), ("Updates", "updates"),
-             ("Audit & logs", "logs"), ("Controller status", "controller")]
-    selected, last_signature, last_draw = 0, None, 0.0
+def popup(stdscr, state, title, text, footer="Enter or Backspace/B close"):
+    lines = str(text).splitlines() or [""]
+    off = 0
     while True:
-        refresh_state_async(state, state.pop("force_refresh", False))
-        mod.maybe_popup_new_sudo(stdscr, state)
-        fleet, issues = state["devices"], all_issues(state["devices"])
-        online = sum(1 for d in fleet if d.get("online"))
-        pending = len(mod.pending_requests(fleet))
-        critical = sum(1 for row in issues if row[1] == "CRITICAL")
-        last_event = recent_activity(1)
-        last_event = last_event[0].get("event", "") if last_event else "No events yet"
-        signature = (selected, state.get("_data_generation", 0), online, len(fleet), len(issues), pending, traffic_text())
-        if redraw_due(signature, last_signature, last_draw):
-            header_ext(stdscr, "Main menu", f"{online}/{len(fleet)} Pis online | {len(issues)} issue(s) | {pending} sudo request(s)")
-            for i, (name, _) in enumerate(items):
-                mod.safe_add(stdscr, 3 + i, 4, f"{i + 1}. {name}",
-                             curses.A_REVERSE | curses.A_BOLD if i == selected else 0)
-            _, width = stdscr.getmaxyx()
-            x = max(36, width - 38)
-            try:
-                box = curses.newwin(9, min(36, max(20, width - x - 1)), 3, x)
-                box.box()
-                mod.safe_add(box, 0, 2, " FLEET STATUS ", curses.A_BOLD)
-                mod.safe_add(box, 2, 2, f"Online       {online}/{len(fleet)}")
-                mod.safe_add(box, 3, 2, f"Needs attn   {len(issues)}")
-                mod.safe_add(box, 4, 2, f"Critical     {critical}")
-                mod.safe_add(box, 5, 2, f"Warnings     {len(issues) - critical}")
-                mod.safe_add(box, 6, 2, f"Pending sudo {pending}")
-                mod.safe_add(box, 7, 2, f"Last: {last_event}", curses.A_DIM)
-                stdscr.noutrefresh(); box.noutrefresh(); curses.doupdate()
-            except curses.error:
-                stdscr.refresh()
-            last_signature, last_draw = signature, time.monotonic()
-        key = stdscr.getch()
-        action = global_key_ext(key)
-        if action:
-            return action
-        if key in (ord("q"), ord("Q")):
-            return "quit"
-        if key in (curses.KEY_DOWN, ord("j")):
-            selected = min(len(items) - 1, selected + 1)
-        elif key in (curses.KEY_UP, ord("k")):
-            selected = max(0, selected - 1)
-        elif ord("1") <= key <= ord("8"):
-            return items[key - ord("1")][1]
-        elif key in (10, 13):
-            return items[selected][1]
-
-
-def find_live_device(state, addr, fallback):
-    for device in state.get("devices", []):
-        if device.get("addr") == addr:
-            return device
-    return fallback
-
-
-def fleet_screen_fast(stdscr, state):
-    selected = min(state.get("selected", 0), max(0, len(state["devices"]) - 1))
-    last_signature, last_draw = None, 0.0
-    while True:
-        refresh_state_async(state, state.pop("force_refresh", False))
-        mod.maybe_popup_new_sudo(stdscr, state)
-        devices = state["devices"]
-        selected = min(selected, max(0, len(devices) - 1))
+        header(stdscr, state, title)
         h, _ = stdscr.getmaxyx()
-        rows = max(1, h - 7)
-        start = max(0, selected - rows + 1) if selected >= rows else 0
-        signature = (selected, start, rows, state.get("_data_generation", 0), traffic_text(), len(devices))
-        if redraw_due(signature, last_signature, last_draw):
-            header_ext(stdscr, "Fleet", "Enter opens a focused menu for the selected Pi. Cached data stays visible while refresh runs.")
-            mod.safe_add(stdscr, 3, 1, "#  DEVICE           ENDPOINT         VER     CPU    RAM    TEMP    STATE",
-                         curses.A_BOLD | curses.A_UNDERLINE)
-            for pos, d in enumerate(devices[start:start + rows]):
-                idx, num = start + pos, pos + 1 if pos < 9 else 0
-                host = d.get("hostname") or d.get("host") or "?"
-                addr = d.get("addr", "?")
-                line = f"{num if num else ' ':>1}  {host[:16]:16} {addr[:15]:15} {str(d.get('version','?'))[:7]:7} {str(d.get('cpu_pct','?'))+'%':6} {str(d.get('mem_pct','?'))+'%':6} {str(d.get('temp_c','?'))+'C':7} {mod.health(d):8}"
-                mod.safe_add(stdscr, 4 + pos, 1, line, curses.A_REVERSE if idx == selected else 0)
-            if not devices:
-                mod.safe_add(stdscr, 5, 3, "No enrolled LGHS Pis available.")
-            stdscr.refresh()
-            last_signature, last_draw = signature, time.monotonic()
-        key = stdscr.getch()
-        action = global_key_ext(key)
-        if action:
-            state["selected"] = selected
-            return action
-        if key in (27, curses.KEY_BACKSPACE, 127):
-            state["selected"] = selected
-            return "main"
-        if key in (ord("r"), ord("R")):
-            state["force_refresh"] = True
-            continue
-        selected, action = mod.list_select_key(key, selected, len(devices), start, rows)
-        if action == "open" and devices:
-            state["selected"] = selected
-            nxt = device_menu_fast(stdscr, state, devices[selected])
-            last_signature = None
-            if nxt != "fleet":
-                return nxt
+        visible = max(1, h - 7)
+        for i, line in enumerate(lines[off:off + visible]):
+            safe(stdscr, 3 + i, 2, line)
+        safe(stdscr, h - 3, 2, footer, curses.A_DIM)
+        stdscr.refresh()
+        key = read_key(stdscr, state)
+        if key in (10, 13) or is_back(key):
+            return
+        if key in (curses.KEY_DOWN, ord("j")):
+            off = min(max(0, len(lines) - visible), off + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            off = max(0, off - 1)
 
 
-def action_result_popup(stdscr, state):
-    future = state.get("_action_future")
+def confirm(stdscr, state, text):
+    while True:
+        header(stdscr, state, "Confirm", text)
+        safe(stdscr, 4, 4, "Y Yes    N No    Backspace/B Cancel", curses.A_BOLD)
+        stdscr.refresh()
+        key = read_key(stdscr, state)
+        if key in (ord("y"), ord("Y")):
+            return True
+        if key in (ord("n"), ord("N")) or is_back(key):
+            return False
+
+
+def start_action(state, title, d, command):
+    if state.get("future") is not None:
+        return False
+    state["future_title"] = title
+    state["future"] = workers.submit(mod.ssh_capture, d["addr"], command)
+    return True
+
+
+def sudo_popup(stdscr, state, d, req):
+    rid = str(req.get("id") or "")
+    while True:
+        header(stdscr, state, "SUDO REQUEST", f"{hostname(d)} | {req.get('requester','?')}")
+        safe(stdscr, 3, 3, "A student is requesting sudo access:", curses.A_BOLD)
+        safe(stdscr, 5, 5, str(req.get("command") or ""), curses.A_BOLD)
+        safe(stdscr, 7, 3, f"Request ID: {rid}")
+        safe(stdscr, 9, 3, "Y approve once | N deny | Backspace/B leave pending", curses.A_REVERSE | curses.A_BOLD)
+        stdscr.refresh()
+        key = read_key(stdscr, state)
+        if key in (ord("y"), ord("Y"), ord("n"), ord("N")):
+            decision = "approve" if key in (ord("y"), ord("Y")) else "deny"
+            start_action(state, f"Sudo {decision} - {hostname(d)}", d,
+                         f"sudo -n /usr/local/sbin/lghs-sudo-admin {decision} {rid}")
+            return
+        if is_back(key):
+            return
+
+
+def maybe_auto_sudo(stdscr, state):
+    if state.get("future") is not None or state.get("sudo_popup_active"):
+        return
+    notified = state.setdefault("notified_sudo", set())
+    for d, req in pending_requests(refresh_cache(state)):
+        rid = str(req.get("id") or "")
+        key = f"{d.get('device_id') or hostname(d)}:{rid}"
+        if rid and key not in notified:
+            notified.add(key)
+            state["sudo_popup_active"] = True
+            try:
+                sudo_popup(stdscr, state, d, req)
+            finally:
+                state["sudo_popup_active"] = False
+            return
+
+
+def harvest_action(stdscr, state):
+    future = state.get("future")
     if future is None or not future.done():
         return
-    title = state.get("_action_title", "Remote action")
+    title = state.get("future_title", "Action")
     try:
         p = future.result()
         body = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
         body = body.strip() or f"Exit code {p.returncode}"
     except Exception as exc:
         body = f"Action failed: {exc}"
-    state["_action_future"] = None
-    state["_action_title"] = ""
-    mod.popup(stdscr, title, body)
-    state["force_refresh"] = True
+    state["future"] = None
+    state["future_title"] = ""
+    popup(stdscr, state, title, body)
+    refresh_cache(state, True)
 
 
-def start_action(state, device, title, command):
-    if state.get("_action_future") is not None:
-        return False
-    state["_action_title"] = title
-    state["_action_future"] = workers.submit(mod.ssh_capture, device["addr"], command)
-    return True
+def global_action(key):
+    return {
+        curses.KEY_F2: "fleet", curses.KEY_F3: "telemetry", curses.KEY_F4: "sudo",
+        curses.KEY_F5: "updates", curses.KEY_F6: "logs", curses.KEY_F7: "attention",
+        curses.KEY_F8: "activity", curses.KEY_F10: "quit",
+    }.get(key)
 
 
-def device_menu_fast(stdscr, state, original):
-    addr = original.get("addr")
-    actions = ["Summary / services", "Telemetry snapshot", "Pending sudo requests", "Logs",
-               "Force LGHS update", "Force Raspberry Pi OS update", "Validate + re-apply policy",
-               "Open SSH session", "Reboot Pi"]
-    selected, last_signature, last_draw = 0, None, 0.0
+def list_nav(key, selected, count, start, rows):
+    if key in (curses.KEY_DOWN, ord("j")) and count:
+        selected = min(count - 1, selected + 1)
+    elif key in (curses.KEY_UP, ord("k")) and count:
+        selected = max(0, selected - 1)
+    elif ord("1") <= key <= ord("9"):
+        idx = start + key - ord("1")
+        if idx < min(count, start + rows):
+            return idx, True
+    elif key in (10, 13) and count:
+        return selected, True
+    return selected, False
+
+
+def main_menu(stdscr, state):
+    items = [("Fleet overview", "fleet"), ("Needs Attention", "attention"), ("Fleet Activity", "activity"),
+             ("Telemetry", "telemetry"), ("Sudo requests", "sudo"), ("Updates", "updates"),
+             ("Audit & logs", "logs"), ("Controller status", "controller")]
+    sel = state.get("menu_selected", 0)
     while True:
-        refresh_state_async(state, state.pop("force_refresh", False))
-        action_result_popup(stdscr, state)
-        device = find_live_device(state, addr, original)
-        host = device.get("hostname") or device.get("host") or addr
-        busy = state.get("_action_future") is not None
-        signature = (selected, state.get("_data_generation", 0), busy,
-                     device.get("cpu_pct"), device.get("mem_pct"), device.get("temp_c"), mod.health(device))
-        if redraw_due(signature, last_signature, last_draw):
-            subtitle = f"{addr} | {mod.health(device)} | LGHS {device.get('version','?')}"
-            if busy:
-                subtitle += f" | WORKING: {state.get('_action_title','remote action')}"
-            header_ext(stdscr, f"Pi menu - {host}", subtitle)
-            for i, name in enumerate(actions):
-                attr = curses.A_REVERSE if i == selected else 0
-                if busy and i != 7:
-                    attr |= curses.A_DIM
-                mod.safe_add(stdscr, 3 + i, 4, f"{i + 1}. {name}", attr)
-            stdscr.refresh()
-            last_signature, last_draw = signature, time.monotonic()
-        key = stdscr.getch()
-        action = global_key_ext(key)
+        harvest_action(stdscr, state)
+        devices = refresh_cache(state)
+        maybe_auto_sudo(stdscr, state)
+        problems = issues(devices)
+        pending = len(pending_requests(devices))
+        header(stdscr, state, "Main menu", f"{sum(bool(d.get('online')) for d in devices)}/{len(devices)} Pis online | {len(problems)} issue(s) | {pending} sudo request(s)")
+        for i, (name, _) in enumerate(items):
+            safe(stdscr, 3 + i, 4, f"{i + 1}. {name}", curses.A_REVERSE | curses.A_BOLD if i == sel else 0)
+        stdscr.refresh()
+        key = read_key(stdscr, state)
+        action = global_action(key)
         if action:
+            state["menu_selected"] = sel
             return action
-        if key in (27, curses.KEY_BACKSPACE, 127):
-            return "fleet"
+        if key in (ord("q"), ord("Q")):
+            return "quit"
         if key in (curses.KEY_DOWN, ord("j")):
-            selected = min(8, selected + 1)
+            sel = min(len(items) - 1, sel + 1)
         elif key in (curses.KEY_UP, ord("k")):
-            selected = max(0, selected - 1)
-        elif ord("1") <= key <= ord("9"):
-            selected = key - ord("1")
-            key = 10
-        if key not in (10, 13):
-            continue
-        n = selected + 1
-        if n == 8:
-            curses.endwin()
-            subprocess.call(mod.ssh_args(addr, batch=False))
-            getattr(stdscr, "_raw", stdscr).refresh()
-            curses.curs_set(0)
-            state["last_activity"] = time.monotonic()
-            last_signature = None
-            continue
-        if busy:
-            continue
-        if n == 3:
-            reqs = device.get("sudo_requests", [])
-            if not reqs:
-                mod.popup(stdscr, "Sudo", "No pending requests for this Pi.")
+            sel = max(0, sel - 1)
+        elif ord("1") <= key <= ord("8"):
+            return items[key - ord("1")][1]
+        elif key in (10, 13):
+            return items[sel][1]
+
+
+def fleet_screen(stdscr, state, telemetry=False):
+    sel = state.get("selected", 0)
+    while True:
+        harvest_action(stdscr, state)
+        devices = refresh_cache(state)
+        maybe_auto_sudo(stdscr, state)
+        rows_data = sorted(devices, key=lambda d: (not d.get("online"), -number(d.get("cpu_pct")))) if telemetry else devices
+        sel = min(sel, max(0, len(rows_data) - 1))
+        h, _ = stdscr.getmaxyx(); rows = max(1, h - 7); start = max(0, sel - rows + 1) if sel >= rows else 0
+        header(stdscr, state, "Telemetry" if telemetry else "Fleet", "Local HTTPS telemetry cache; browsing does not SSH to student Pis.")
+        if telemetry:
+            safe(stdscr, 3, 1, "#  DEVICE           STATE    CPU     RAM     DISK    TEMP    RX       TX", curses.A_BOLD | curses.A_UNDERLINE)
+        else:
+            safe(stdscr, 3, 1, "#  DEVICE           STATE    VER      CPU     RAM     TEMP    CACHE", curses.A_BOLD | curses.A_UNDERLINE)
+        for pos, d in enumerate(rows_data[start:start + rows]):
+            idx = start + pos; attr = curses.A_REVERSE if idx == sel else 0
+            if telemetry:
+                line = f"{pos+1 if pos<9 else ' ':>1}  {hostname(d)[:16]:16} {health(d):8} {str(d.get('cpu_pct','?'))+'%':7} {str(d.get('mem_pct','?'))+'%':7} {str(d.get('disk_pct','?'))+'%':7} {str(d.get('temp_c','?'))+'C':7} {fmt_bytes(d.get('rx_bytes')):8} {fmt_bytes(d.get('tx_bytes')):8}"
             else:
-                for req in reqs:
-                    mod.sudo_decision_popup(stdscr, device, req)
-            state["force_refresh"] = True
-        elif n == 1:
-            start_action(state, device, f"Summary - {host}", "sudo -n /usr/local/sbin/lghs-report summary && echo && sudo -n /usr/local/sbin/lghs-report services")
+                age = "--" if d.get("cache_age") is None else f"{number(d.get('cache_age')):.1f}s"
+                line = f"{pos+1 if pos<9 else ' ':>1}  {hostname(d)[:16]:16} {health(d):8} {str(d.get('version','?'))[:8]:8} {str(d.get('cpu_pct','?'))+'%':7} {str(d.get('mem_pct','?'))+'%':7} {str(d.get('temp_c','?'))+'C':7} {age:7}"
+            safe(stdscr, 4 + pos, 1, line, attr)
+        stdscr.refresh()
+        key = read_key(stdscr, state); action = global_action(key)
+        if action:
+            state["selected"] = sel; return action
+        if is_back(key):
+            state["selected"] = sel; return "main"
+        if key in (ord("r"), ord("R")):
+            refresh_cache(state, True); continue
+        sel, opened = list_nav(key, sel, len(rows_data), start, rows)
+        if opened and rows_data:
+            d = rows_data[sel]
+            state["selected"] = next((i for i, x in enumerate(devices) if x.get("device_id") == d.get("device_id")), 0)
+            nxt = device_menu(stdscr, state, d)
+            if nxt != "fleet":
+                return nxt
+
+
+def device_menu(stdscr, state, original):
+    actions = ["Cached summary", "Cached telemetry", "Pending sudo requests", "Live logs (SSH)", "Force LGHS update",
+               "Force Raspberry Pi OS update", "Validate + re-apply policy", "Open SSH session", "Reboot Pi"]
+    sel = 0; device_id = original.get("device_id")
+    while True:
+        harvest_action(stdscr, state)
+        devices = refresh_cache(state); d = next((x for x in devices if x.get("device_id") == device_id), original)
+        busy = state.get("future") is not None
+        header(stdscr, state, f"Pi menu - {hostname(d)}", f"{health(d)} | {'WORKING: '+state.get('future_title','') if busy else 'cached data'}")
+        for i, name in enumerate(actions): safe(stdscr, 3 + i, 4, f"{i + 1}. {name}", curses.A_REVERSE if i == sel else 0)
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action: return action
+        if is_back(key): return "fleet"
+        if key in (curses.KEY_DOWN, ord("j")): sel = min(8, sel + 1)
+        elif key in (curses.KEY_UP, ord("k")): sel = max(0, sel - 1)
+        elif ord("1") <= key <= ord("9"): sel = key - ord("1"); key = 10
+        if key not in (10, 13): continue
+        n = sel + 1
+        if n == 1:
+            popup(stdscr, state, f"Cached summary - {hostname(d)}", "\n".join(f"{k}={v}" for k, v in sorted(d.items()) if k != "sudo_requests"))
         elif n == 2:
-            start_action(state, device, f"Telemetry - {host}", "sudo -n /usr/local/sbin/lghs-report stats")
-        elif n == 4:
-            start_action(state, device, f"Logs - {host}", "sudo -n /usr/local/sbin/lghs-report logs all")
-        elif n == 5 and mod.confirm(stdscr, f"Force LGHS update on {host}?"):
-            start_action(state, device, f"LGHS update - {host}", "sudo -n /usr/local/sbin/lghs-update")
-        elif n == 6 and mod.confirm(stdscr, f"Run Raspberry Pi OS full-upgrade on {host}?"):
-            start_action(state, device, f"OS update - {host}", "sudo -n /usr/local/sbin/lghs-os-update")
-        elif n == 7:
-            start_action(state, device, f"Validation - {host}", "sudo -n /usr/local/sbin/lghs-enforce && sudo -n /usr/local/sbin/lghs-check")
-        elif n == 9 and mod.confirm(stdscr, f"Reboot {host}?"):
-            start_action(state, device, f"Reboot - {host}", "sudo -n /usr/sbin/reboot")
-        last_signature = None
+            popup(stdscr, state, f"Cached telemetry - {hostname(d)}", f"CPU {d.get('cpu_pct','?')}%\nRAM {d.get('mem_pct','?')}%\nDisk {d.get('disk_pct','?')}%\nTemp {d.get('temp_c','?')}C\nRX {fmt_bytes(d.get('rx_bytes'))}\nTX {fmt_bytes(d.get('tx_bytes'))}")
+        elif n == 3:
+            reqs = d.get("sudo_requests") or []
+            if not reqs: popup(stdscr, state, "Sudo", "No pending requests for this Pi.")
+            else: sudo_popup(stdscr, state, d, reqs[0])
+        elif n == 4 and not busy: start_action(state, f"Logs - {hostname(d)}", d, "sudo -n /usr/local/sbin/lghs-report logs all")
+        elif n == 5 and not busy and confirm(stdscr, state, f"Force LGHS update on {hostname(d)}?"): start_action(state, f"LGHS update - {hostname(d)}", d, "sudo -n /usr/local/sbin/lghs-update")
+        elif n == 6 and not busy and confirm(stdscr, state, f"Run OS update on {hostname(d)}?"): start_action(state, f"OS update - {hostname(d)}", d, "sudo -n /usr/local/sbin/lghs-os-update")
+        elif n == 7 and not busy: start_action(state, f"Validation - {hostname(d)}", d, "sudo -n /usr/local/sbin/lghs-enforce && sudo -n /usr/local/sbin/lghs-check")
+        elif n == 8:
+            curses.endwin(); subprocess.call(mod.ssh_args(d["addr"], batch=False)); stdscr.refresh(); curses.curs_set(0); state["last_activity"] = time.monotonic()
+        elif n == 9 and not busy and confirm(stdscr, state, f"Reboot {hostname(d)}?"): start_action(state, f"Reboot - {hostname(d)}", d, "sudo -n /usr/sbin/reboot")
 
 
-# Any legacy screen that opens a device now gets the fast device menu too.
-mod.device_menu = device_menu_fast
+def sudo_screen(stdscr, state):
+    sel = 0
+    while True:
+        harvest_action(stdscr, state)
+        queue = pending_requests(refresh_cache(state)); sel = min(sel, max(0, len(queue)-1))
+        h, _ = stdscr.getmaxyx(); rows = max(1, h-7); start = max(0, sel-rows+1) if sel >= rows else 0
+        header(stdscr, state, "Sudo requests", f"{len(queue)} cached pending request(s)")
+        for pos, (d, r) in enumerate(queue[start:start+rows]):
+            safe(stdscr, 4+pos, 1, f"{pos+1 if pos<9 else ' ':>1}  {hostname(d)[:16]:16} {str(r.get('requester','?'))[:12]:12} {str(r.get('command',''))[:70]}", curses.A_REVERSE if start+pos == sel else 0)
+        if not queue: safe(stdscr, 5, 3, "No pending sudo requests.")
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action: return action
+        if is_back(key): return "main"
+        sel, opened = list_nav(key, sel, len(queue), start, rows)
+        if opened and queue: sudo_popup(stdscr, state, *queue[sel])
 
 
 def attention_screen(stdscr, state):
-    selected, last_signature, last_draw = 0, None, 0.0
+    sel = 0
     while True:
-        refresh_state_async(state, state.pop("force_refresh", False))
-        rows = all_issues(state["devices"])
-        selected = min(selected, max(0, len(rows) - 1))
-        h, _ = stdscr.getmaxyx(); visible = max(1, h - 7)
-        start = max(0, selected - visible + 1) if selected >= visible else 0
-        signature = (selected, start, state.get("_data_generation", 0), len(rows))
-        if redraw_due(signature, last_signature, last_draw):
-            header_ext(stdscr, "Needs Attention", f"{len(rows)} active fleet issue(s). Critical items sort first.")
-            mod.safe_add(stdscr, 3, 1, "#  SEVERITY  DEVICE           ISSUE          DETAIL", curses.A_BOLD | curses.A_UNDERLINE)
-            for pos, (device, severity, kind, detail) in enumerate(rows[start:start + visible]):
-                idx = start + pos; host = device.get("hostname") or device.get("host") or device.get("addr", "?")
-                mod.safe_add(stdscr, 4 + pos, 1,
-                             f"{pos + 1 if pos < 9 else ' ':>1}  {severity:8}  {host[:16]:16} {kind[:13]:13} {detail[:60]}",
-                             curses.A_REVERSE if idx == selected else 0)
-            if not rows:
-                mod.safe_add(stdscr, 5, 3, "All currently enrolled Pis look healthy.", curses.A_BOLD)
-            stdscr.refresh(); last_signature, last_draw = signature, time.monotonic()
-        key = stdscr.getch(); action = global_key_ext(key)
+        rows_data = issues(refresh_cache(state)); sel = min(sel, max(0, len(rows_data)-1))
+        h, _ = stdscr.getmaxyx(); rows = max(1, h-7); start = max(0, sel-rows+1) if sel >= rows else 0
+        header(stdscr, state, "Needs Attention", f"{len(rows_data)} cached issue(s)")
+        for pos, (d, sev, kind, detail) in enumerate(rows_data[start:start+rows]):
+            safe(stdscr, 4+pos, 1, f"{pos+1 if pos<9 else ' ':>1} {sev:8} {hostname(d)[:16]:16} {kind:12} {detail}", curses.A_REVERSE if start+pos == sel else 0)
+        if not rows_data: safe(stdscr, 5, 3, "All cached Pis look healthy.")
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
         if action: return action
-        if key in (27, curses.KEY_BACKSPACE, 127): return "main"
-        if key in (ord("r"), ord("R")): state["force_refresh"] = True; continue
-        selected, action = mod.list_select_key(key, selected, len(rows), start, visible)
-        if action == "open" and rows:
-            nxt = device_menu_fast(stdscr, state, rows[selected][0]); last_signature = None
+        if is_back(key): return "main"
+        sel, opened = list_nav(key, sel, len(rows_data), start, rows)
+        if opened and rows_data:
+            nxt = device_menu(stdscr, state, rows_data[sel][0])
             if nxt != "fleet": return nxt
 
 
 def activity_screen(stdscr, state):
-    selected, last_signature, last_draw = 0, None, 0.0
+    sel = 0
     while True:
-        refresh_state_async(state, state.pop("force_refresh", False))
-        rows = recent_activity(200); selected = min(selected, max(0, len(rows) - 1))
-        h, _ = stdscr.getmaxyx(); visible = max(1, h - 7)
-        start = max(0, selected - visible + 1) if selected >= visible else 0
-        activity_mtime = ACTIVITY.stat().st_mtime_ns if ACTIVITY.exists() else 0
-        signature = (selected, start, len(rows), activity_mtime)
-        if redraw_due(signature, last_signature, last_draw):
-            header_ext(stdscr, "Fleet Activity", f"{len(rows)} recent event(s), newest first.")
-            mod.safe_add(stdscr, 3, 1, "#  TIME      LEVEL     DEVICE           EVENT                 DETAIL", curses.A_BOLD | curses.A_UNDERLINE)
-            for pos, row in enumerate(rows[start:start + visible]):
-                idx = start + pos; stamp = time.strftime("%H:%M:%S", time.localtime(float(row.get("ts", 0) or 0)))
-                mod.safe_add(stdscr, 4 + pos, 1,
-                             f"{pos + 1 if pos < 9 else ' ':>1}  {stamp:8} {str(row.get('severity','normal')).upper()[:8]:8} {str(row.get('host','?'))[:16]:16} {str(row.get('event',''))[:20]:20} {str(row.get('detail',''))[:50]}",
-                             curses.A_REVERSE if idx == selected else 0)
-            if not rows: mod.safe_add(stdscr, 5, 3, "No fleet activity recorded yet.")
-            stdscr.refresh(); last_signature, last_draw = signature, time.monotonic()
-        key = stdscr.getch(); action = global_key_ext(key)
+        try:
+            data = []
+            for line in reversed(ACTIVITY.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]):
+                try: data.append(json.loads(line))
+                except Exception: pass
+        except Exception:
+            data = []
+        sel = min(sel, max(0, len(data)-1)); h, _ = stdscr.getmaxyx(); rows = max(1, h-7); start = max(0, sel-rows+1) if sel >= rows else 0
+        header(stdscr, state, "Fleet Activity", f"{len(data)} recent local event(s)")
+        for pos, row in enumerate(data[start:start+rows]):
+            stamp = time.strftime("%H:%M:%S", time.localtime(number(row.get("ts"), 0)))
+            safe(stdscr, 4+pos, 1, f"{pos+1 if pos<9 else ' ':>1} {stamp:8} {str(row.get('host','?'))[:16]:16} {str(row.get('event',''))[:22]:22} {str(row.get('detail',''))[:50]}", curses.A_REVERSE if start+pos == sel else 0)
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
         if action: return action
-        if key in (27, curses.KEY_BACKSPACE, 127): return "main"
-        selected, _ = mod.list_select_key(key, selected, len(rows), start, visible)
+        if is_back(key): return "main"
+        sel, _ = list_nav(key, sel, len(data), start, rows)
 
 
-def responsive_app(raw_stdscr):
-    global ROOT_WINDOW, APP_STATE
-    curses.curs_set(0)
-    raw_stdscr.keypad(True)
-    raw_stdscr.timeout(50)
-    state = {
-        "devices": [], "discovered": [], "selected": 0,
-        "last_refresh": 0.0, "last_discovery": 0.0,
-        "force_refresh": True, "seen_sudo": set(),
-        "_discovery_future": None, "_refresh_future": None,
-        "_action_future": None, "_action_title": "",
-        "_data_generation": 0,
-        "last_activity": time.monotonic(),
-        "idle_seconds": IDLE_SECONDS,
-    }
-    ROOT_WINDOW, APP_STATE = raw_stdscr, state
-    stdscr = InputWindow(raw_stdscr, state)
-    screen = "main"
+def updates_screen(stdscr, state):
+    opts = ["Selected Pi: LGHS update", "All online Pis: LGHS update", "Selected Pi: OS update", "All online Pis: OS update"]
+    sel = 0
     while True:
-        maybe_lock(stdscr, state)
-        refresh_state_async(state, state.pop("force_refresh", False))
-        mod.maybe_popup_new_sudo(stdscr, state)
+        harvest_action(stdscr, state); devices = refresh_cache(state); selected = devices[state.get("selected",0)] if devices else None
+        header(stdscr, state, "Updates", f"Selected: {hostname(selected) if selected else 'none'} | commands use SSH; browsing does not")
+        for i, x in enumerate(opts): safe(stdscr, 3+i, 4, f"{i+1}. {x}", curses.A_REVERSE if i == sel else 0)
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action: return action
+        if is_back(key): return "main"
+        if key in (curses.KEY_DOWN, ord('j')): sel = min(3, sel+1)
+        elif key in (curses.KEY_UP, ord('k')): sel = max(0, sel-1)
+        elif ord('1') <= key <= ord('4'): sel = key-ord('1'); key = 10
+        if key in (10,13) and state.get("future") is None:
+            all_targets = sel in (1,3); osup = sel in (2,3)
+            targets = [d for d in devices if d.get("online")] if all_targets else ([selected] if selected and selected.get("online") else [])
+            if not targets: popup(stdscr, state, "Updates", "No eligible online Pi."); continue
+            if not confirm(stdscr, state, f"Run {'OS' if osup else 'LGHS'} update on {len(targets)} Pi(s)?"): continue
+            remote = "sudo -n /usr/local/sbin/lghs-os-update" if osup else "sudo -n /usr/local/sbin/lghs-update"
+            def multi():
+                parts = []
+                for d in targets:
+                    p = mod.ssh_capture(d["addr"], remote)
+                    parts.append(f"{hostname(d)}: {'OK' if p.returncode == 0 else 'FAILED'}\n{p.stdout}{p.stderr}")
+                return subprocess.CompletedProcess([], 0, "\n\n".join(parts), "")
+            state["future_title"] = "Fleet update"; state["future"] = workers.submit(multi)
+
+
+def logs_screen(stdscr, state):
+    opts = ["Fleet sudo command log", "Fleet sudo approval audit", "LGHS update history", "Raspberry Pi OS update history", "Selected Pi live logs (SSH)"]
+    paths = [Path('/var/log/lghs-fleet/sudo.log'), Path('/var/log/lghs-fleet/audit.jsonl'), Path('/var/log/lghs-fleet/update.log'), Path('/var/log/lghs-fleet/os-update.log')]
+    sel = 0
+    while True:
+        harvest_action(stdscr, state); header(stdscr, state, "Audit & logs", "Controller copies are local; only live Pi logs use SSH.")
+        for i,x in enumerate(opts): safe(stdscr,3+i,4,f"{i+1}. {x}",curses.A_REVERSE if i==sel else 0)
+        stdscr.refresh(); key=read_key(stdscr,state); action=global_action(key)
+        if action:return action
+        if is_back(key):return "main"
+        if key in (curses.KEY_DOWN,ord('j')):sel=min(4,sel+1)
+        elif key in (curses.KEY_UP,ord('k')):sel=max(0,sel-1)
+        elif ord('1')<=key<=ord('5'):sel=key-ord('1');key=10
+        if key in (10,13):
+            if sel<4:
+                try:text='\n'.join(paths[sel].read_text(encoding='utf-8',errors='replace').splitlines()[-180:])
+                except Exception as exc:text=str(exc)
+                popup(stdscr,state,opts[sel],text or 'No entries.')
+            else:
+                devices=refresh_cache(state);d=devices[state.get('selected',0)] if devices else None
+                if d and state.get('future') is None:start_action(state,f"Live logs - {hostname(d)}",d,"sudo -n /usr/local/sbin/lghs-report logs all")
+                else:popup(stdscr,state,"Logs","No selected Pi.")
+
+
+def controller_screen(stdscr, state):
+    services = ["lghs-fleet-api.service", "lghs-fleet-notify.service", "lghs-audit-sync.timer", "lghs-update.timer", "lghs-reconcile.timer"]
+    last_check = 0.0; statuses = {}
+    while True:
+        now = time.monotonic()
+        if now - last_check >= 2.0:
+            for name in services:
+                p = subprocess.run(["systemctl", "is-active", name], text=True, capture_output=True)
+                statuses[name] = p.stdout.strip() or "unknown"
+            last_check = now
+        header(stdscr, state, "Controller status", "Local service state only; refreshed every 2 seconds.")
+        for i, name in enumerate(services): safe(stdscr,3+i,4,f"{name:30} {statuses.get(name,'checking...')}")
+        safe(stdscr,10,4,f"Fleet cache: {CACHE} | {'present' if CACHE.exists() else 'missing'}")
+        stdscr.refresh(); key=read_key(stdscr,state); action=global_action(key)
+        if action:return action
+        if is_back(key):return "main"
+
+
+def app(stdscr):
+    curses.curs_set(0)
+    curses.set_escdelay(250)
+    stdscr.keypad(True)
+    stdscr.timeout(50)
+    state = {
+        "devices": [], "selected": 0, "menu_selected": 0,
+        "cache_loaded": 0.0, "generation": 0,
+        "future": None, "future_title": "",
+        "last_activity": time.monotonic(), "idle_seconds": IDLE_SECONDS,
+        "notified_sudo": set(), "sudo_popup_active": False,
+        "traffic_samples": {}, "down_bps": 0.0, "up_bps": 0.0,
+    }
+    screen = "main"
+    while screen != "quit":
+        refresh_cache(state)
+        maybe_auto_sudo(stdscr, state)
         if screen == "main": screen = main_menu(stdscr, state)
-        elif screen == "fleet": screen = fleet_screen_fast(stdscr, state)
+        elif screen == "fleet": screen = fleet_screen(stdscr, state, False)
+        elif screen == "telemetry": screen = fleet_screen(stdscr, state, True)
+        elif screen == "sudo": screen = sudo_screen(stdscr, state)
+        elif screen == "updates": screen = updates_screen(stdscr, state)
+        elif screen == "logs": screen = logs_screen(stdscr, state)
         elif screen == "attention": screen = attention_screen(stdscr, state)
         elif screen == "activity": screen = activity_screen(stdscr, state)
-        elif screen == "telemetry": screen = mod.telemetry_screen(stdscr, state)
-        elif screen == "sudo": screen = mod.sudo_screen(stdscr, state)
-        elif screen == "updates": screen = mod.update_screen(stdscr, state)
-        elif screen == "logs": screen = mod.logs_screen(stdscr, state)
-        elif screen == "controller": screen = mod.controller_screen(stdscr, state)
-        elif screen == "help": mod.help_popup(stdscr); screen = "main"
-        elif screen == "quit": break
+        elif screen == "controller": screen = controller_screen(stdscr, state)
         else: screen = "main"
 
 
 if __name__ == "__main__":
     mod.ensure_root()
     mod.ensure_dirs()
-    if not os.path.exists(BASE):
-        raise SystemExit(f"Missing Fleet Console base: {BASE}")
     try:
-        curses.wrapper(responsive_app)
+        curses.wrapper(app)
     finally:
         workers.shutdown(wait=False, cancel_futures=True)
