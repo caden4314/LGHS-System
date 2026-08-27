@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
+
+CLOUDFLARED=/usr/local/bin/cloudflared
+TOKEN_FILE=/etc/cloudflared/token
+SERVICE_FILE=/etc/systemd/system/lghs-cloudflared.service
+
+install_cloudflared() {
+  if [[ -x "$CLOUDFLARED" ]]; then
+    return 0
+  fi
+  local arch url tmp
+  arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  case "$arch" in
+    arm64|aarch64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+    amd64|x86_64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+    *) echo "Unsupported architecture for cloudflared: $arch" >&2; exit 2 ;;
+  esac
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+  curl -fsSL "$url" -o "$tmp"
+  chmod 0755 "$tmp"
+  install -m 0755 "$tmp" "$CLOUDFLARED"
+}
+
+if [[ "${1:-}" == "--disable" ]]; then
+  systemctl disable --now lghs-cloudflared.service 2>/dev/null || true
+  rm -f "$TOKEN_FILE"
+  exit 0
+fi
+
+# Tunnel token is intentionally accepted only on stdin so it does not appear
+# in argv, process listings, shell history, or logs.
+IFS= read -r TOKEN || true
+[[ -n "$TOKEN" ]] || { echo "Tunnel token must be provided on stdin" >&2; exit 2; }
+
+install_cloudflared
+install -d -m 0700 /etc/cloudflared
+printf '%s' "$TOKEN" > "$TOKEN_FILE"
+chown root:root "$TOKEN_FILE"
+chmod 0600 "$TOKEN_FILE"
+unset TOKEN
+
+cat > "$SERVICE_FILE" <<'EOF'
+[Unit]
+Description=LGHS Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/token
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/cloudflared/token
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now lghs-cloudflared.service
+
+for _ in $(seq 1 15); do
+  if journalctl -u lghs-cloudflared.service --since '-30 seconds' --no-pager 2>/dev/null | grep -q 'Registered tunnel connection'; then
+    echo "LGHS Cloudflare tunnel connected."
+    exit 0
+  fi
+  sleep 1
+done
+
+systemctl status lghs-cloudflared.service --no-pager >&2 || true
+echo "cloudflared service started but no registered connection was observed yet" >&2
+exit 1

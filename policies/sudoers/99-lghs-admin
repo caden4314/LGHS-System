@@ -1,0 +1,21 @@
+Defaults:cs_admin timestamp_timeout=5
+
+# Keep normal interactive administrator sudo password-protected.
+cs_admin ALL=(ALL:ALL) PASSWD: ALL
+
+# Fleet automation must be non-interactive. These command-specific rules are
+# intentionally loaded from 99-lghs-admin so older/bootstrap PASSWD: ALL rules
+# cannot override them after a reboot.
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-report *
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-update
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-os-update
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-os-update --reboot
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-check
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-enforce
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-export *
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-sync
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-cloudflare-install
+cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
+cs_admin ALL=(root) NOPASSWD: /usr/sbin/poweroff
+cs_admin ALL=(root) NOPASSWD: /usr/sbin/shutdown

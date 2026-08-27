@@ -9,3 +9,7 @@ lg_cs_cont ALL=(ALL:ALL) PASSWD: ALL
 # broad local Root-password fallback above also matches them.
 lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-broker *
 lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-approved-exec *
+
+# Fleet provisioning is performed by the controller as cs_admin. The tunnel
+# token is sent on stdin by lghs-cloudflare-provision and never appears in argv.
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-cloudflare-install

@@ -5,13 +5,14 @@ import shutil
 import subprocess
 from pathlib import Path
 
-SERVICE = '_lghs._tcp'
 SSH_USER = 'cs_admin'
 KEY_FILE = '/etc/lghs/secrets/controller_ed25519'
 KNOWN_HOSTS = '/var/lib/lghs/ssh_known_hosts'
 CONTROL_DIR = '/run/lghs-ssh'
 BASE = Path('/var/log/lghs-fleet')
 STATE = Path('/var/lib/lghs/audit-sync-state.json')
+REGISTRY = Path('/etc/lghs/fleet.json')
+CLOUDFLARED = shutil.which('cloudflared') or '/usr/local/bin/cloudflared'
 KINDS = ('sudo', 'audit', 'update', 'os-update')
 
 
@@ -25,40 +26,53 @@ def ensure_dirs():
     Path(CONTROL_DIR).mkdir(parents=True, exist_ok=True)
 
 
+def load_registry():
+    try:
+        data = json.loads(REGISTRY.read_text(encoding='utf-8'))
+        devices = data.get('devices', {})
+        if not isinstance(devices, dict):
+            return {}
+        return devices
+    except Exception:
+        return {}
+
+
 def discover():
-    if not shutil.which('avahi-browse'):
-        return []
-    p = run(['avahi-browse', '-rtp', SERVICE])
-    out, seen = [], set()
-    for line in p.stdout.splitlines():
-        if not line.startswith('='):
+    out = []
+    for device, meta in sorted(load_registry().items()):
+        host = meta.get('ssh_host')
+        if not host:
             continue
-        f = line.split(';')
-        if len(f) < 9 or f[4] != SERVICE:
-            continue
-        addr = f[7]
-        if addr in seen:
-            continue
-        seen.add(addr)
-        out.append({'name': f[3], 'host': f[6], 'addr': addr})
+        out.append({
+            'device_id': device,
+            'name': device,
+            'host': host,
+            'addr': host,
+            'transport': meta.get('transport', 'cloudflare'),
+        })
     return out
 
 
-def ssh_args(addr):
-    return [
+def ssh_args(dev):
+    host = dev['host']
+    args = [
         'ssh', '-i', KEY_FILE, '-o', 'IdentitiesOnly=yes',
         '-o', f'UserKnownHostsFile={KNOWN_HOSTS}', '-o', 'StrictHostKeyChecking=yes',
         '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
         '-o', 'BatchMode=yes', '-o', 'ForwardAgent=no', '-o', 'ForwardX11=no',
-        '-o', 'ClearAllForwardings=yes', '-o', 'ConnectTimeout=3',
+        '-o', 'ClearAllForwardings=yes', '-o', 'ConnectTimeout=10',
         '-o', 'ControlMaster=auto', '-o', 'ControlPersist=90',
-        '-o', f'ControlPath={CONTROL_DIR}/%C', f'{SSH_USER}@{addr}'
+        '-o', f'ControlPath={CONTROL_DIR}/%C'
     ]
+    if dev.get('transport') == 'cloudflare':
+        args += ['-o', f'ProxyCommand={CLOUDFLARED} access ssh --hostname %h']
+    args.append(f'{SSH_USER}@{host}')
+    return args
 
 
-def remote(addr, *args):
+def remote(dev, *args):
     cmd = 'sudo -n /usr/local/sbin/lghs-audit-export ' + ' '.join(args)
-    return run(ssh_args(addr) + [cmd])
+    return run(ssh_args(dev) + [cmd])
 
 
 def load_state():
@@ -74,12 +88,6 @@ def save_state(state):
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     os.chmod(tmp, 0o600)
     os.replace(tmp, STATE)
-
-
-def device_id(addr):
-    p = run(ssh_args(addr) + ["sed -n 's/^DEVICE_ID=//p' /etc/lghs/device.conf | head -n1 || hostname"])
-    value = (p.stdout or '').strip().splitlines()
-    return value[0] if value else addr.replace(':', '_')
 
 
 def append_lines(path, text, prefix=None):
@@ -98,10 +106,10 @@ def append_lines(path, text, prefix=None):
 
 
 def sync_kind(state, dev, kind):
-    addr, did = dev['addr'], dev['device_id']
+    did = dev['device_id']
     key = f'{did}:{kind}'
     old = state.get(key, {'offset': 0, 'inode': 0})
-    meta_p = remote(addr, 'meta', kind)
+    meta_p = remote(dev, 'meta', kind)
     if meta_p.returncode != 0:
         return
     try:
@@ -118,7 +126,7 @@ def sync_kind(state, dev, kind):
         state[key] = {'offset': size, 'inode': inode}
         return
 
-    read_p = remote(addr, 'read', kind, str(offset))
+    read_p = remote(dev, 'read', kind, str(offset))
     if read_p.returncode != 0:
         return
     text = read_p.stdout or ''
@@ -134,10 +142,8 @@ def main():
     ensure_dirs()
     state = load_state()
     for dev in discover():
-        # Collection only starts after explicit host-key enrollment.
-        if run(['ssh-keygen', '-F', dev['addr'], '-f', KNOWN_HOSTS]).returncode != 0:
+        if run(['ssh-keygen', '-F', dev['host'], '-f', KNOWN_HOSTS]).returncode != 0:
             continue
-        dev['device_id'] = device_id(dev['addr'])
         for kind in KINDS:
             sync_kind(state, dev, kind)
     save_state(state)

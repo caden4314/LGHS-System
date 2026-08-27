@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Tunnel transport shim for the existing LGHS console engine.
+
+The console UI/telemetry/sudo workflows stay unchanged, but device discovery
+and SSH transport come from /etc/lghs/fleet.json. Registered students are
+reached through their Cloudflare SSH hostname using cloudflared access ssh.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+LEGACY = "/usr/local/libexec/lghs-console-legacy"
+REGISTRY_FILE = Path("/etc/lghs/fleet.json")
+CLOUDFLARED = shutil.which("cloudflared") or "/usr/local/bin/cloudflared"
+
+
+def load_legacy():
+    loader = importlib.machinery.SourceFileLoader("lghs_console_legacy", LEGACY)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+legacy = load_legacy()
+_original_enroll = legacy.enroll
+_original_discover = legacy.discover_devices
+
+
+def load_registry():
+    try:
+        data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
+        devices = data.get("devices", {})
+        return devices if isinstance(devices, dict) else {}
+    except Exception:
+        return {}
+
+
+def target_meta(target):
+    devices = load_registry()
+    key = str(target).upper()
+    if key in devices:
+        meta = dict(devices[key])
+        meta["device"] = key
+        meta["host"] = meta.get("ssh_host") or target
+        meta["cloudflare"] = meta.get("transport", "cloudflare") == "cloudflare"
+        return meta
+    for name, raw in devices.items():
+        if str(target) == raw.get("ssh_host"):
+            meta = dict(raw)
+            meta["device"] = name
+            meta["host"] = target
+            meta["cloudflare"] = meta.get("transport", "cloudflare") == "cloudflare"
+            return meta
+    return {"device": str(target), "host": str(target), "cloudflare": False, "transport": "direct"}
+
+
+def discover_devices():
+    """Registry is authoritative. Local discovery is only a fallback if empty."""
+    devices = load_registry()
+    if devices:
+        out = []
+        for name, meta in sorted(devices.items()):
+            host = meta.get("ssh_host") or name
+            out.append({
+                "name": name,
+                "host": host,
+                "addr": name,
+                "port": "22",
+                "transport": meta.get("transport", "cloudflare"),
+            })
+        return out
+    return _original_discover()
+
+
+def trusted_host(target):
+    return target_meta(target)["host"]
+
+
+def enrolled(target):
+    legacy.ensure_dirs()
+    return subprocess.run(
+        ["ssh-keygen", "-F", trusted_host(target), "-f", legacy.KNOWN_HOSTS],
+        text=True,
+        capture_output=True,
+    ).returncode == 0
+
+
+def ssh_args(target, batch=True):
+    legacy.ensure_dirs()
+    meta = target_meta(target)
+    host = meta["host"]
+    args = [
+        "ssh", "-i", legacy.KEY_FILE,
+        "-o", "IdentitiesOnly=yes",
+        "-o", f"UserKnownHostsFile={legacy.KNOWN_HOSTS}",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "ForwardAgent=no",
+        "-o", "ForwardX11=no",
+        "-o", "ClearAllForwardings=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=2",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=90",
+        "-o", f"ControlPath={legacy.CONTROL_DIR}/%C",
+    ]
+    if meta.get("cloudflare"):
+        if not os.path.exists(CLOUDFLARED) and not shutil.which("cloudflared"):
+            raise RuntimeError("cloudflared is not installed on the controller")
+        args += ["-o", f"ProxyCommand={CLOUDFLARED} access ssh --hostname %h"]
+    if batch:
+        args += ["-o", "BatchMode=yes"]
+    args.append(f"{legacy.SSH_USER}@{host}")
+    return args
+
+
+def enroll(target):
+    meta = target_meta(target)
+    if not meta.get("cloudflare"):
+        return _original_enroll(target)
+    if not enrolled(target):
+        return False
+    p = subprocess.run(ssh_args(target) + ["true"], text=True, capture_output=True)
+    return p.returncode == 0
+
+
+# Patch the legacy engine's globals. Functions such as fetch_one(),
+# resolve_sudo(), run_remote_action(), and refresh_fleet() resolve these names
+# at call time, so all console operations inherit the tunnel transport.
+legacy.discover_devices = discover_devices
+legacy.enrolled = enrolled
+legacy.enroll = enroll
+legacy.ssh_args = ssh_args
+
+# Re-export the complete legacy console API. The responsive launcher uses more
+# than just refresh_fleet(), so keeping the shim API-compatible avoids coupling
+# it to one particular console revision.
+for _name in dir(legacy):
+    if _name.startswith("__"):
+        continue
+    if _name not in globals():
+        globals()[_name] = getattr(legacy, _name)
+
+# Explicit exports used by fleet-notify and other controller components.
+refresh_fleet = legacy.refresh_fleet
+ssh_capture = legacy.ssh_capture
+parse_kv = legacy.parse_kv
+
+
+def main():
+    """Run the legacy curses application through the patched tunnel transport."""
+    legacy.ensure_root()
+    legacy.ensure_dirs()
+    legacy.curses.wrapper(legacy.app)
+
+
+if __name__ == "__main__":
+    main()

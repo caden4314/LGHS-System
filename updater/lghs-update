@@ -45,10 +45,16 @@ fi
 
 cd "$CHECKOUT"
 git remote set-url origin "$REPO_URL"
-if ! GIT_TERMINAL_PROMPT=0 git fetch --prune origin "$BRANCH"; then
+
+# Always materialize the requested branch as origin/<branch>. A checkout that
+# was originally cloned as main may have a single-branch fetch refspec, so
+# `git fetch origin "$BRANCH"` can populate FETCH_HEAD without creating the
+# remote-tracking ref that the updater later resolves.
+if ! GIT_TERMINAL_PROMPT=0 git fetch --prune origin \
+    "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"; then
     if queue_for_network "fetch failed; deferring update."; then exit 0; else exit 75; fi
 fi
-TARGET_COMMIT="$(git rev-parse "origin/$BRANCH")"
+TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/$BRANCH^{commit}")"
 
 if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
     git reset --hard "$TARGET_COMMIT" >/dev/null
