@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""LGHS Fleet Console v2: cache-first UI, background actions, idle lock."""
+import curses
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+BASE = "/usr/local/libexec/lghs-console-base"
+CACHE = Path("/var/lib/lghs/fleet-cache.json")
+REGISTRY = Path("/etc/lghs/fleet.json")
+ACTIVITY = Path("/var/log/lghs-fleet/activity.jsonl")
+IDLE_SECONDS = max(30, int(os.environ.get("LGHS_CONSOLE_IDLE_SECONDS", "300")))
+STALE_SECONDS = float(os.environ.get("LGHS_FLEET_STALE_SECONDS", "15"))
+workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lghs-ui")
+
+
+def load_base():
+    loader = importlib.machinery.SourceFileLoader("lghs_console_base_v2", BASE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+mod = load_base()
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def hostname(d):
+    return str(d.get("hostname") or d.get("device_id") or d.get("host") or d.get("addr") or "?")
+
+
+def num(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def health(d):
+    if not d.get("online"):
+        return "OFFLINE"
+    keys = ["update_timer", "reconcile_timer"]
+    if d.get("role") == "student":
+        keys += ["agent", "policy", "ssh", "networkmanager"]
+    bad = [k for k in keys if d.get(k) not in (None, "active")]
+    return "CHECK" if bad else "OK"
+
+
+def fmt_bytes(value):
+    n = num(value, -1)
+    if n < 0:
+        return "?"
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.0f}P"
+
+
+def load_devices():
+    now = time.time()
+    cache = read_json(CACHE, {"devices": {}})
+    registry = read_json(REGISTRY, {"devices": {}})
+    reports = cache.get("devices", {}) if isinstance(cache, dict) else {}
+    enrolled = registry.get("devices", {}) if isinstance(registry, dict) else {}
+    out = []
+    names = set(enrolled) | set(reports)
+    for name in sorted(names):
+        entry = enrolled.get(name, {}) if isinstance(enrolled.get(name, {}), dict) else {}
+        report = reports.get(name, {}) if isinstance(reports.get(name, {}), dict) else {}
+        d = dict(report)
+        d.setdefault("device_id", name)
+        d.setdefault("hostname", name)
+        d.setdefault("host", name)
+        d["addr"] = entry.get("ssh_host") or d.get("addr") or name
+        received = num(d.get("received_at"), 0)
+        d["online"] = bool(received and now - received <= STALE_SECONDS)
+        d["cache_age"] = max(0.0, now - received) if received else None
+        d.setdefault("sudo_requests", [])
+        out.append(d)
+    return sorted(out, key=lambda d: (not d.get("online"), hostname(d).lower()))
+
+
+def recent_activity(limit=200):
+    try:
+        rows = []
+        for line in reversed(ACTIVITY.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]):
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+        return rows
+    except Exception:
+        return []
+
+
+def issues(devices):
+    rows = []
+    for d in devices:
+        if not d.get("online"):
+            rows.append((d, "CRITICAL", "OFFLINE", f"cache age {d.get('cache_age') if d.get('cache_age') is not None else '?'}s"))
+            continue
+        temp = num(d.get("temp_c"), -1)
+        disk = num(d.get("disk_pct"), -1)
+        if temp >= 85:
+            rows.append((d, "CRITICAL", "TEMP", f"{temp:.1f}C"))
+        elif temp >= 80:
+            rows.append((d, "WARNING", "TEMP", f"{temp:.1f}C"))
+        if disk >= 96:
+            rows.append((d, "CRITICAL", "DISK", f"{disk:.0f}%"))
+        elif disk >= 90:
+            rows.append((d, "WARNING", "DISK", f"{disk:.0f}%"))
+        if d.get("student_sudo") == "yes":
+            rows.append((d, "CRITICAL", "SECURITY", "student account in sudo"))
+        for key, label in (("ssh", "SSH"), ("policy", "POLICY"), ("update_timer", "UPDATE"), ("reconcile_timer", "RECONCILE")):
+            value = d.get(key)
+            if value and value != "active":
+                rows.append((d, "CRITICAL" if key in ("ssh", "policy") else "WARNING", label, value))
+    return sorted(rows, key=lambda r: (r[1] != "CRITICAL", hostname(r[0]), r[2]))
+
+
+def safe(win, y, x, text, attr=0):
+    mod.safe_add(win, y, x, text, attr)
+
+
+def header(stdscr, title, subtitle=""):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    safe(stdscr, 0, 0, f" LGHS CONTROL | {title} ".ljust(max(1, w - 1)), curses.A_REVERSE | curses.A_BOLD)
+    if subtitle:
+        safe(stdscr, 1, 1, subtitle)
+    safe(stdscr, h - 2, 1, "F2 Fleet F3 Telemetry F4 Sudo F5 Updates F6 Logs F7 Attention F8 Activity F10 Quit", curses.A_DIM)
+    safe(stdscr, h - 1, 1, "Arrows move | Enter select | 1-9 quick select | Backspace/B back | R reload cache", curses.A_DIM)
+
+
+def validate_password(password):
+    if not password:
+        return False
+    try:
+        p = subprocess.run(["sudo", "-u", "cs_admin", "sudo", "-S", "-k", "-p", "", "-v"], input=password + "\n", text=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def lock(stdscr, state):
+    raw = stdscr
+    raw.timeout(-1)
+    error = ""
+    while True:
+        raw.erase(); h, w = raw.getmaxyx()
+        safe(raw, max(1, h // 2 - 3), max(1, w // 2 - 12), "LGHS FLEET LOCKED", curses.A_REVERSE | curses.A_BOLD)
+        safe(raw, max(2, h // 2 - 1), max(1, w // 2 - 18), "Fleet console locked due to inactivity")
+        safe(raw, max(3, h // 2 + 1), max(1, w // 2 - 18), "cs_admin password:")
+        if error:
+            safe(raw, max(4, h // 2 + 3), max(1, w // 2 - 18), error, curses.A_BOLD)
+        raw.refresh()
+        chars = []
+        while True:
+            key = raw.getch()
+            if key in (10, 13): break
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                if chars: chars.pop()
+            elif 32 <= key <= 126 and len(chars) < 128:
+                chars.append(chr(key))
+            safe(raw, max(3, h // 2 + 1), max(1, w // 2 + 1), "*" * len(chars) + " " * 20)
+            raw.refresh()
+        if validate_password("".join(chars)):
+            state["last_activity"] = time.monotonic(); raw.timeout(50); raw.erase(); return
+        error = "Incorrect password"
+
+
+def getkey(stdscr, state):
+    if time.monotonic() - state["last_activity"] >= state["idle_seconds"]:
+        lock(stdscr, state)
+    key = stdscr.getch()
+    if key == 27:
+        # Never treat a raw ESC byte as navigation. Arrow/function keys use ESC
+        # prefixes on many terminals; swallowing a bare ESC prevents random back-outs.
+        return -1
+    if key != -1:
+        state["last_activity"] = time.monotonic()
+    return key
+
+
+def global_action(key):
+    return {curses.KEY_F2: "fleet", curses.KEY_F3: "telemetry", curses.KEY_F4: "sudo",
+            curses.KEY_F5: "updates", curses.KEY_F6: "logs", curses.KEY_F7: "attention",
+            curses.KEY_F8: "activity", curses.KEY_F10: "quit"}.get(key)
+
+
+def back_key(key):
+    return key in (curses.KEY_BACKSPACE, 127, ord("b"), ord("B"))
+
+
+def popup(stdscr, state, title, text):
+    lines = str(text).splitlines() or [""]
+    off = 0
+    while True:
+        header(stdscr, title)
+        h, _ = stdscr.getmaxyx(); visible = max(1, h - 6)
+        for i, line in enumerate(lines[off:off + visible]): safe(stdscr, 3 + i, 2, line)
+        stdscr.refresh(); key = getkey(stdscr, state)
+        if key in (10, 13) or back_key(key): return
+        if key in (curses.KEY_DOWN, ord("j")): off = min(max(0, len(lines) - visible), off + 1)
+        elif key in (curses.KEY_UP, ord("k")): off = max(0, off - 1)
+
+
+def confirm(stdscr, state, text):
+    while True:
+        header(stdscr, "Confirm", text)
+        safe(stdscr, 4, 4, "Y Yes    N No", curses.A_BOLD); stdscr.refresh()
+        key = getkey(stdscr, state)
+        if key in (ord("y"), ord("Y")): return True
+        if key in (ord("n"), ord("N")) or back_key(key): return False
+
+
+def run_action(state, title, fn, *args):
+    if state.get("future") is not None: return False
+    state["future_title"] = title
+    state["future"] = workers.submit(fn, *args)
+    return True
+
+
+def harvest_action(stdscr, state):
+    future = state.get("future")
+    if future is None or not future.done(): return
+    title = state.get("future_title", "Action")
+    try:
+        result = future.result()
+        if hasattr(result, "returncode"):
+            body = (result.stdout or "") + (("\n" + result.stderr) if result.stderr else "")
+            if not body.strip(): body = f"Exit code {result.returncode}"
+        else:
+            body = str(result)
+    except Exception as exc:
+        body = f"Action failed: {exc}"
+    state["future"] = None; state["future_title"] = ""
+    popup(stdscr, state, title, body.strip())
+
+
+def cached_state(state, force=False):
+    now = time.monotonic()
+    if force or now - state.get("cache_loaded", 0) >= 0.5:
+        state["devices"] = load_devices(); state["cache_loaded"] = now
+        state["generation"] += 1
+    return state["devices"]
+
+
+def list_nav(key, selected, count, start, rows):
+    if key in (curses.KEY_DOWN, ord("j")) and count: selected = min(count - 1, selected + 1)
+    elif key in (curses.KEY_UP, ord("k")) and count: selected = max(0, selected - 1)
+    elif ord("1") <= key <= ord("9"):
+        idx = start + key - ord("1")
+        if idx < min(count, start + rows): return idx, True
+    elif key in (10, 13) and count: return selected, True
+    return selected, False
+
+
+def main_menu(stdscr, state):
+    items = [("Fleet overview", "fleet"), ("Needs Attention", "attention"), ("Fleet Activity", "activity"),
+             ("Telemetry", "telemetry"), ("Sudo requests", "sudo"), ("Updates", "updates"),
+             ("Audit & logs", "logs"), ("Controller status", "controller")]
+    sel = 0
+    while True:
+        devices = cached_state(state); problem = issues(devices); pending = sum(len(d.get("sudo_requests", [])) for d in devices)
+        header(stdscr, "Main menu", f"{sum(bool(d.get('online')) for d in devices)}/{len(devices)} online | {len(problem)} issue(s) | {pending} sudo")
+        for i, (name, _) in enumerate(items): safe(stdscr, 3 + i, 4, f"{i+1}. {name}", curses.A_REVERSE | curses.A_BOLD if i == sel else 0)
+        stdscr.refresh(); key = getkey(stdscr, state); action = global_action(key)
+        if action: return action
+        if key in (ord("q"), ord("Q")): return "quit"
+        if key in (curses.KEY_DOWN, ord("j")): sel = min(len(items)-1, sel+1)
+        elif key in (curses.KEY_UP, ord("k")): sel = max(0, sel-1)
+        elif ord("1") <= key <= ord("8"): return items[key-ord("1")][1]
+        elif key in (10, 13): return items[sel][1]
+
+
+def fleet_screen(stdscr, state, telemetry=False):
+    sel = min(state.get("selected", 0), max(0, len(state["devices"])-1))
+    while True:
+        devices = cached_state(state); rows_data = sorted(devices, key=lambda d: (not d.get("online"), -num(d.get("cpu_pct")))) if telemetry else devices
+        sel = min(sel, max(0, len(rows_data)-1)); h, _ = stdscr.getmaxyx(); rows = max(1, h-7); start = max(0, sel-rows+1) if sel >= rows else 0
+        title = "Telemetry" if telemetry else "Fleet"
+        header(stdscr, title, "Local controller cache; opening this screen does not contact any Pi.")
+        if telemetry:
+            safe(stdscr, 3, 1, "#  DEVICE           STATE    CPU     RAM     DISK    TEMP    RX       TX", curses.A_BOLD | curses.A_UNDERLINE)
+        else:
+            safe(stdscr, 3, 1, "#  DEVICE           STATE    VER      CPU     RAM     TEMP    CACHE", curses.A_BOLD | curses.A_UNDERLINE)
+        for pos, d in enumerate(rows_data[start:start+rows]):
+            idx = start + pos; host = hostname(d); attr = curses.A_REVERSE if idx == sel else 0
+            if telemetry:
+                line = f"{pos+1 if pos<9 else ' ':>1}  {host[:16]:16} {health(d):8} {str(d.get('cpu_pct','?'))+'%':7} {str(d.get('mem_pct','?'))+'%':7} {str(d.get('disk_pct','?'))+'%':7} {str(d.get('temp_c','?'))+'C':7} {fmt_bytes(d.get('rx_bytes')):8} {fmt_bytes(d.get('tx_bytes')):8}"
+            else:
+                age = "--" if d.get("cache_age") is None else f"{d['cache_age']:.1f}s"
+                line = f"{pos+1 if pos<9 else ' ':>1}  {host[:16]:16} {health(d):8} {str(d.get('version','?'))[:8]:8} {str(d.get('cpu_pct','?'))+'%':7} {str(d.get('mem_pct','?'))+'%':7} {str(d.get('temp_c','?'))+'C':7} {age:7}"
+            safe(stdscr, 4+pos, 1, line, attr)
+        stdscr.refresh(); key = getkey(stdscr, state); action = global_action(key)
+        if action: state["selected"] = sel; return action
+        if back_key(key): state["selected"] = sel; return "main"
+        if key in (ord("r"), ord("R")): cached_state(state, True); continue
+        sel, opened = list_nav(key, sel, len(rows_data), start, rows)
+        if opened and rows_data:
+            state["selected"] = next((i for i,d in enumerate(devices) if d.get("device_id") == rows_data[sel].get("device_id")), 0)
+            nxt = device_menu(stdscr, state, rows_data[sel])
+            if nxt != "fleet": return nxt
+
+
+def device_menu(stdscr, state, original):
+    actions = ["Cached summary", "Cached telemetry", "Pending sudo requests", "Live logs (SSH)", "Force LGHS update",
+               "Force Raspberry Pi OS update", "Validate + re-apply policy", "Open SSH session", "Reboot Pi"]
+    sel = 0; device_id = original.get("device_id")
+    while True:
+        harvest_action(stdscr, state); devices = cached_state(state)
+        d = next((x for x in devices if x.get("device_id") == device_id), original); host = hostname(d)
+        busy = state.get("future") is not None
+        header(stdscr, f"Pi menu - {host}", f"{health(d)} | cache age {d.get('cache_age','?')} | {'WORKING: '+state.get('future_title','') if busy else 'cached data'}")
+        for i, name in enumerate(actions): safe(stdscr, 3+i, 4, f"{i+1}. {name}", curses.A_REVERSE if i == sel else 0)
+        stdscr.refresh(); key = getkey(stdscr, state); action = global_action(key)
+        if action: return action
+        if back_key(key): return "fleet"
+        if key in (curses.KEY_DOWN, ord("j")): sel = min(8, sel+1)
+        elif key in (curses.KEY_UP, ord("k")): sel = max(0, sel-1)
+        elif ord("1") <= key <= ord("9"): sel = key-ord("1"); key = 10
+        if key not in (10,13): continue
+        n = sel+1
+        if n == 1: popup(stdscr, state, f"Cached summary - {host}", "\n".join(f"{k}={v}" for k,v in sorted(d.items()) if k != "sudo_requests"))
+        elif n == 2: popup(stdscr, state, f"Cached telemetry - {host}", f"CPU {d.get('cpu_pct','?')}%\nRAM {d.get('mem_pct','?')}%\nDisk {d.get('disk_pct','?')}%\nTemp {d.get('temp_c','?')}C\nRX {fmt_bytes(d.get('rx_bytes'))}\nTX {fmt_bytes(d.get('tx_bytes'))}")
+        elif n == 3: sudo_for_device(stdscr, state, d)
+        elif n == 4 and not busy: run_action(state, f"Logs - {host}", mod.ssh_capture, d["addr"], "sudo -n /usr/local/sbin/lghs-report logs all")
+        elif n == 5 and not busy and confirm(stdscr, state, f"Force LGHS update on {host}?"): run_action(state, f"LGHS update - {host}", mod.ssh_capture, d["addr"], "sudo -n /usr/local/sbin/lghs-update")
+        elif n == 6 and not busy and confirm(stdscr, state, f"Run OS update on {host}?"): run_action(state, f"OS update - {host}", mod.ssh_capture, d["addr"], "sudo -n /usr/local/sbin/lghs-os-update")
+        elif n == 7 and not busy: run_action(state, f"Validation - {host}", mod.ssh_capture, d["addr"], "sudo -n /usr/local/sbin/lghs-enforce && sudo -n /usr/local/sbin/lghs-check")
+        elif n == 8:
+            curses.endwin(); subprocess.call(mod.ssh_args(d["addr"], batch=False)); stdscr.refresh(); curses.curs_set(0); state["last_activity"] = time.monotonic()
+        elif n == 9 and not busy and confirm(stdscr, state, f"Reboot {host}?"): run_action(state, f"Reboot - {host}", mod.ssh_capture, d["addr"], "sudo -n /usr/sbin/reboot")
+
+
+def sudo_for_device(stdscr, state, d):
+    reqs = d.get("sudo_requests", [])
+    if not reqs: popup(stdscr, state, "Sudo", "No pending requests for this Pi."); return
+    for req in reqs:
+        rid = req.get("id", ""); command = req.get("command", "")
+        header(stdscr, "Sudo request", f"{hostname(d)} requests: {command}")
+        safe(stdscr, 4, 4, "Y approve once | N deny | B leave pending", curses.A_BOLD); stdscr.refresh()
+        while True:
+            key = getkey(stdscr, state)
+            if key in (ord("y"), ord("Y"), ord("n"), ord("N")):
+                decision = "approve" if key in (ord("y"), ord("Y")) else "deny"
+                run_action(state, f"Sudo {decision} - {hostname(d)}", mod.ssh_capture, d["addr"], f"sudo -n /usr/local/sbin/lghs-sudo-admin {decision} {rid}")
+                return
+            if back_key(key): return
+
+
+def sudo_screen(stdscr, state):
+    sel = 0
+    while True:
+        devices = cached_state(state); queue = [(d,r) for d in devices for r in d.get("sudo_requests", [])]
+        sel = min(sel, max(0, len(queue)-1)); h,_=stdscr.getmaxyx(); rows=max(1,h-7); start=max(0,sel-rows+1) if sel>=rows else 0
+        header(stdscr, "Sudo requests", f"{len(queue)} cached pending request(s)")
+        for pos,(d,r) in enumerate(queue[start:start+rows]): safe(stdscr,4+pos,1,f"{pos+1 if pos<9 else ' ':>1}  {hostname(d)[:16]:16} {str(r.get('requester','?'))[:12]:12} {str(r.get('command',''))[:70]}",curses.A_REVERSE if start+pos==sel else 0)
+        if not queue: safe(stdscr,5,3,"No pending sudo requests.")
+        stdscr.refresh(); key=getkey(stdscr,state); action=global_action(key)
+        if action:return action
+        if back_key(key):return "main"
+        sel,opened=list_nav(key,sel,len(queue),start,rows)
+        if opened and queue:sudo_for_device(stdscr,state,queue[sel][0])
+
+
+def attention_screen(stdscr,state):
+    sel=0
+    while True:
+        rows_data=issues(cached_state(state)); sel=min(sel,max(0,len(rows_data)-1)); h,_=stdscr.getmaxyx(); rows=max(1,h-7); start=max(0,sel-rows+1) if sel>=rows else 0
+        header(stdscr,"Needs Attention",f"{len(rows_data)} cached issue(s)")
+        for pos,(d,sev,kind,detail) in enumerate(rows_data[start:start+rows]):safe(stdscr,4+pos,1,f"{pos+1 if pos<9 else ' ':>1} {sev:8} {hostname(d)[:16]:16} {kind:12} {detail}",curses.A_REVERSE if start+pos==sel else 0)
+        if not rows_data:safe(stdscr,5,3,"All cached Pis look healthy.")
+        stdscr.refresh();key=getkey(stdscr,state);action=global_action(key)
+        if action:return action
+        if back_key(key):return "main"
+        sel,opened=list_nav(key,sel,len(rows_data),start,rows)
+        if opened and rows_data:
+            nxt=device_menu(stdscr,state,rows_data[sel][0])
+            if nxt!="fleet":return nxt
+
+
+def activity_screen(stdscr,state):
+    sel=0
+    while True:
+        rows_data=recent_activity();sel=min(sel,max(0,len(rows_data)-1));h,_=stdscr.getmaxyx();rows=max(1,h-7);start=max(0,sel-rows+1) if sel>=rows else 0
+        header(stdscr,"Fleet Activity",f"{len(rows_data)} recent local event(s)")
+        for pos,row in enumerate(rows_data[start:start+rows]):
+            stamp=time.strftime("%H:%M:%S",time.localtime(num(row.get("ts"),0)));safe(stdscr,4+pos,1,f"{pos+1 if pos<9 else ' ':>1} {stamp:8} {str(row.get('host','?'))[:16]:16} {str(row.get('event',''))[:22]:22} {str(row.get('detail',''))[:50]}",curses.A_REVERSE if start+pos==sel else 0)
+        stdscr.refresh();key=getkey(stdscr,state);action=global_action(key)
+        if action:return action
+        if back_key(key):return "main"
+        sel,_=list_nav(key,sel,len(rows_data),start,rows)
+
+
+def updates_screen(stdscr,state):
+    opts=["Selected Pi: LGHS update","All online Pis: LGHS update","Selected Pi: OS update","All online Pis: OS update"]
+    sel=0
+    while True:
+        harvest_action(stdscr,state);devices=cached_state(state);selected=devices[state.get("selected",0)] if devices else None
+        header(stdscr,"Updates",f"Selected: {hostname(selected) if selected else 'none'} | commands use SSH; browsing does not")
+        for i,x in enumerate(opts):safe(stdscr,3+i,4,f"{i+1}. {x}",curses.A_REVERSE if i==sel else 0)
+        stdscr.refresh();key=getkey(stdscr,state);action=global_action(key)
+        if action:return action
+        if back_key(key):return "main"
+        if key in (curses.KEY_DOWN,ord('j')):sel=min(len(opts)-1,sel+1)
+        elif key in (curses.KEY_UP,ord('k')):sel=max(0,sel-1)
+        elif ord('1')<=key<=ord('4'):sel=key-ord('1');key=10
+        if key in (10,13) and state.get("future") is None:
+            all_targets=sel in (1,3);osup=sel in (2,3);targets=[d for d in devices if d.get("online")] if all_targets else ([selected] if selected and selected.get("online") else [])
+            if not targets:popup(stdscr,state,"Updates","No eligible online Pi.");continue
+            if not confirm(stdscr,state,f"Run {'OS' if osup else 'LGHS'} update on {len(targets)} Pi(s)?"):continue
+            remote="sudo -n /usr/local/sbin/lghs-os-update" if osup else "sudo -n /usr/local/sbin/lghs-update"
+            def multi():
+                parts=[]
+                for d in targets:
+                    p=mod.ssh_capture(d["addr"],remote);parts.append(f"{hostname(d)}: {'OK' if p.returncode==0 else 'FAILED'}\n{p.stdout}{p.stderr}")
+                return "\n\n".join(parts)
+            run_action(state,"Fleet update",multi)
+
+
+def logs_screen(stdscr,state):
+    opts=["Fleet sudo command log","Fleet sudo approval audit","LGHS update history","Raspberry Pi OS update history","Selected Pi live logs (SSH)"]
+    sel=0
+    paths=[Path('/var/log/lghs-fleet/sudo.log'),Path('/var/log/lghs-fleet/audit.jsonl'),Path('/var/log/lghs-fleet/update.log'),Path('/var/log/lghs-fleet/os-update.log')]
+    while True:
+        harvest_action(stdscr,state);header(stdscr,"Audit & logs","Controller copies are local; only live Pi logs use SSH.")
+        for i,x in enumerate(opts):safe(stdscr,3+i,4,f"{i+1}. {x}",curses.A_REVERSE if i==sel else 0)
+        stdscr.refresh();key=getkey(stdscr,state);action=global_action(key)
+        if action:return action
+        if back_key(key):return "main"
+        if key in (curses.KEY_DOWN,ord('j')):sel=min(4,sel+1)
+        elif key in (curses.KEY_UP,ord('k')):sel=max(0,sel-1)
+        elif ord('1')<=key<=ord('5'):sel=key-ord('1');key=10
+        if key in (10,13):
+            if sel<4:
+                try:text='\n'.join(paths[sel].read_text(encoding='utf-8',errors='replace').splitlines()[-180:])
+                except Exception as exc:text=str(exc)
+                popup(stdscr,state,opts[sel],text or 'No entries.')
+            else:
+                devices=cached_state(state);d=devices[state.get('selected',0)] if devices else None
+                if d and state.get('future') is None:run_action(state,f"Live logs - {hostname(d)}",mod.ssh_capture,d['addr'],"sudo -n /usr/local/sbin/lghs-report logs all")
+                else:popup(stdscr,state,"Logs","No selected Pi.")
+
+
+def controller_screen(stdscr,state):
+    services=["lghs-fleet-api.service","lghs-fleet-notify.service","lghs-audit-sync.timer","lghs-update.timer","lghs-reconcile.timer"]
+    while True:
+        header(stdscr,"Controller status","Local service state only.")
+        for i,name in enumerate(services):
+            p=subprocess.run(["systemctl","is-active",name],text=True,capture_output=True);safe(stdscr,3+i,4,f"{name:30} {(p.stdout.strip() or 'unknown')}")
+        safe(stdscr,10,4,f"Fleet cache: {CACHE} | {'present' if CACHE.exists() else 'missing'}")
+        stdscr.refresh();key=getkey(stdscr,state);action=global_action(key)
+        if action:return action
+        if back_key(key):return "main"
+
+
+def app(stdscr):
+    curses.curs_set(0); curses.set_escdelay(250); stdscr.keypad(True); stdscr.timeout(50)
+    state={"devices":[],"selected":0,"cache_loaded":0.0,"generation":0,"future":None,"future_title":"","last_activity":time.monotonic(),"idle_seconds":IDLE_SECONDS}
+    screen="main"
+    while screen!="quit":
+        cached_state(state)
+        if screen=="main":screen=main_menu(stdscr,state)
+        elif screen=="fleet":screen=fleet_screen(stdscr,state,False)
+        elif screen=="telemetry":screen=fleet_screen(stdscr,state,True)
+        elif screen=="sudo":screen=sudo_screen(stdscr,state)
+        elif screen=="updates":screen=updates_screen(stdscr,state)
+        elif screen=="logs":screen=logs_screen(stdscr,state)
+        elif screen=="attention":screen=attention_screen(stdscr,state)
+        elif screen=="activity":screen=activity_screen(stdscr,state)
+        elif screen=="controller":screen=controller_screen(stdscr,state)
+        else:screen="main"
+
+
+if __name__=="__main__":
+    mod.ensure_root();mod.ensure_dirs()
+    try:curses.wrapper(app)
+    finally:workers.shutdown(wait=False,cancel_futures=True)
