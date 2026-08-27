@@ -82,6 +82,13 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.service" /etc/systemd/system/lghs-audit-sync.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.timer" /etc/systemd/system/lghs-audit-sync.timer
 
+  # HTTPS telemetry data plane. The API is local-only; Cloudflare ingress is
+  # configured separately by lghs-fleet-api-cloudflare when credentials exist.
+  install -m 0755 "$ROOT_DIR/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
+  install -m 0755 "$ROOT_DIR/controller/lghs-fleet-api-cloudflare" /usr/local/sbin/lghs-fleet-api-cloudflare
+  install -m 0755 "$ROOT_DIR/controller/lghs-fleet-api-provision" /usr/local/sbin/lghs-fleet-api-provision
+  install -m 0644 "$ROOT_DIR/systemd/lghs-fleet-api.service" /etc/systemd/system/lghs-fleet-api.service
+
   # The registry is authoritative once devices are enrolled. Never overwrite an
   # existing registry during update/reconcile.
   if [[ ! -f /etc/lghs/fleet.json ]]; then
@@ -129,6 +136,9 @@ else
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-cloudflare-install" /usr/local/sbin/lghs-cloudflare-install
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-telemetry-configure" /usr/local/sbin/lghs-telemetry-configure
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-telemetry-push" /usr/local/sbin/lghs-telemetry-push
+  install -m 0644 "$ROOT_DIR/systemd/lghs-telemetry-push.service" /etc/systemd/system/lghs-telemetry-push.service
   install -m 0755 "$ROOT_DIR/student/sudo" /usr/local/bin/sudo
   install -d -m 0700 /var/lib/lghs/sudo-requests
   touch /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log /var/log/lghs-update.log /var/log/lghs-os-update.log
@@ -180,11 +190,16 @@ systemctl enable --now avahi-daemon.service
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
   systemctl enable --now lghs-policy.service lghs-agent.service ssh.service
+  systemctl enable lghs-telemetry-push.service
+  # Conditions on the telemetry unit keep it inactive until URL/token
+  # provisioning is complete; once provisioned it starts automatically.
+  systemctl try-restart lghs-telemetry-push.service >/dev/null 2>&1 || true
   systemctl restart lghs-policy.service lghs-agent.service
   systemctl try-restart ssh.service >/dev/null 2>&1 || true
 else
-  systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service
+  systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service lghs-fleet-api.service
   systemctl try-restart lghs-fleet-notify.service
+  systemctl try-restart lghs-fleet-api.service
 fi
 
 systemctl enable lghs-install-success-notify.service
