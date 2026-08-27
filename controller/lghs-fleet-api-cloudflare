@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API = "https://api.cloudflare.com/client/v4"
+TOKEN_FILE = Path("/etc/lghs/secrets/cloudflare-api-token")
+CF_CONF = Path("/etc/lghs/cloudflare.conf")
+API_CONF = Path("/etc/lghs/fleet-api.conf")
+
+
+def conf():
+    out = {}
+    for raw in CF_CONF.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if raw and not raw.startswith("#") and "=" in raw:
+            k, v = raw.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def call(token, method, path, body=None):
+    data = None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(API + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.load(exc)
+        except Exception:
+            payload = {"success": False, "errors": [{"message": str(exc)}]}
+    if not payload.get("success"):
+        raise RuntimeError(payload.get("errors"))
+    return payload.get("result")
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("Run with sudo")
+    cfg = conf()
+    account = cfg.get("ACCOUNT_ID")
+    zone = cfg.get("ZONE", "scenicrouteservers.com")
+    tunnel = cfg.get("CONTROLLER_TUNNEL_ID")
+    hostname = cfg.get("FLEET_API_HOST", f"fleet-api.{zone}")
+    if not account or not tunnel:
+        raise SystemExit("Set ACCOUNT_ID and CONTROLLER_TUNNEL_ID in /etc/lghs/cloudflare.conf")
+    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+
+    zones = call(token, "GET", "/zones?" + urllib.parse.urlencode({"name": zone}))
+    if not zones:
+        raise RuntimeError(f"Zone not found: {zone}")
+    zone_id = zones[0]["id"]
+
+    current = call(token, "GET", f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations") or {}
+    config = current.get("config") if isinstance(current, dict) else None
+    if not isinstance(config, dict):
+        config = {}
+    ingress = list(config.get("ingress") or [])
+    fallback = [x for x in ingress if not x.get("hostname")]
+    named = [x for x in ingress if x.get("hostname") and x.get("hostname") != hostname]
+    named.append({"hostname": hostname, "service": "http://127.0.0.1:8789"})
+    config["ingress"] = named + (fallback or [{"service": "http_status:404"}])
+    call(token, "PUT", f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations", {"config": config})
+
+    records = call(token, "GET", f"/zones/{zone_id}/dns_records?" + urllib.parse.urlencode({"type": "CNAME", "name": hostname}))
+    record = {"type": "CNAME", "name": hostname, "content": f"{tunnel}.cfargotunnel.com", "proxied": True}
+    if records:
+        call(token, "PUT", f"/zones/{zone_id}/dns_records/{records[0]['id']}", record)
+    else:
+        call(token, "POST", f"/zones/{zone_id}/dns_records", record)
+
+    API_CONF.parent.mkdir(parents=True, exist_ok=True)
+    API_CONF.write_text(f"URL=https://{hostname}\n", encoding="utf-8")
+    os.chmod(API_CONF, 0o640)
+    print(f"READY https://{hostname} -> http://127.0.0.1:8789")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=os.sys.stderr)
+        raise SystemExit(1)
