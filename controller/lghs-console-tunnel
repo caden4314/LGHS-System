@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Tunnel transport shim for the existing LGHS console engine.
+"""Cloudflare control-plane + HTTPS cache data-plane shim for LGHS Console.
 
-The console UI/telemetry/sudo workflows stay unchanged, but device discovery
-and SSH transport come from /etc/lghs/fleet.json. Registered students are
-reached through their Cloudflare SSH hostname using cloudflared access ssh.
+Normal console browsing reads /var/lib/lghs/fleet-cache.json and never polls
+student Pis over SSH. Explicit control actions (sudo decisions, updates, logs,
+reboot, shell) still use the registered Cloudflare SSH transport.
 """
 import importlib.machinery
 import importlib.util
@@ -11,11 +11,14 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 LEGACY = "/usr/local/libexec/lghs-console-legacy"
 REGISTRY_FILE = Path("/etc/lghs/fleet.json")
+CACHE_FILE = Path("/var/lib/lghs/fleet-cache.json")
 CLOUDFLARED = shutil.which("cloudflared") or "/usr/local/bin/cloudflared"
+STALE_SECONDS = float(os.environ.get("LGHS_FLEET_STALE_SECONDS", "15"))
 
 
 def load_legacy():
@@ -31,13 +34,24 @@ _original_enroll = legacy.enroll
 _original_discover = legacy.discover_devices
 
 
-def load_registry():
+def load_json(path, default):
     try:
-        data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
-        devices = data.get("devices", {})
-        return devices if isinstance(devices, dict) else {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value
     except Exception:
-        return {}
+        return default
+
+
+def load_registry():
+    data = load_json(REGISTRY_FILE, {})
+    devices = data.get("devices", {}) if isinstance(data, dict) else {}
+    return devices if isinstance(devices, dict) else {}
+
+
+def load_cache():
+    data = load_json(CACHE_FILE, {})
+    devices = data.get("devices", {}) if isinstance(data, dict) else {}
+    return devices if isinstance(devices, dict) else {}
 
 
 def target_meta(target):
@@ -60,7 +74,7 @@ def target_meta(target):
 
 
 def discover_devices():
-    """Registry is authoritative. Local discovery is only a fallback if empty."""
+    """Registry is authoritative. Avahi is only a bootstrap/recovery fallback."""
     devices = load_registry()
     if devices:
         out = []
@@ -69,12 +83,56 @@ def discover_devices():
             out.append({
                 "name": name,
                 "host": host,
+                # Keep addr as the logical device ID. ssh_args() resolves it
+                # through the registry to the Cloudflare hostname.
                 "addr": name,
                 "port": "22",
                 "transport": meta.get("transport", "cloudflare"),
             })
         return out
     return _original_discover()
+
+
+def refresh_fleet(discovered):
+    """Build the fleet view entirely from the controller's HTTPS telemetry cache."""
+    now = time.time()
+    reports = load_cache()
+    registry = load_registry()
+    by_name = {}
+
+    for item in discovered or []:
+        name = str(item.get("name") or item.get("addr") or item.get("host") or "").upper()
+        if name:
+            by_name[name] = dict(item)
+
+    # A cached device should remain visible even if discovery/registry is being
+    # repaired. Registry metadata is still preferred for control transport.
+    names = set(by_name) | set(reports) | set(registry)
+    out = []
+    for name in sorted(names):
+        base = dict(by_name.get(name, {}))
+        meta = registry.get(name, {}) if isinstance(registry.get(name, {}), dict) else {}
+        report = reports.get(name, {}) if isinstance(reports.get(name, {}), dict) else {}
+        d = dict(base)
+        d.update(report)
+        d.setdefault("name", name)
+        d.setdefault("hostname", name)
+        d.setdefault("host", meta.get("ssh_host") or name)
+        d["addr"] = name
+        d["transport"] = meta.get("transport", d.get("transport", "cloudflare"))
+        d.setdefault("sudo_requests", [])
+        try:
+            received = float(d.get("received_at") or 0)
+        except Exception:
+            received = 0.0
+        d["online"] = bool(received and now - received <= STALE_SECONDS)
+        d["cache_age"] = max(0.0, now - received) if received else None
+        out.append(d)
+
+    return sorted(out, key=lambda d: (
+        not d.get("online", False),
+        (d.get("hostname") or d.get("host") or d.get("addr", "")).lower(),
+    ))
 
 
 def trusted_host(target):
@@ -131,31 +189,28 @@ def enroll(target):
     return p.returncode == 0
 
 
-# Patch the legacy engine's globals. Functions such as fetch_one(),
-# resolve_sudo(), run_remote_action(), and refresh_fleet() resolve these names
-# at call time, so all console operations inherit the tunnel transport.
+# Patch the legacy engine's globals. Explicit remote actions resolve these names
+# at call time, while refresh_fleet() above keeps normal browsing cache-only.
 legacy.discover_devices = discover_devices
 legacy.enrolled = enrolled
 legacy.enroll = enroll
 legacy.ssh_args = ssh_args
+legacy.refresh_fleet = refresh_fleet
 
 # Re-export the complete legacy console API. The responsive launcher uses more
-# than just refresh_fleet(), so keeping the shim API-compatible avoids coupling
-# it to one particular console revision.
+# than refresh_fleet(), and this keeps the shim compatible with that UI.
 for _name in dir(legacy):
     if _name.startswith("__"):
         continue
     if _name not in globals():
         globals()[_name] = getattr(legacy, _name)
 
-# Explicit exports used by fleet-notify and other controller components.
-refresh_fleet = legacy.refresh_fleet
+# Explicit exports used by responsive console and controller components.
 ssh_capture = legacy.ssh_capture
 parse_kv = legacy.parse_kv
 
 
 def main():
-    """Run the legacy curses application through the patched tunnel transport."""
     legacy.ensure_root()
     legacy.ensure_dirs()
     legacy.curses.wrapper(legacy.app)
