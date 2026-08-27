@@ -3,11 +3,16 @@ set -euo pipefail
 
 ROLE="${1:-}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ADMIN_GROUP=lghs-admin
 
 if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo ./install.sh <controller|student>" >&2; exit 1; fi
 if [[ "$ROLE" != "controller" && "$ROLE" != "student" ]]; then echo "Usage: sudo ./install.sh <controller|student>" >&2; exit 2; fi
 
-install -d -m 0755 /opt/lghs /etc/lghs /var/lib/lghs /var/lib/lghs/update
+# Create the management group before copying any management binaries. Student
+# systems therefore never have a reconcile/install window where lghs-* tools
+# are world-executable before lghs-access-enforce runs.
+getent group "$ADMIN_GROUP" >/dev/null 2>&1 || groupadd --system "$ADMIN_GROUP"
+install -d -o root -g "$ADMIN_GROUP" -m 0750 /opt/lghs /etc/lghs /var/lib/lghs /var/lib/lghs/update
 install -d -m 0700 /etc/lghs/secrets /var/lib/lghs/netqueue /var/lib/lghs/netqueue/jobs
 printf '%s\n' "$ROLE" > /etc/lghs/role
 printf '%s\n' "$(cat "$ROOT_DIR/VERSION")" > /etc/lghs/version
@@ -20,16 +25,16 @@ if [[ -n "$SOURCE_COMMIT" && "$SOURCE_COMMIT" != "unknown" ]]; then
   printf '%s\n' "$SOURCE_COMMIT" > /var/lib/lghs/update/current-commit
 fi
 
-install -m 0755 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
-install -m 0755 "$ROOT_DIR/updater/lghs-os-update" /usr/local/sbin/lghs-os-update
-install -m 0755 "$ROOT_DIR/updater/lghs-autologin-apply" /usr/local/sbin/lghs-autologin-apply
-install -m 0755 "$ROOT_DIR/updater/lghs-reconcile" /usr/local/sbin/lghs-reconcile
-install -m 0755 "$ROOT_DIR/updater/lghs-access-enforce" /usr/local/sbin/lghs-access-enforce
-install -m 0755 "$ROOT_DIR/updater/lghs-netqueue" /usr/local/sbin/lghs-netqueue
-install -m 0755 "$ROOT_DIR/updater/lghs-install-success-notify" /usr/local/sbin/lghs-install-success-notify
-install -m 0755 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
-install -m 0755 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
-install -m 0755 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/updater/lghs-update" /usr/local/sbin/lghs-update
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/updater/lghs-os-update" /usr/local/sbin/lghs-os-update
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/updater/lghs-autologin-apply" /usr/local/sbin/lghs-autologin-apply
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/updater/lghs-reconcile" /usr/local/sbin/lghs-reconcile
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/updater/lghs-access-enforce" /usr/local/sbin/lghs-access-enforce
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/updater/lghs-netqueue" /usr/local/sbin/lghs-netqueue
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/updater/lghs-install-success-notify" /usr/local/sbin/lghs-install-success-notify
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
+install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
 install -m 0644 "$ROOT_DIR/systemd/lghs-firstboot-provision.service" /etc/systemd/system/lghs-firstboot-provision.service
@@ -53,25 +58,15 @@ for pkg in "${COMMON_PKGS[@]}"; do dpkg-query -W -f='${Status}' "$pkg" 2>/dev/nu
 if (( ${#MISSING_PKGS[@]} )); then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"; fi
 
 if ! id cs_admin >/dev/null 2>&1; then useradd -m -s /bin/bash cs_admin; fi
-usermod -aG sudo cs_admin
+usermod -aG sudo,"$ADMIN_GROUP" cs_admin
 install -d -m 0700 -o cs_admin -g cs_admin /home/cs_admin/.ssh
-cat > /etc/sudoers.d/91-lghs-admin <<'EOF'
-Defaults:cs_admin timestamp_timeout=5
-cs_admin ALL=(ALL:ALL) ALL
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-report *
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-update
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-os-update
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-os-update --reboot
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-check
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-enforce
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-export *
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-sync
-cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
-cs_admin ALL=(root) NOPASSWD: /usr/sbin/poweroff
-cs_admin ALL=(root) NOPASSWD: /usr/sbin/shutdown
-EOF
-chmod 0440 /etc/sudoers.d/91-lghs-admin
+
+# One authoritative admin policy, loaded last. Remove historical/bootstrap files
+# so later PASSWD tags cannot override the command-specific fleet NOPASSWD rules.
+rm -f /etc/sudoers.d/88-lghs-fleet-admin \
+      /etc/sudoers.d/91-lghs-admin \
+      /etc/sudoers.d/91-lghs-bootstrap-admin
+install -m 0440 "$ROOT_DIR/policies/sudoers/99-lghs-admin" /etc/sudoers.d/99-lghs-admin
 
 if [[ "$ROLE" == "controller" ]]; then
   install -d -m 0755 /usr/local/libexec
@@ -123,17 +118,17 @@ if [[ "$ROLE" == "controller" ]]; then
 EOF
   chmod 0644 /etc/logrotate.d/lghs-fleet
 else
-  install -m 0755 "$ROOT_DIR/student/lghs-enforce" /usr/local/sbin/lghs-enforce
-  install -m 0755 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
-  install -m 0755 "$ROOT_DIR/student/lghs-agent" /usr/local/sbin/lghs-agent
-  install -m 0755 "$ROOT_DIR/student/lghs-network-ui-apply" /usr/local/sbin/lghs-network-ui-apply
-  install -m 0755 "$ROOT_DIR/student/lghs-install-network-ui" /usr/local/sbin/lghs-install-network-ui
-  install -m 0755 "$ROOT_DIR/student/lghs-sudo-broker" /usr/local/sbin/lghs-sudo-broker
-  install -m 0755 "$ROOT_DIR/student/lghs-approved-exec" /usr/local/sbin/lghs-approved-exec
-  install -m 0755 "$ROOT_DIR/student/lghs-local-exec" /usr/local/sbin/lghs-local-exec
-  install -m 0755 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
-  install -m 0755 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
-  install -m 0755 "$ROOT_DIR/student/lghs-cloudflare-install" /usr/local/sbin/lghs-cloudflare-install
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-enforce" /usr/local/sbin/lghs-enforce
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-agent" /usr/local/sbin/lghs-agent
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-network-ui-apply" /usr/local/sbin/lghs-network-ui-apply
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-install-network-ui" /usr/local/sbin/lghs-install-network-ui
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-broker" /usr/local/sbin/lghs-sudo-broker
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-approved-exec" /usr/local/sbin/lghs-approved-exec
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-local-exec" /usr/local/sbin/lghs-local-exec
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-cloudflare-install" /usr/local/sbin/lghs-cloudflare-install
   install -m 0755 "$ROOT_DIR/student/sudo" /usr/local/bin/sudo
   install -d -m 0700 /var/lib/lghs/sudo-requests
   touch /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log /var/log/lghs-update.log /var/log/lghs-os-update.log
