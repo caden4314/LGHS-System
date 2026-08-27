@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -13,6 +14,8 @@ KEY_FILE = "/etc/lghs/secrets/controller_ed25519"
 KNOWN_HOSTS = "/var/lib/lghs/ssh_known_hosts"
 CONTROL_DIR = "/run/lghs-ssh"
 FLEET_LOG_DIR = Path('/var/log/lghs-fleet')
+REGISTRY_FILE = Path('/etc/lghs/fleet.json')
+CLOUDFLARED = shutil.which('cloudflared') or '/usr/local/bin/cloudflared'
 
 
 def run(cmd):
@@ -26,176 +29,303 @@ def ensure_dirs():
         open(KNOWN_HOSTS, "a").close()
 
 
-def discover_devices():
+def load_registry():
+    if not REGISTRY_FILE.exists():
+        return {}
+    try:
+        data = json.loads(REGISTRY_FILE.read_text(encoding='utf-8'))
+        return data.get('devices', {})
+    except Exception as exc:
+        raise RuntimeError(f"Invalid {REGISTRY_FILE}: {exc}")
+
+
+def local_discover_devices():
     if not shutil.which("avahi-browse"):
-        raise RuntimeError("avahi-browse is not installed")
+        return []
     p = run(["avahi-browse", "-rtp", SERVICE])
     if p.returncode not in (0, 1):
-        raise RuntimeError(p.stderr.strip() or "avahi-browse failed")
+        return []
     devices, seen = [], set()
     for line in p.stdout.splitlines():
-        if not line.startswith("="): continue
+        if not line.startswith("="):
+            continue
         f = line.split(";")
-        if len(f) < 9 or f[4] != SERVICE: continue
+        if len(f) < 9 or f[4] != SERVICE:
+            continue
         key = (f[6], f[7])
-        if key in seen: continue
+        if key in seen:
+            continue
         seen.add(key)
-        devices.append({"name": f[3], "host": f[6], "addr": f[7], "port": f[8]})
+        devices.append({"name": f[3], "host": f[6], "addr": f[7], "port": f[8], "transport": "local"})
     return devices
+
+
+def discover_devices():
+    """Cloudflare registry is authoritative; Avahi is provisioning/recovery fallback."""
+    devices = []
+    registered = load_registry()
+    for name, meta in sorted(registered.items()):
+        devices.append({
+            "name": name,
+            "host": meta.get("ssh_host", ""),
+            "addr": meta.get("ssh_host", ""),
+            "port": "22",
+            "transport": meta.get("transport", "cloudflare"),
+        })
+    known = {d['name'].upper() for d in devices}
+    for d in local_discover_devices():
+        raw = d['name'].replace('LGHS ', '').upper()
+        if raw not in known:
+            devices.append(d)
+    return devices
+
+
+def target_meta(target):
+    devices = load_registry()
+    key = target.upper()
+    if key in devices:
+        meta = dict(devices[key])
+        meta['device'] = key
+        meta['host'] = meta.get('ssh_host') or target
+        meta['cloudflare'] = meta.get('transport') == 'cloudflare'
+        return meta
+    for name, meta0 in devices.items():
+        if target == meta0.get('ssh_host'):
+            meta = dict(meta0)
+            meta['device'] = name
+            meta['host'] = target
+            meta['cloudflare'] = meta.get('transport') == 'cloudflare'
+            return meta
+    return {'device': target, 'host': target, 'cloudflare': False, 'transport': 'direct'}
 
 
 def ssh_base(target, batch=True):
     ensure_dirs()
-    dest = target if "@" in target else f"{DEFAULT_USER}@{target}"
-    args = ["ssh","-i",KEY_FILE,"-o","IdentitiesOnly=yes","-o",f"UserKnownHostsFile={KNOWN_HOSTS}",
-            "-o","StrictHostKeyChecking=yes","-o","PasswordAuthentication=no","-o","KbdInteractiveAuthentication=no",
-            "-o","ForwardAgent=no","-o","ForwardX11=no","-o","ClearAllForwardings=yes","-o","ConnectTimeout=3",
-            "-o","ServerAliveInterval=15","-o","ServerAliveCountMax=2","-o","ControlMaster=auto","-o","ControlPersist=90",
-            "-o",f"ControlPath={CONTROL_DIR}/%C"]
-    if batch: args += ["-o", "BatchMode=yes"]
+    meta = target_meta(target)
+    host = meta['host']
+    dest = host if "@" in host else f"{DEFAULT_USER}@{host}"
+    args = [
+        "ssh", "-i", KEY_FILE,
+        "-o", "IdentitiesOnly=yes",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "ForwardAgent=no",
+        "-o", "ForwardX11=no",
+        "-o", "ClearAllForwardings=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=2",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=90",
+        "-o", f"ControlPath={CONTROL_DIR}/%C",
+    ]
+    if meta['cloudflare']:
+        if not os.path.exists(CLOUDFLARED) and not shutil.which('cloudflared'):
+            raise RuntimeError("cloudflared is not installed on the controller")
+        args += ["-o", f"ProxyCommand={CLOUDFLARED} access ssh --hostname %h"]
+    if batch:
+        args += ["-o", "BatchMode=yes"]
     args.append(dest)
     return args
 
 
+def trusted_host_for(target):
+    return target_meta(target)['host']
+
+
 def is_enrolled(target):
-    ensure_dirs(); return run(["ssh-keygen","-F",target,"-f",KNOWN_HOSTS]).returncode == 0
+    ensure_dirs()
+    return run(["ssh-keygen", "-F", trusted_host_for(target), "-f", KNOWN_HOSTS]).returncode == 0
 
 
 def enroll_one(target):
+    meta = target_meta(target)
+    if meta['cloudflare']:
+        if is_enrolled(target):
+            test = run(ssh_base(target) + ["true"])
+            return test.returncode == 0, "tunnel host trusted" if test.returncode == 0 else (test.stderr.strip() or "tunnel SSH failed")
+        return False, "Cloudflare host key is not enrolled; run lghs-cloudflare-provision from a trusted local provisioning network"
     ensure_dirs()
-    if is_enrolled(target): return True,"already enrolled"
-    p=run(["ssh-keyscan","-T","3","-t","ed25519",target])
-    if p.returncode != 0 or not p.stdout.strip(): return False,p.stderr.strip() or "no SSH host key returned"
-    with open(KNOWN_HOSTS,"a",encoding="utf-8") as f:f.write(p.stdout)
-    test=run(ssh_base(target)+["true"])
+    if is_enrolled(target):
+        return True, "already enrolled"
+    p = run(["ssh-keyscan", "-T", "3", "-t", "ed25519", target])
+    if p.returncode != 0 or not p.stdout.strip():
+        return False, p.stderr.strip() or "no SSH host key returned"
+    with open(KNOWN_HOSTS, "a", encoding="utf-8") as f:
+        f.write(p.stdout)
+    test = run(ssh_base(target) + ["true"])
     if test.returncode != 0:
-        run(["ssh-keygen","-R",target,"-f",KNOWN_HOSTS]);return False,test.stderr.strip() or "key authentication failed"
-    return True,"enrolled and key-authenticated"
+        run(["ssh-keygen", "-R", target, "-f", KNOWN_HOSTS])
+        return False, test.stderr.strip() or "key authentication failed"
+    return True, "enrolled and key-authenticated"
 
 
 def ensure_enrolled(target):
-    if is_enrolled(target): return True
-    ok,_=enroll_one(target);return ok
+    if is_enrolled(target):
+        return True
+    ok, _ = enroll_one(target)
+    return ok
 
 
 def ssh_capture(target, remote):
-    if not ensure_enrolled(target): return subprocess.CompletedProcess([],255,"","LGHS SSH enrollment failed")
-    return run(ssh_base(target)+[remote])
+    if not ensure_enrolled(target):
+        return subprocess.CompletedProcess([], 255, "", "LGHS SSH enrollment failed")
+    return run(ssh_base(target) + [remote])
 
 
 def ssh_cmd(target, remote):
-    p=ssh_capture(target,remote)
-    if p.stdout:print(p.stdout,end="")
-    if p.stderr:print(p.stderr,end="",file=sys.stderr)
+    p = ssh_capture(target, remote)
+    if p.stdout:
+        print(p.stdout, end="")
+    if p.stderr:
+        print(p.stderr, end="", file=sys.stderr)
     return p.returncode
 
 
 def targets_all():
-    try:return [d["addr"] for d in discover_devices()]
-    except RuntimeError as exc:print(str(exc),file=sys.stderr);return []
+    registry = load_registry()
+    if registry:
+        return sorted(registry.keys())
+    return [d["addr"] for d in local_discover_devices()]
 
 
-def run_parallel(targets,func):
-    with ThreadPoolExecutor(max_workers=min(8,max(1,len(targets)))) as pool:
-        fs={pool.submit(func,t):t for t in targets};return {fs[f]:f.result() for f in as_completed(fs)}
+def run_parallel(targets, func):
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(targets)))) as pool:
+        fs = {pool.submit(func, t): t for t in targets}
+        return {fs[f]: f.result() for f in as_completed(fs)}
 
 
-def remote_report(target,mode,extra=None):
-    cmd=f"sudo -n /usr/local/sbin/lghs-report {mode}"+(f" {extra}" if extra else "")
-    return ssh_capture(target,cmd)
+def remote_report(target, mode, extra=None):
+    cmd = f"sudo -n /usr/local/sbin/lghs-report {mode}" + (f" {extra}" if extra else "")
+    return ssh_capture(target, cmd)
 
 
 def fleet_status():
-    targets=targets_all()
-    if not targets:print("No LGHS devices discovered.");return 0
-    results=run_parallel(targets,lambda t:remote_report(t,"summary"));bad=0
-    print(f"{'HOSTNAME':16} {'IP':15} {'VER':8} {'CPU':6} {'RAM':6} {'DISK':6} {'TEMP':7} {'COMMIT':12} STATUS")
+    targets = targets_all()
+    if not targets:
+        print("No LGHS devices registered or discovered.")
+        return 0
+    results = run_parallel(targets, lambda t: remote_report(t, "summary"))
+    bad = 0
+    print(f"{'HOSTNAME':16} {'TRANSPORT':11} {'VER':8} {'CPU':6} {'RAM':6} {'DISK':6} {'TEMP':7} {'COMMIT':12} STATUS")
     for t in targets:
-        p=results[t]
+        p = results[t]
+        transport = target_meta(t).get('transport', 'direct')[:11]
         if p.returncode != 0:
-            print(f"{'?':16} {t:15} {'?':8} {'?':6} {'?':6} {'?':6} {'?':7} {'?':12} OFFLINE");bad+=1;continue
-        d=dict(line.split("=",1) for line in p.stdout.splitlines() if "=" in line)
-        svc=[d.get("update_timer"),d.get("reconcile_timer")]
-        if d.get("role")=="student":svc += [d.get("agent"),d.get("policy"),d.get("ssh")]
-        state="OK" if all(x=="active" for x in svc if x is not None) else "CHECK";bad += state!="OK"
-        print(f"{d.get('hostname','?')[:16]:16} {t:15} {d.get('version','?')[:8]:8} {d.get('cpu_pct','?')+'%':6} {d.get('mem_pct','?')+'%':6} {d.get('disk_pct','?')+'%':6} {d.get('temp_c','?')+'C':7} {d.get('commit','?')[:12]:12} {state}")
+            print(f"{t[:16]:16} {transport:11} {'?':8} {'?':6} {'?':6} {'?':6} {'?':7} {'?':12} OFFLINE")
+            if p.stderr:
+                print(f"  {p.stderr.strip()}", file=sys.stderr)
+            bad += 1
+            continue
+        d = dict(line.split("=", 1) for line in p.stdout.splitlines() if "=" in line)
+        svc = [d.get("update_timer"), d.get("reconcile_timer")]
+        if d.get("role") == "student":
+            svc += [d.get("agent"), d.get("policy"), d.get("ssh")]
+        state = "OK" if all(x == "active" for x in svc if x is not None) else "CHECK"
+        bad += state != "OK"
+        print(f"{d.get('hostname',t)[:16]:16} {transport:11} {d.get('version','?')[:8]:8} {d.get('cpu_pct','?')+'%':6} {d.get('mem_pct','?')+'%':6} {d.get('disk_pct','?')+'%':6} {d.get('temp_c','?')+'C':7} {d.get('commit','?')[:12]:12} {state}")
     return 1 if bad else 0
 
 
 def fleet_dump(mode):
-    targets=targets_all()
-    if not targets:print("No LGHS devices discovered.");return 0
-    results=run_parallel(targets,lambda t:remote_report(t,mode))
+    targets = targets_all()
+    if not targets:
+        print("No LGHS devices registered or discovered.")
+        return 0
+    results = run_parallel(targets, lambda t: remote_report(t, mode))
     for t in targets:
-        p=results[t];print(f"\n===== {t} =====");print((p.stdout if p.returncode==0 else p.stderr).rstrip())
+        p = results[t]
+        print(f"\n===== {t} ({target_meta(t).get('transport','direct')}) =====")
+        print((p.stdout if p.returncode == 0 else p.stderr).rstrip())
     return 0
 
 
-def run_fleet_command(targets,remote,label):
-    if not targets:print("No LGHS devices discovered.");return 0
-    results=run_parallel(targets,lambda t:ssh_capture(t,remote));failures=0
+def run_fleet_command(targets, remote, label):
+    if not targets:
+        print("No LGHS devices registered or discovered.")
+        return 0
+    results = run_parallel(targets, lambda t: ssh_capture(t, remote))
+    failures = 0
     for t in targets:
-        p=results[t];ok=p.returncode==0
+        p = results[t]
+        ok = p.returncode == 0
         print(f"\n===== {t} : {label} {'OK' if ok else 'FAILED'} =====")
-        if p.stdout:print(p.stdout.rstrip())
-        if p.stderr:print(p.stderr.rstrip(),file=sys.stderr)
+        if p.stdout:
+            print(p.stdout.rstrip())
+        if p.stderr:
+            print(p.stderr.rstrip(), file=sys.stderr)
         failures += not ok
     return 1 if failures else 0
 
 
 def enroll_all(targets):
-    if not targets:print("No LGHS devices discovered.");return 0
-    results=run_parallel(targets,enroll_one);bad=0
+    if not targets:
+        print("No LGHS devices registered or discovered.")
+        return 0
+    results = run_parallel(targets, enroll_one)
+    bad = 0
     for t in targets:
-        ok,msg=results[t];print(f"{t:16} {'OK' if ok else 'FAILED':7} {msg}");bad += not ok
+        ok, msg = results[t]
+        print(f"{t:20} {'OK' if ok else 'FAILED':7} {msg}")
+        bad += not ok
     return 1 if bad else 0
 
 
-def show_fleet_logs(kind,lines):
-    names={'sudo':'sudo.log','audit':'audit.jsonl','update':'update.log','os-update':'os-update.log'}
-    path=FLEET_LOG_DIR/names[kind]
+def show_fleet_logs(kind, lines):
+    names = {'sudo':'sudo.log','audit':'audit.jsonl','update':'update.log','os-update':'os-update.log'}
+    path = FLEET_LOG_DIR / names[kind]
     if not path.exists():
-        print(f"No centralized {kind} log exists yet. Run: sudo lghs-audit-sync");return 0
-    p=run(["tail","-n",str(lines),str(path)])
-    print(p.stdout,end="");return p.returncode
+        print(f"No centralized {kind} log exists yet. Run: sudo lghs-audit-sync")
+        return 0
+    p = run(["tail", "-n", str(lines), str(path)])
+    print(p.stdout, end="")
+    return p.returncode
 
 
 def main():
-    ap=argparse.ArgumentParser(prog="lghsctl",description="LGHS encrypted classroom fleet controller")
-    sub=ap.add_subparsers(dest="cmd",required=True)
-    for name in ("discover","status","versions","services","update-state","audit-sync"):sub.add_parser(name)
-    p=sub.add_parser("enroll");p.add_argument("target",nargs="?");p.add_argument("--all",action="store_true")
-    p=sub.add_parser("info");p.add_argument("target")
-    p=sub.add_parser("logs");p.add_argument("target");p.add_argument("group",nargs="?",default="all",choices=["all","update","agent","policy"])
-    p=sub.add_parser("fleet-logs");p.add_argument("kind",choices=["sudo","audit","update","os-update"]);p.add_argument("--lines",type=int,default=100)
-    p=sub.add_parser("update");p.add_argument("target",nargs="?");p.add_argument("--all",action="store_true")
-    p=sub.add_parser("os-update");p.add_argument("target",nargs="?");p.add_argument("--all",action="store_true");p.add_argument("--reboot",action="store_true")
-    for name in ("check","enforce","reboot","ssh"):
-        p=sub.add_parser(name);p.add_argument("target")
-    args=ap.parse_args()
+    ap = argparse.ArgumentParser(prog="lghsctl", description="LGHS encrypted classroom fleet controller")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("discover", "status", "versions", "services", "update-state", "audit-sync"):
+        sub.add_parser(name)
+    p = sub.add_parser("enroll"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true")
+    p = sub.add_parser("info"); p.add_argument("target")
+    p = sub.add_parser("logs"); p.add_argument("target"); p.add_argument("group", nargs="?", default="all", choices=["all","update","agent","policy"])
+    p = sub.add_parser("fleet-logs"); p.add_argument("kind", choices=["sudo","audit","update","os-update"]); p.add_argument("--lines", type=int, default=100)
+    p = sub.add_parser("update"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true")
+    p = sub.add_parser("os-update"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true"); p.add_argument("--reboot", action="store_true")
+    for name in ("check", "enforce", "reboot", "ssh"):
+        p = sub.add_parser(name); p.add_argument("target")
+    args = ap.parse_args()
 
-    if args.cmd=="discover":
-        for d in discover_devices():print(f"{d['name']:28} {d['host']:28} {d['addr']:16} {d['port']}")
+    if args.cmd == "discover":
+        for d in discover_devices():
+            print(f"{d['name']:28} {d['transport']:11} {d['host']:42} {d['port']}")
         return 0
-    if args.cmd=="status":return fleet_status()
-    if args.cmd=="versions":return fleet_dump("versions")
-    if args.cmd=="services":return fleet_dump("services")
-    if args.cmd=="update-state":return fleet_dump("update-state")
-    if args.cmd=="audit-sync":return subprocess.call(["sudo","-n","/usr/local/sbin/lghs-audit-sync"])
-    if args.cmd=="fleet-logs":return show_fleet_logs(args.kind,args.lines)
-    if args.cmd=="enroll":return enroll_all(targets_all() if args.all or not args.target else [args.target])
-    if args.cmd=="info":return ssh_cmd(args.target,"sudo -n /usr/local/sbin/lghs-report summary")
-    if args.cmd=="logs":return ssh_cmd(args.target,f"sudo -n /usr/local/sbin/lghs-report logs {args.group}")
-    if args.cmd=="update":return run_fleet_command(targets_all() if args.all or not args.target else [args.target],"sudo -n /usr/local/sbin/lghs-update","LGHS UPDATE")
-    if args.cmd=="os-update":
-        targets=targets_all() if args.all or not args.target else [args.target]
-        remote="sudo -n /usr/local/sbin/lghs-os-update"+(" --reboot" if args.reboot else "")
-        return run_fleet_command(targets,remote,"OS UPDATE")
-    if args.cmd=="check":return ssh_cmd(args.target,"sudo -n /usr/local/sbin/lghs-check")
-    if args.cmd=="enforce":return ssh_cmd(args.target,"sudo -n /usr/local/sbin/lghs-enforce")
-    if args.cmd=="reboot":return ssh_cmd(args.target,"sudo -n /usr/sbin/reboot")
-    if args.cmd=="ssh":
-        ensure_enrolled(args.target);return subprocess.call(ssh_base(args.target,batch=False))
+    if args.cmd == "status": return fleet_status()
+    if args.cmd == "versions": return fleet_dump("versions")
+    if args.cmd == "services": return fleet_dump("services")
+    if args.cmd == "update-state": return fleet_dump("update-state")
+    if args.cmd == "audit-sync": return subprocess.call(["sudo", "-n", "/usr/local/sbin/lghs-audit-sync"])
+    if args.cmd == "fleet-logs": return show_fleet_logs(args.kind, args.lines)
+    if args.cmd == "enroll": return enroll_all(targets_all() if args.all or not args.target else [args.target])
+    if args.cmd == "info": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-report summary")
+    if args.cmd == "logs": return ssh_cmd(args.target, f"sudo -n /usr/local/sbin/lghs-report logs {args.group}")
+    if args.cmd == "update": return run_fleet_command(targets_all() if args.all or not args.target else [args.target], "sudo -n /usr/local/sbin/lghs-update", "LGHS UPDATE")
+    if args.cmd == "os-update":
+        targets = targets_all() if args.all or not args.target else [args.target]
+        remote = "sudo -n /usr/local/sbin/lghs-os-update" + (" --reboot" if args.reboot else "")
+        return run_fleet_command(targets, remote, "OS UPDATE")
+    if args.cmd == "check": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-check")
+    if args.cmd == "enforce": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-enforce")
+    if args.cmd == "reboot": return ssh_cmd(args.target, "sudo -n /usr/sbin/reboot")
+    if args.cmd == "ssh":
+        if not ensure_enrolled(args.target):
+            return 255
+        return subprocess.call(ssh_base(args.target, batch=False))
     return 2
 
-if __name__=="__main__":raise SystemExit(main())
+
+if __name__ == "__main__":
+    raise SystemExit(main())
