@@ -2,7 +2,7 @@
 """Tunnel transport shim for the existing LGHS console engine.
 
 The console UI/telemetry/sudo workflows stay unchanged, but device discovery
-and SSH transport come from /etc/lghs/fleet.json.  Registered students are
+and SSH transport come from /etc/lghs/fleet.json. Registered students are
 reached through their Cloudflare SSH hostname using cloudflared access ssh.
 """
 import importlib.machinery
@@ -139,11 +139,26 @@ legacy.enrolled = enrolled
 legacy.enroll = enroll
 legacy.ssh_args = ssh_args
 
-# Export the API consumed by lghs-fleet-notify and the responsive console.
+# Re-export the complete legacy console API. The responsive launcher uses more
+# than just refresh_fleet(), so keeping the shim API-compatible avoids coupling
+# it to one particular console revision.
+for _name in dir(legacy):
+    if _name.startswith("__"):
+        continue
+    if _name not in globals():
+        globals()[_name] = getattr(legacy, _name)
+
+# Explicit exports used by fleet-notify and other controller components.
 refresh_fleet = legacy.refresh_fleet
 ssh_capture = legacy.ssh_capture
 parse_kv = legacy.parse_kv
-main = legacy.main
+
+
+def main():
+    """Run the legacy curses application through the patched tunnel transport."""
+    legacy.ensure_root()
+    legacy.ensure_dirs()
+    legacy.curses.wrapper(legacy.app)
 
 
 if __name__ == "__main__":
