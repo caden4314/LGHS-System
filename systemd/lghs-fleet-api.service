@@ -1,0 +1,20 @@
+[Unit]
+Description=LGHS Fleet Telemetry API
+After=network.target
+ConditionPathExists=/etc/lghs/role
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/lghs-fleet-api
+Restart=always
+RestartSec=2
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/lghs /etc/lghs
+
+[Install]
+WantedBy=multi-user.target
