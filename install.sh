@@ -77,13 +77,22 @@ if [[ "$ROLE" == "controller" ]]; then
   install -d -m 0755 /usr/local/libexec
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/libexec/lghsctl-real
   install -m 0755 "$ROOT_DIR/controller/lghsctl-wrapper" /usr/local/sbin/lghsctl
-  install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-base
+  install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-legacy
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-tunnel" /usr/local/libexec/lghs-console-base
   install -m 0755 "$ROOT_DIR/controller/lghs-console-responsive" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-notify" /usr/local/sbin/lghs-fleet-notify
+  install -m 0755 "$ROOT_DIR/controller/lghs-cloudflare-provision" /usr/local/sbin/lghs-cloudflare-provision
   install -m 0644 "$ROOT_DIR/systemd/lghs-fleet-notify.service" /etc/systemd/system/lghs-fleet-notify.service
   install -m 0755 "$ROOT_DIR/controller/lghs-audit-sync" /usr/local/sbin/lghs-audit-sync
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.service" /etc/systemd/system/lghs-audit-sync.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-audit-sync.timer" /etc/systemd/system/lghs-audit-sync.timer
+
+  # The registry is authoritative once devices are enrolled. Never overwrite an
+  # existing registry during update/reconcile.
+  if [[ ! -f /etc/lghs/fleet.json ]]; then
+    printf '%s\n' '{"version":1,"devices":{}}' > /etc/lghs/fleet.json
+    chmod 0644 /etc/lghs/fleet.json
+  fi
 
   CTRL_PKGS=(avahi-daemon avahi-utils)
   MISSING_PKGS=()
@@ -124,6 +133,7 @@ else
   install -m 0755 "$ROOT_DIR/student/lghs-local-exec" /usr/local/sbin/lghs-local-exec
   install -m 0755 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
   install -m 0755 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
+  install -m 0755 "$ROOT_DIR/student/lghs-cloudflare-install" /usr/local/sbin/lghs-cloudflare-install
   install -m 0755 "$ROOT_DIR/student/sudo" /usr/local/bin/sudo
   install -d -m 0700 /var/lib/lghs/sudo-requests
   touch /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log /var/log/lghs-update.log /var/log/lghs-os-update.log
@@ -145,9 +155,8 @@ else
   install -d -m 0755 /etc/ssh/sshd_config.d
   cat > /etc/ssh/sshd_config.d/90-lghs-fleet.conf <<'EOF'
 Match User cs_admin
-    AuthenticationMethods publickey
-    PasswordAuthentication no
-    KbdInteractiveAuthentication no
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication yes
     PubkeyAuthentication yes
     X11Forwarding no
     AllowAgentForwarding no
@@ -170,6 +179,8 @@ visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
 
 systemctl enable lghs-update.service lghs-firstboot-provision.service
+# Avahi remains available strictly for initial provisioning/recovery. Normal
+# controller operations use /etc/lghs/fleet.json and Cloudflare transport.
 systemctl enable --now avahi-daemon.service
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
