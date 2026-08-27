@@ -5,6 +5,7 @@ ConditionPathExists=/etc/lghs/role
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/lghs/update.env
 ExecStart=/usr/local/sbin/lghs-update
 Nice=10
 IOSchedulingClass=best-effort
