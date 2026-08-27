@@ -18,8 +18,7 @@ LOCK = threading.Lock()
 
 def load_json(path, default):
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
 
@@ -92,15 +91,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        # Only the non-sensitive health check is exposed over HTTP. Fleet cache
+        # contents are read directly from disk by the local controller UI; they
+        # are intentionally not available through the Cloudflare reverse proxy.
         if self.path == "/health":
             self.reply(200, {"ok": True, "time": time.time()})
-            return
-        if self.path == "/v1/cache":
-            peer = self.client_address[0]
-            if peer not in ("127.0.0.1", "::1"):
-                self.reply(403, {"ok": False, "error": "local-only"})
-                return
-            self.reply(200, load_json(CACHE, {"version": 1, "devices": {}}))
             return
         self.reply(404, {"ok": False})
 
