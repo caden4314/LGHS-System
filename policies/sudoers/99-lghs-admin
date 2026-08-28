@@ -16,7 +16,10 @@ cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-export *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-sync
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-cloudflare-install
-cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-telemetry-configure https://*
+# lghs-telemetry-configure itself validates that the supplied endpoint is HTTPS.
+# Keep the sudoers command match syntax simple; ':' in an unescaped URL pattern
+# is parsed specially by sudoers on Raspberry Pi OS.
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-telemetry-configure *
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/poweroff
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/shutdown
