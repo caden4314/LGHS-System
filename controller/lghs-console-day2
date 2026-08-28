@@ -13,8 +13,8 @@ import sys
 import time
 from pathlib import Path
 
-BASE = "/usr/local/sbin/lghs-console"
-COMMAND_HELPER = Path("/opt/lghs/repo/controller/lghs-fleet-command")
+BASE = "/usr/local/libexec/lghs-console-responsive-core"
+COMMAND_HELPER = Path("/usr/local/sbin/lghs-fleet-command")
 
 
 def load_base():
@@ -58,7 +58,7 @@ def command_rows(state, active_only=False):
         for cmd in d.get("fleet_commands") or []:
             if not isinstance(cmd, dict):
                 continue
-            state_name = str(cmd.get("state") or "pending").lower()
+            state_name = str(cmd.get("state") or "queued").lower()
             if active_only and state_name in terminal:
                 continue
             rows.append((d, cmd))
@@ -83,7 +83,7 @@ def network_update_runner(targets, action):
         out, rc = [], 0
         for d in targets:
             did = ui.device_id(d)
-            p = subprocess.run([sys.executable, str(COMMAND_HELPER), did, action], text=True, capture_output=True, timeout=10)
+            p = subprocess.run([sys.executable, str(COMMAND_HELPER), "enqueue", did, action], text=True, capture_output=True, timeout=10)
             rc = rc or p.returncode
             command_id = (p.stdout or "").strip()
             detail = command_id if p.returncode == 0 else ((p.stderr or p.stdout or "queue failed").strip())
@@ -104,7 +104,6 @@ def start_job_network_aware(state, title, targets, command=None, runner=None, po
     return _original_start_job(state, title, targets, command=command, runner=runner, popup_result=popup_result)
 
 
-# All inherited update buttons now enqueue through the HTTPS command plane.
 ui.start_job = start_job_network_aware
 
 
@@ -155,7 +154,7 @@ def draw_live(stdscr, state, y, x, h, w):
         ui.safe(stdscr, row, x + 2, "Device health:", curses.A_BOLD); row += 1
     for d in devices[:max(0, end - row)]:
         op = ui.operation_for_device(d)
-        suffix = ui.progress_text(op) if ui.operation_label(op) else f"cache {ui.cache_age_text(d)}"
+        suffix = ui.progress_text(op) if ui.operation_label(op) else f"CPU {d.get('cpu_pct','?')}% RAM {d.get('mem_pct','?')}% T {d.get('temp_c','?')}C cache {ui.cache_age_text(d)}"
         ui.safe(stdscr, row, x + 2, clip(f"{ui.device_id(d):12} {ui.health(d, state):11} {suffix}", w - 4)); row += 1
 
 
@@ -182,7 +181,6 @@ def draw_jobs(stdscr, state, y, x, h, w):
         draw_progress(stdscr, row, x + 2, max(8, w - 4), pct); row += 1
         detail = str(cmd.get("stage") or cmd.get("message") or "Waiting for Pi acknowledgement")
         ui.safe(stdscr, row, x + 2, clip(detail, w - 4), curses.A_DIM); row += 1
-    # Older/in-flight update telemetry without a command record still appears.
     for d, op in pi_jobs:
         if row + 2 >= end or any(ui.device_id(d) == ui.device_id(cd) for cd, _ in cmds):
             continue
@@ -223,7 +221,7 @@ def draw_recent(stdscr, state, y, x, h, w):
         return
     for d, cmd in rows:
         action = "LGHS" if cmd.get("action") == "lghs-update" else "OS"
-        status = str(cmd.get("state") or "pending").upper().replace("_", " ")
+        status = str(cmd.get("state") or "queued").upper().replace("_", " ")
         ui.safe(stdscr, row, x + 2, clip(f"{ui.device_id(d):12} {action:4} {status:15} {str(cmd.get('stage') or cmd.get('message') or '')}", w - 4)); row += 1
 
 
@@ -249,12 +247,10 @@ def dashboard_main_menu(stdscr, state):
         jobs = len(command_rows(state, True)) + len(ui.active_jobs(state))
         title = f" LGHS CONTROL | ONLINE {online}/{len(devices)} | WARN {warn} | SUDO {sudo} | JOBS {jobs} | {ui.controller_status_short(state)} "
         ui.safe(stdscr, 0, 0, clip(title, w - 1).ljust(w - 1), curses.A_REVERSE | curses.A_BOLD)
-
         nav_w = min(29, max(23, w // 4))
         body_y, body_h = 2, h - 5
         right_x, right_w = nav_w + 2, w - nav_w - 3
         draw_nav(stdscr, state, items, sel, body_y, 0, body_h, nav_w)
-
         live_h = max(7, body_h // 4)
         remain = body_h - live_h - 2
         jobs_h = max(7, remain // 2)
@@ -265,12 +261,10 @@ def dashboard_main_menu(stdscr, state):
         draw_warnings(stdscr, state, body_y + live_h + jobs_h + 2, right_x, lower_h, lower_w)
         if right_w - lower_w - 1 >= 20:
             draw_recent(stdscr, state, body_y + live_h + jobs_h + 2, right_x + lower_w + 1, lower_h, right_w - lower_w - 1)
-
         ui.safe(stdscr, h - 2, 1, "Enter open | Up/Down menu | J jobs | F9 notices | / search | G group | R refresh", curses.A_DIM)
         ui.safe(stdscr, h - 1, 1, "Updates: QUEUED > DELIVERED > ACCEPTED > RUNNING > COMPLETE | F10 quit", curses.A_DIM)
         ui.draw_toast(stdscr, state)
         stdscr.refresh()
-
         key = ui.read_key(stdscr, state)
         action = ui.global_action(key)
         if action == "help":
