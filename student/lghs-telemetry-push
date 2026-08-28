@@ -85,10 +85,20 @@ def snapshot():
     data["sudo_requests"] = requests
     data["sudo_pending"] = len(requests)
 
-    # Update state is written atomically by the two updater scripts. Keeping it
-    # nested avoids flattening structured progress data into key=value strings.
-    data["lghs_update"] = load_json(LGHS_STATUS)
-    data["os_update"] = load_json(OS_STATUS)
+    lghs_status = load_json(LGHS_STATUS)
+    os_status = load_json(OS_STATUS)
+    # /run/reboot-required is recreated by the current boot. If the previous
+    # update requested a reboot and the marker is gone now, the reboot happened
+    # and the persistent status file should no longer keep the UI in REBOOT!.
+    if os_status.get("state") == "reboot_required" and not Path("/run/reboot-required").exists():
+        os_status = dict(os_status)
+        os_status["state"] = "complete"
+        os_status["stage"] = "Reboot completed"
+        os_status["message"] = "System restarted after OS update"
+        os_status["reboot_required"] = "no"
+        os_status["updated_at"] = time.time()
+    data["lghs_update"] = lghs_status
+    data["os_update"] = os_status
     return data
 
 
