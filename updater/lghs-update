@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Persistent updater settings are shared by manual runs, timers, and queued
+# network work. Explicit environment variables still win over the file.
+UPDATE_ENV=/etc/lghs/update.env
+ENV_REPO_URL="${LGHS_REPO_URL-}"
+ENV_BRANCH="${LGHS_UPDATE_BRANCH-}"
+ENV_CHECKOUT="${LGHS_UPDATE_CHECKOUT-}"
+if [[ -r "$UPDATE_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$UPDATE_ENV"
+fi
+[[ -n "$ENV_REPO_URL" ]] && LGHS_REPO_URL="$ENV_REPO_URL"
+[[ -n "$ENV_BRANCH" ]] && LGHS_UPDATE_BRANCH="$ENV_BRANCH"
+[[ -n "$ENV_CHECKOUT" ]] && LGHS_UPDATE_CHECKOUT="$ENV_CHECKOUT"
+
 REPO_URL="${LGHS_REPO_URL:-https://github.com/caden4314/LGHS-System.git}"
 BRANCH="${LGHS_UPDATE_BRANCH:-main}"
 CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
@@ -52,7 +66,7 @@ os.replace(tmp, path)
 PY
 }
 
-write_status "checking" "Starting LGHS update" 2 "Preparing updater"
+write_status "checking" "Starting LGHS update" 2 "Preparing updater for branch $BRANCH"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     write_status "busy" "Update already running" 0 "Another LGHS update process owns the lock"
@@ -73,7 +87,7 @@ queue_for_network() {
     return 75
 }
 
-write_status "checking" "Checking GitHub" 5 "Testing repository access"
+write_status "checking" "Checking GitHub" 5 "Testing repository access for $BRANCH"
 if ! GIT_TERMINAL_PROMPT=0 timeout 12 git ls-remote --heads "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
     if queue_for_network "Git repository is currently unreachable; deferring update."; then exit 0; else exit 75; fi
 fi
@@ -171,9 +185,10 @@ if apply_install; then
     write_status "complete" "LGHS update complete" 100 "Installed ${TARGET_COMMIT:0:12}"
     echo "LGHS update applied successfully: ${TARGET_COMMIT:0:12}"
     exit 0
+else
+    RC=$?
 fi
 
-RC=$?
 write_status "rolling_back" "Validation failed; rolling back" 70 "Update validation failed with exit $RC"
 echo "LGHS update validation failed (exit $RC)." >&2
 
@@ -191,13 +206,13 @@ if [[ "$PREVIOUS_COMMIT" != "unknown" ]]; then
             printf '%s\n' "$PREVIOUS_COMMIT" > "$STATE_DIR/current-commit"
             printf '%s\n' "$PREVIOUS_COMMIT" > /etc/lghs/source-commit
             rm -f "$STATE_DIR/pending-commit"
-            write_status "failed" "Update rolled back" 100 "New revision failed validation; restored ${PREVIOUS_COMMIT:0:12}"
+            write_status "failed" "Update rolled back" 100 "New revision failed validation with exit $RC; restored ${PREVIOUS_COMMIT:0:12}"
             echo "LGHS rollback completed." >&2
             exit "$RC"
         fi
     fi
 fi
 
-write_status "failed" "LGHS update failed" 100 "Automatic rollback was unavailable or failed"
+write_status "failed" "LGHS update failed" 100 "Automatic rollback was unavailable or failed; original exit $RC"
 echo "Automatic rollback was unavailable or failed. Manual repair is required." >&2
 exit "$RC"
