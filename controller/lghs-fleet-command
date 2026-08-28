@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Queue allowlisted fleet maintenance commands for HTTPS delivery.
+
+This tool never connects to a student Pi. It writes a controller-local command
+queue consumed by lghs-fleet-api; the student receives work in the response to
+its normal outbound HTTPS telemetry POST.
+"""
+import argparse
+import json
+import os
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+COMMANDS = Path("/var/lib/lghs/fleet-commands.json")
+REGISTRY = Path("/etc/lghs/fleet.json")
+ALLOWED = {"lghs-update", "os-update"}
+
+
+def load_json(path, default):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else default
+    except Exception:
+        return default
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def known_devices():
+    data = load_json(REGISTRY, {})
+    devices = data.get("devices", {}) if isinstance(data, dict) else {}
+    return {str(x).upper() for x in devices} if isinstance(devices, dict) else set()
+
+
+def enqueue(device, action):
+    device = device.upper()
+    if action not in ALLOWED:
+        raise SystemExit("Unsupported command")
+    known = known_devices()
+    if known and device not in known:
+        raise SystemExit(f"Unknown fleet device: {device}")
+    data = load_json(COMMANDS, {"version": 1, "devices": {}})
+    data.setdefault("version", 1)
+    devices = data.setdefault("devices", {})
+    rows = devices.setdefault(device, [])
+    # Do not stack duplicate still-pending update requests.
+    for row in rows:
+        if isinstance(row, dict) and row.get("action") == action and row.get("state", "pending") == "pending":
+            print(row.get("id"))
+            return
+    now = time.time()
+    row = {
+        "id": uuid.uuid4().hex,
+        "action": action,
+        "state": "pending",
+        "created_at": now,
+    }
+    rows.append(row)
+    devices[device] = rows[-64:]
+    data["updated_at"] = now
+    atomic_json(COMMANDS, data)
+    print(row["id"])
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("Run as root")
+    parser = argparse.ArgumentParser(description="Queue an HTTPS fleet update command")
+    parser.add_argument("device")
+    parser.add_argument("action", choices=sorted(ALLOWED))
+    args = parser.parse_args()
+    enqueue(args.device, args.action)
+
+
+if __name__ == "__main__":
+    main()
