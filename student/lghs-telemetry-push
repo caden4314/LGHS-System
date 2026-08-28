@@ -13,7 +13,7 @@ TOKEN = Path("/etc/lghs/secrets/fleet-api-token")
 SUDO_REQUEST_DIR = Path("/var/lib/lghs/sudo-requests")
 LGHS_STATUS = Path("/var/lib/lghs/update/lghs-status.json")
 OS_STATUS = Path("/var/lib/lghs/update/os-status.json")
-ACCEPTED_COMMANDS = Path("/var/lib/lghs/telemetry-accepted-commands.json")
+COMMAND_STATE = Path("/var/lib/lghs/telemetry-command-state.json")
 NETQUEUE = "/usr/local/sbin/lghs-netqueue"
 INTERVAL = float(os.environ.get("LGHS_TELEMETRY_SECONDS", "3"))
 TIMEOUT = float(os.environ.get("LGHS_TELEMETRY_TIMEOUT", "8"))
@@ -21,6 +21,7 @@ ALLOWED_COMMANDS = {
     "lghs-update": [NETQUEUE, "enqueue", "local-update"],
     "os-update": [NETQUEUE, "enqueue", "os-update"],
 }
+ACTIVE_UPDATE_STATES = {"checking", "queued", "downloading", "preparing", "installing", "validating", "cleaning", "finishing", "rolling_back", "busy", "rebooting"}
 
 
 def parse_conf():
@@ -68,21 +69,40 @@ def atomic_json(path, value):
         pass
 
 
-def accepted_commands():
-    data = load_json(ACCEPTED_COMMANDS)
-    rows = data.get("ids", []) if isinstance(data, dict) else []
-    return [str(x) for x in rows if x][-128:]
+def command_rows():
+    data = load_json(COMMAND_STATE)
+    rows = data.get("commands", []) if isinstance(data, dict) else []
+    return [dict(x) for x in rows if isinstance(x, dict) and x.get("id")][-64:]
 
 
-def remember_accepted(command_id):
-    rows = accepted_commands()
-    if command_id not in rows:
-        rows.append(command_id)
-    atomic_json(ACCEPTED_COMMANDS, {"ids": rows[-128:], "updated_at": time.time()})
+def save_command_rows(rows):
+    atomic_json(COMMAND_STATE, {"commands": rows[-64:], "updated_at": time.time()})
+
+
+def update_command_progress(rows, lghs_status, os_status):
+    now = time.time()
+    for row in rows:
+        action = str(row.get("action") or "")
+        status = lghs_status if action == "lghs-update" else os_status if action == "os-update" else {}
+        accepted_at = float(row.get("accepted_at") or 0)
+        started_at = float(status.get("started_at") or 0) if isinstance(status, dict) else 0
+        if not status or not started_at or started_at + 1 < accepted_at:
+            continue
+        s = str(status.get("state") or "").lower()
+        if s in ACTIVE_UPDATE_STATES:
+            row["state"] = "running"
+        elif s in ("complete", "failed", "reboot_required"):
+            row["state"] = s
+        else:
+            continue
+        row["stage"] = str(status.get("stage") or "")
+        row["message"] = str(status.get("message") or "")
+        row["progress"] = status.get("progress")
+        row["updated_at"] = float(status.get("updated_at") or now)
+    return rows
 
 
 def pending_sudo_requests():
-    """Read pending requests without invoking the mutating admin helper."""
     now = time.time()
     requests = []
     try:
@@ -110,11 +130,9 @@ def snapshot():
     data = parse_kv(p.stdout) if p.returncode == 0 else {}
     data["device_id"] = str(data.get("hostname") or device).upper()
     data["sent_at"] = time.time()
-
     requests = pending_sudo_requests()
     data["sudo_requests"] = requests
     data["sudo_pending"] = len(requests)
-
     lghs_status = load_json(LGHS_STATUS)
     os_status = load_json(OS_STATUS)
     if os_status.get("state") == "reboot_required" and not Path("/run/reboot-required").exists():
@@ -126,28 +144,44 @@ def snapshot():
         os_status["updated_at"] = time.time()
     data["lghs_update"] = lghs_status
     data["os_update"] = os_status
-    data["accepted_commands"] = accepted_commands()
+    rows = update_command_progress(command_rows(), lghs_status, os_status)
+    save_command_rows(rows)
+    data["command_states"] = rows[-32:]
     return data
 
 
 def accept_commands(commands):
     if not isinstance(commands, list):
         return
-    already = set(accepted_commands())
+    rows = command_rows()
+    by_id = {str(x.get("id")): x for x in rows}
+    changed = False
+    now = time.time()
     for command in commands[:16]:
         if not isinstance(command, dict):
             continue
         command_id = str(command.get("id") or "")
         action = str(command.get("action") or "")
-        if not command_id or command_id in already or action not in ALLOWED_COMMANDS:
+        if not command_id or action not in ALLOWED_COMMANDS:
             continue
+        if command_id in by_id:
+            continue
+        row = {"id": command_id, "action": action, "state": "received", "received_at": now, "updated_at": now}
+        rows.append(row)
+        by_id[command_id] = row
+        changed = True
         try:
             p = run(ALLOWED_COMMANDS[action])
-        except Exception:
+        except Exception as exc:
+            row.update({"state": "failed", "message": str(exc), "updated_at": time.time()})
             continue
         if p.returncode == 0:
-            remember_accepted(command_id)
-            already.add(command_id)
+            row.update({"state": "accepted", "accepted_at": time.time(), "updated_at": time.time(), "message": "Queued locally on Pi"})
+        else:
+            detail = (p.stderr or p.stdout or "queue command failed").strip()[-500:]
+            row.update({"state": "failed", "message": detail, "updated_at": time.time()})
+    if changed:
+        save_command_rows(rows)
 
 
 def send_once():
@@ -162,14 +196,8 @@ def send_once():
     device = payload["device_id"]
     body = json.dumps(payload, separators=(",", ":")).encode()
     req = urllib.request.Request(
-        f"{base}/v1/report/{device}",
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "LGHS-Telemetry/3",
-        },
+        f"{base}/v1/report/{device}", data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "LGHS-Telemetry/4"},
     )
     with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
         if response.status not in (200, 202, 204):
