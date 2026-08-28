@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Day-to-day LGHS Fleet Control dashboard.
 
-This is a thin presentation layer over lghs-console-responsive. It keeps all
-existing screens/actions/popups and replaces only the home screen with a
-split-pane operational dashboard: stable navigation on the left and live
-cache-backed jobs/warnings/device data on the right.
+Stable navigation stays on the left. Live cache-backed fleet state, command
+acknowledgements, update progress, jobs, and warnings stay visible on the right.
+Existing screens and centered popups come from lghs-console-responsive.
 """
 import curses
 import importlib.machinery
 import importlib.util
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 BASE = "/usr/local/sbin/lghs-console"
+COMMAND_HELPER = Path("/opt/lghs/repo/controller/lghs-fleet-command")
 
 
 def load_base():
@@ -23,11 +26,11 @@ def load_base():
 
 
 ui = load_base()
+_original_start_job = ui.start_job
 
 
 def clip(text, width):
-    text = str(text)
-    return text[:max(0, width)]
+    return str(text)[:max(0, width)]
 
 
 def box(win, y, x, h, w, title, attr=0):
@@ -43,10 +46,24 @@ def box(win, y, x, h, w, title, attr=0):
         win.addch(y + h - 1, x, curses.ACS_LLCORNER)
         win.hline(y + h - 1, x + 1, curses.ACS_HLINE, w - 2)
         win.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
-        label = f" {title} "
-        ui.safe(win, y, x + 2, clip(label, w - 4), attr | curses.A_BOLD)
+        ui.safe(win, y, x + 2, clip(f" {title} ", w - 4), attr | curses.A_BOLD)
     except curses.error:
         pass
+
+
+def command_rows(state, active_only=False):
+    rows = []
+    terminal = {"complete", "failed", "reboot_required"}
+    for d in state.get("devices", []):
+        for cmd in d.get("fleet_commands") or []:
+            if not isinstance(cmd, dict):
+                continue
+            state_name = str(cmd.get("state") or "pending").lower()
+            if active_only and state_name in terminal:
+                continue
+            rows.append((d, cmd))
+    rows.sort(key=lambda x: ui.number(x[1].get("updated_at") or x[1].get("created_at"), 0), reverse=True)
+    return rows
 
 
 def live_jobs(state):
@@ -59,6 +76,38 @@ def live_jobs(state):
     return rows
 
 
+def network_update_runner(targets, action):
+    def runner():
+        if not COMMAND_HELPER.exists():
+            return subprocess.CompletedProcess([], 127, "", f"Missing {COMMAND_HELPER}")
+        out, rc = [], 0
+        for d in targets:
+            did = ui.device_id(d)
+            p = subprocess.run([sys.executable, str(COMMAND_HELPER), did, action], text=True, capture_output=True, timeout=10)
+            rc = rc or p.returncode
+            command_id = (p.stdout or "").strip()
+            detail = command_id if p.returncode == 0 else ((p.stderr or p.stdout or "queue failed").strip())
+            out.append(f"{did}: {'QUEUED' if p.returncode == 0 else 'FAILED'} {detail}")
+        return subprocess.CompletedProcess([], rc, "\n".join(out), "")
+    return runner
+
+
+def start_job_network_aware(state, title, targets, command=None, runner=None, popup_result=True):
+    """Route update actions through HTTPS command delivery; keep other explicit actions unchanged."""
+    if runner is None and command in ("sudo -n /usr/local/sbin/lghs-update", "sudo -n /usr/local/sbin/lghs-os-update"):
+        action = "lghs-update" if command.endswith("lghs-update") else "os-update"
+        return _original_start_job(
+            state, title, targets,
+            runner=network_update_runner(targets, action),
+            popup_result=False,
+        )
+    return _original_start_job(state, title, targets, command=command, runner=runner, popup_result=popup_result)
+
+
+# All inherited update buttons now enqueue through the HTTPS command plane.
+ui.start_job = start_job_network_aware
+
+
 def draw_progress(win, y, x, width, progress):
     if width < 8:
         return
@@ -67,79 +116,25 @@ def draw_progress(win, y, x, width, progress):
     except Exception:
         pct = None
     inner = max(1, width - 2)
-    if pct is None:
-        bar = "[" + ("-" * inner) + "]"
-    else:
-        fill = int(inner * pct / 100)
-        bar = "[" + ("#" * fill) + ("-" * (inner - fill)) + "]"
-    ui.safe(win, y, x, clip(bar, width))
+    fill = 0 if pct is None else int(inner * pct / 100)
+    ui.safe(win, y, x, clip("[" + ("#" * fill) + ("-" * (inner - fill)) + "]", width))
 
 
 def draw_nav(stdscr, state, items, selected, y, x, h, w):
     box(stdscr, y, x, h, w, "MENU", curses.A_REVERSE)
-    max_rows = max(0, h - 3)
-    for i, (name, target) in enumerate(items[:max_rows]):
+    devices = state.get("devices", [])
+    for i, (name, target) in enumerate(items[:max(0, h - 3)]):
         count = ""
-        devices = state.get("devices", [])
         if target == "fleet": count = str(len(devices))
         elif target == "attention": count = str(len(ui.issues(devices, state)))
         elif target == "sudo": count = str(len(ui.pending_requests(devices)))
         elif target == "updates":
-            n = sum(bool(ui.operation_label(ui.operation_for_device(d))) or bool(ui.version_state(d, state)) for d in devices)
+            n = len(command_rows(state, True)) + sum(bool(ui.operation_label(ui.operation_for_device(d))) for d in devices)
             count = str(n) if n else ""
         line = f"{i+1}. {name}"
         if count:
-            pad = max(1, w - 4 - len(line) - len(count))
-            line += (" " * pad) + count
-        attr = curses.A_REVERSE | curses.A_BOLD if i == selected else 0
-        ui.safe(stdscr, y + 2 + i, x + 2, clip(line, w - 4), attr)
-
-
-def draw_jobs(stdscr, state, y, x, h, w):
-    jobs = live_jobs(state)
-    ctrl_jobs = ui.active_jobs(state)
-    title = f"ACTIVE JOBS {len(jobs) + len(ctrl_jobs)}"
-    box(stdscr, y, x, h, w, title)
-    row = y + 2
-    end = y + h - 1
-    if not jobs and not ctrl_jobs:
-        ui.safe(stdscr, row, x + 2, "No active work. Fleet is idle.", curses.A_DIM)
-        return
-    for d, op in jobs:
-        if row + 2 >= end:
-            break
-        pct = op.get("progress")
-        pct_text = "--" if pct is None else f"{int(ui.number(pct)):3d}%"
-        label = ui.operation_label(op) or str(op.get("state") or "WORK").upper()
-        ui.safe(stdscr, row, x + 2, clip(f"{ui.device_id(d)}  {label}  {pct_text}", w - 4), curses.A_BOLD)
-        row += 1
-        draw_progress(stdscr, row, x + 2, max(8, w - 4), pct)
-        row += 1
-        ui.safe(stdscr, row, x + 2, clip(str(op.get("stage") or op.get("message") or "Working"), w - 4), curses.A_DIM)
-        row += 1
-    for job in ctrl_jobs:
-        if row >= end:
-            break
-        elapsed = int(time.time() - job.get("started", time.time()))
-        ui.safe(stdscr, row, x + 2, clip(f"Job #{job['id']}  {job['title']}  {elapsed}s", w - 4))
-        row += 1
-
-
-def draw_warnings(stdscr, state, y, x, h, w):
-    rows = ui.issues(state.get("devices", []), state)
-    box(stdscr, y, x, h, w, f"WARNINGS {len(rows)}")
-    row = y + 2
-    end = y + h - 1
-    if not rows:
-        ui.safe(stdscr, row, x + 2, "No current warnings.", curses.A_DIM)
-        return
-    for d, sev, kind, detail in rows:
-        if row >= end:
-            break
-        mark = "X" if sev == "CRITICAL" else "!"
-        attr = curses.A_BOLD if sev == "CRITICAL" else 0
-        ui.safe(stdscr, row, x + 2, clip(f"{mark} {ui.device_id(d)}  {kind}  {detail}", w - 4), attr)
-        row += 1
+            line += (" " * max(1, w - 4 - len(line) - len(count))) + count
+        ui.safe(stdscr, y + 2 + i, x + 2, clip(line, w - 4), curses.A_REVERSE | curses.A_BOLD if i == selected else 0)
 
 
 def draw_live(stdscr, state, y, x, h, w):
@@ -148,38 +143,96 @@ def draw_live(stdscr, state, y, x, h, w):
     stale = sum(ui.cache_state(d) == "STALE" for d in devices)
     offline = sum(ui.cache_state(d) == "OFFLINE" for d in devices)
     box(stdscr, y, x, h, w, "LIVE FLEET")
-    row = y + 2
-    lines = [
+    row, end = y + 2, y + h - 1
+    for line in (
         f"Devices {len(devices)}   Online {online}   Stale {stale}   Offline {offline}",
         f"Traffic down {ui.fmt_rate(state.get('down_bps', 0))}   up {ui.fmt_rate(state.get('up_bps', 0))}",
-        f"Controller {ui.controller_status_short(state)}   Cache refresh <= 0.75s",
-    ]
-    for line in lines:
-        if row < y + h - 1:
-            ui.safe(stdscr, row, x + 2, clip(line, w - 4))
-            row += 1
-    if row < y + h - 1:
-        ui.safe(stdscr, row, x + 2, "Recent devices:", curses.A_BOLD)
-        row += 1
-    for d in devices[:max(0, y + h - 1 - row)]:
+        f"Controller {ui.controller_status_short(state)}   HTTPS cache {state.get('generation', 0)}",
+    ):
+        if row < end:
+            ui.safe(stdscr, row, x + 2, clip(line, w - 4)); row += 1
+    if row < end:
+        ui.safe(stdscr, row, x + 2, "Device health:", curses.A_BOLD); row += 1
+    for d in devices[:max(0, end - row)]:
         op = ui.operation_for_device(d)
         suffix = ui.progress_text(op) if ui.operation_label(op) else f"cache {ui.cache_age_text(d)}"
-        ui.safe(stdscr, row, x + 2, clip(f"{ui.device_id(d):12} {ui.health(d, state):11} {suffix}", w - 4))
+        ui.safe(stdscr, row, x + 2, clip(f"{ui.device_id(d):12} {ui.health(d, state):11} {suffix}", w - 4)); row += 1
+
+
+def draw_jobs(stdscr, state, y, x, h, w):
+    cmds = command_rows(state, True)
+    pi_jobs = live_jobs(state)
+    ctrl_jobs = ui.active_jobs(state)
+    box(stdscr, y, x, h, w, f"ACTIVE JOBS {len(cmds) + len(ctrl_jobs)}")
+    row, end = y + 2, y + h - 1
+    seen = set()
+    for d, cmd in cmds:
+        if row + 2 >= end:
+            break
+        cid = str(cmd.get("id") or "")
+        if cid in seen:
+            continue
+        seen.add(cid)
+        state_name = str(cmd.get("state") or "queued").upper().replace("_", " ")
+        action = "LGHS UPDATE" if cmd.get("action") == "lghs-update" else "OS UPDATE"
+        pct = cmd.get("progress")
+        pct_text = "--" if pct is None else f"{int(ui.number(pct)):3d}%"
+        ui.safe(stdscr, row, x + 2, clip(f"{ui.device_id(d)}  {action}  {state_name}  {pct_text}", w - 4), curses.A_BOLD)
         row += 1
+        draw_progress(stdscr, row, x + 2, max(8, w - 4), pct); row += 1
+        detail = str(cmd.get("stage") or cmd.get("message") or "Waiting for Pi acknowledgement")
+        ui.safe(stdscr, row, x + 2, clip(detail, w - 4), curses.A_DIM); row += 1
+    # Older/in-flight update telemetry without a command record still appears.
+    for d, op in pi_jobs:
+        if row + 2 >= end or any(ui.device_id(d) == ui.device_id(cd) for cd, _ in cmds):
+            continue
+        pct = op.get("progress")
+        ui.safe(stdscr, row, x + 2, clip(f"{ui.device_id(d)}  {ui.operation_label(op)}  {ui.progress_text(op)}", w - 4), curses.A_BOLD); row += 1
+        draw_progress(stdscr, row, x + 2, max(8, w - 4), pct); row += 1
+        ui.safe(stdscr, row, x + 2, clip(str(op.get("stage") or "Working"), w - 4), curses.A_DIM); row += 1
+    for job in ctrl_jobs:
+        if row >= end:
+            break
+        elapsed = int(time.time() - job.get("started", time.time()))
+        ui.safe(stdscr, row, x + 2, clip(f"Local job #{job['id']}  {job['title']}  {elapsed}s", w - 4)); row += 1
+    if row == y + 2:
+        ui.safe(stdscr, row, x + 2, "No active work. Fleet is idle.", curses.A_DIM)
+
+
+def draw_warnings(stdscr, state, y, x, h, w):
+    rows = ui.issues(state.get("devices", []), state)
+    box(stdscr, y, x, h, w, f"WARNINGS {len(rows)}")
+    row, end = y + 2, y + h - 1
+    if not rows:
+        ui.safe(stdscr, row, x + 2, "No current warnings.", curses.A_DIM)
+        return
+    for d, sev, kind, detail in rows:
+        if row >= end:
+            break
+        mark = "X" if sev == "CRITICAL" else "!"
+        ui.safe(stdscr, row, x + 2, clip(f"{mark} {ui.device_id(d)}  {kind}  {detail}", w - 4), curses.A_BOLD if sev == "CRITICAL" else 0)
+        row += 1
+
+
+def draw_recent(stdscr, state, y, x, h, w):
+    box(stdscr, y, x, h, w, "RECENT COMMANDS")
+    row, end = y + 2, y + h - 1
+    rows = command_rows(state, False)[:max(0, end - row)]
+    if not rows:
+        ui.safe(stdscr, row, x + 2, "No network commands yet.", curses.A_DIM)
+        return
+    for d, cmd in rows:
+        action = "LGHS" if cmd.get("action") == "lghs-update" else "OS"
+        status = str(cmd.get("state") or "pending").upper().replace("_", " ")
+        ui.safe(stdscr, row, x + 2, clip(f"{ui.device_id(d):12} {action:4} {status:15} {str(cmd.get('stage') or cmd.get('message') or '')}", w - 4)); row += 1
 
 
 def dashboard_main_menu(stdscr, state):
     state["context"] = "main"
     items = [
-        ("Fleet", "fleet"),
-        ("Telemetry", "telemetry"),
-        ("Sudo requests", "sudo"),
-        ("Updates", "updates"),
-        ("Needs Attention", "attention"),
-        ("Activity", "activity"),
-        ("Notifications", "notices"),
-        ("Audit & logs", "logs"),
-        ("Controller", "controller"),
+        ("Fleet", "fleet"), ("Telemetry", "telemetry"), ("Sudo requests", "sudo"),
+        ("Updates", "updates"), ("Needs Attention", "attention"), ("Activity", "activity"),
+        ("Notifications", "notices"), ("Audit & logs", "logs"), ("Controller", "controller"),
     ]
     sel = min(state.get("menu_selected", 0), len(items) - 1)
     while True:
@@ -187,72 +240,61 @@ def dashboard_main_menu(stdscr, state):
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         if h < 20 or w < 88:
-            # Existing menu remains the small-terminal fallback.
             state["menu_selected"] = sel
             return ui._classic_main_menu(stdscr, state)
-
         devices = state.get("devices", [])
         online = sum(ui.cache_state(d) == "ONLINE" for d in devices)
         warn = len(ui.issues(devices, state))
         sudo = len(ui.pending_requests(devices))
-        jobs = len(live_jobs(state)) + len(ui.active_jobs(state))
-        title = f" LGHS CONTROL  |  ONLINE {online}/{len(devices)}  WARN {warn}  SUDO {sudo}  JOBS {jobs}  {ui.controller_status_short(state)} "
+        jobs = len(command_rows(state, True)) + len(ui.active_jobs(state))
+        title = f" LGHS CONTROL | ONLINE {online}/{len(devices)} | WARN {warn} | SUDO {sudo} | JOBS {jobs} | {ui.controller_status_short(state)} "
         ui.safe(stdscr, 0, 0, clip(title, w - 1).ljust(w - 1), curses.A_REVERSE | curses.A_BOLD)
 
-        nav_w = min(28, max(22, w // 4))
+        nav_w = min(29, max(23, w // 4))
         body_y, body_h = 2, h - 5
-        right_x = nav_w + 2
-        right_w = w - right_x - 1
+        right_x, right_w = nav_w + 2, w - nav_w - 3
         draw_nav(stdscr, state, items, sel, body_y, 0, body_h, nav_w)
 
-        live_h = max(7, body_h // 3)
-        remain = body_h - live_h - 1
+        live_h = max(7, body_h // 4)
+        remain = body_h - live_h - 2
         jobs_h = max(7, remain // 2)
-        warn_h = max(6, remain - jobs_h)
+        lower_h = max(6, remain - jobs_h)
+        lower_w = max(20, right_w // 2)
         draw_live(stdscr, state, body_y, right_x, live_h, right_w)
         draw_jobs(stdscr, state, body_y + live_h + 1, right_x, jobs_h, right_w)
-        draw_warnings(stdscr, state, body_y + live_h + jobs_h + 2, right_x, warn_h, right_w)
+        draw_warnings(stdscr, state, body_y + live_h + jobs_h + 2, right_x, lower_h, lower_w)
+        if right_w - lower_w - 1 >= 20:
+            draw_recent(stdscr, state, body_y + live_h + jobs_h + 2, right_x + lower_w + 1, lower_h, right_w - lower_w - 1)
 
         ui.safe(stdscr, h - 2, 1, "Enter open | Up/Down menu | J jobs | F9 notices | / search | G group | R refresh", curses.A_DIM)
-        ui.safe(stdscr, h - 1, 1, "F1 help | F2 fleet | F3 telemetry | F4 sudo | F5 updates | F7 attention | F10 quit | B back", curses.A_DIM)
+        ui.safe(stdscr, h - 1, 1, "Updates: QUEUED > DELIVERED > ACCEPTED > RUNNING > COMPLETE | F10 quit", curses.A_DIM)
         ui.draw_toast(stdscr, state)
         stdscr.refresh()
 
         key = ui.read_key(stdscr, state)
         action = ui.global_action(key)
         if action == "help":
-            ui.contextual_help(stdscr, state)
-            continue
+            ui.contextual_help(stdscr, state); continue
         if action:
-            state["menu_selected"] = sel
-            return action
+            state["menu_selected"] = sel; return action
         if key in (ord("q"), ord("Q")):
             return "quit"
         if key == ord("J"):
-            ui.jobs_popup(stdscr, state)
-            continue
+            ui.jobs_popup(stdscr, state); continue
         if key == ord("/"):
             q = ui.prompt_text(stdscr, state, "SEARCH", "Device/group/version/state/stage/tag contains:", state.get("search", ""))
-            if q is not None:
-                state["search"] = q
+            if q is not None: state["search"] = q
             continue
         if key in (ord("g"), ord("G")):
-            ui.cycle_group(state)
-            continue
+            ui.cycle_group(state); continue
         if key in (ord("r"), ord("R")):
-            ui.refresh_cache(state, True)
-            continue
-        if key in (curses.KEY_DOWN, ord("j")):
-            sel = min(len(items) - 1, sel + 1)
-        elif key in (curses.KEY_UP, ord("k")):
-            sel = max(0, sel - 1)
+            ui.refresh_cache(state, True); continue
+        if key in (curses.KEY_DOWN, ord("j")): sel = min(len(items) - 1, sel + 1)
+        elif key in (curses.KEY_UP, ord("k")): sel = max(0, sel - 1)
         elif ord("1") <= key <= ord("9"):
-            sel = key - ord("1")
-            state["menu_selected"] = sel
-            return items[sel][1]
+            sel = key - ord("1"); state["menu_selected"] = sel; return items[sel][1]
         elif key in (10, 13):
-            state["menu_selected"] = sel
-            return items[sel][1]
+            state["menu_selected"] = sel; return items[sel][1]
 
 
 ui._classic_main_menu = ui.main_menu
