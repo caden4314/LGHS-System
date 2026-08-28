@@ -5,21 +5,65 @@ REPO_URL="${LGHS_REPO_URL:-https://github.com/caden4314/LGHS-System.git}"
 BRANCH="${LGHS_UPDATE_BRANCH:-main}"
 CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
 STATE_DIR=/var/lib/lghs/update
+STATUS_FILE="$STATE_DIR/lghs-status.json"
 ROLE="$(cat /etc/lghs/role 2>/dev/null || true)"
 LOCK_FILE=/run/lock/lghs-update.lock
 LOG=/var/log/lghs-update.log
 NETQUEUE=/usr/local/sbin/lghs-netqueue
+STARTED_AT="$(date +%s)"
+TARGET_COMMIT=""
+PREVIOUS_COMMIT=""
 
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
 [[ "$ROLE" == "controller" || "$ROLE" == "student" ]] || { echo "Invalid or missing LGHS role" >&2; exit 1; }
 
 install -d -m 0755 "$STATE_DIR" /opt/lghs
+
+write_status() {
+    local state="$1" stage="$2" progress="$3" message="${4:-}" reboot_required="${5:-no}"
+    python3 - "$STATUS_FILE" "$state" "$stage" "$progress" "$message" "$STARTED_AT" "$TARGET_COMMIT" "$PREVIOUS_COMMIT" "$reboot_required" <<'PY'
+import json, os, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+state, stage, progress, message = sys.argv[2:6]
+started_at = float(sys.argv[6])
+target, previous, reboot_required = sys.argv[7:10]
+try:
+    progress_value = int(float(progress))
+except Exception:
+    progress_value = None
+payload = {
+    "kind": "lghs",
+    "state": state,
+    "stage": stage,
+    "progress": progress_value,
+    "message": message,
+    "started_at": started_at,
+    "updated_at": time.time(),
+    "target_commit": target,
+    "previous_commit": previous,
+    "reboot_required": reboot_required,
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+os.chmod(tmp, 0o640)
+os.replace(tmp, path)
+PY
+}
+
+write_status "checking" "Starting LGHS update" 2 "Preparing updater"
 exec 9>"$LOCK_FILE"
-flock -n 9 || { echo "Another LGHS update is already running."; exit 0; }
+if ! flock -n 9; then
+    write_status "busy" "Update already running" 0 "Another LGHS update process owns the lock"
+    echo "Another LGHS update is already running."
+    exit 0
+fi
 
 queue_for_network() {
     local reason="$1"
     echo "LGHS updater: $reason"
+    write_status "queued" "Waiting for network" 0 "$reason"
     if [[ "${LGHS_NETQUEUE_RUNNING:-0}" == "1" ]]; then return 75; fi
     if [[ -x "$NETQUEUE" ]]; then
         "$NETQUEUE" enqueue local-update >/dev/null
@@ -29,13 +73,16 @@ queue_for_network() {
     return 75
 }
 
+write_status "checking" "Checking GitHub" 5 "Testing repository access"
 if ! GIT_TERMINAL_PROMPT=0 timeout 12 git ls-remote --heads "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
     if queue_for_network "Git repository is currently unreachable; deferring update."; then exit 0; else exit 75; fi
 fi
 
 INSTALLED_COMMIT="$(cat "$STATE_DIR/current-commit" 2>/dev/null || cat /etc/lghs/source-commit 2>/dev/null || echo unknown)"
+PREVIOUS_COMMIT="$INSTALLED_COMMIT"
 
 if [[ ! -d "$CHECKOUT/.git" ]]; then
+    write_status "downloading" "Cloning LGHS repository" 12 "Creating local update checkout"
     echo "LGHS updater: creating local checkout..."
     rm -rf "$CHECKOUT"
     if ! GIT_TERMINAL_PROMPT=0 git clone --branch "$BRANCH" "$REPO_URL" "$CHECKOUT"; then
@@ -46,27 +93,29 @@ fi
 cd "$CHECKOUT"
 git remote set-url origin "$REPO_URL"
 
-# Always materialize the requested branch as origin/<branch>. A checkout that
-# was originally cloned as main may have a single-branch fetch refspec, so
-# `git fetch origin "$BRANCH"` can populate FETCH_HEAD without creating the
-# remote-tracking ref that the updater later resolves.
+write_status "downloading" "Fetching LGHS changes" 20 "Fetching origin/$BRANCH"
 if ! GIT_TERMINAL_PROMPT=0 git fetch --prune origin \
     "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"; then
     if queue_for_network "fetch failed; deferring update."; then exit 0; else exit 75; fi
 fi
 TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/$BRANCH^{commit}")"
+write_status "preparing" "Comparing versions" 28 "Target ${TARGET_COMMIT:0:12}"
 
 if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
     git reset --hard "$TARGET_COMMIT" >/dev/null
-    if [[ -x /usr/local/sbin/lghs-reconcile ]]; then /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true; fi
+    if [[ -x /usr/local/sbin/lghs-reconcile ]]; then
+        write_status "validating" "Reconciling current install" 85 "LGHS is already current"
+        /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true
+    fi
+    write_status "complete" "LGHS is current" 100 "Already at ${TARGET_COMMIT:0:12}"
     echo "LGHS is already current at ${TARGET_COMMIT:0:12}."
     exit 0
 fi
 
-PREVIOUS_COMMIT="$INSTALLED_COMMIT"
 printf '%s\n' "$PREVIOUS_COMMIT" > "$STATE_DIR/previous-commit"
 printf '%s\n' "$TARGET_COMMIT" > "$STATE_DIR/pending-commit"
 
+write_status "preparing" "Preparing new revision" 35 "${PREVIOUS_COMMIT:0:12} -> ${TARGET_COMMIT:0:12}"
 echo "LGHS updater: ${PREVIOUS_COMMIT:0:12} -> ${TARGET_COMMIT:0:12}"
 git reset --hard "$TARGET_COMMIT"
 printf '%s\n' "$TARGET_COMMIT" > .lghs-source-commit
@@ -90,8 +139,11 @@ validate_controller() {
 }
 
 apply_install() {
+    write_status "installing" "Applying LGHS configuration" 55 "Running install.sh for $ROLE"
     /bin/bash ./install.sh "$ROLE"
+    write_status "installing" "Reloading services" 75 "Refreshing systemd units"
     systemctl daemon-reload
+    write_status "validating" "Validating installation" 88 "Running post-update checks"
     if [[ "$ROLE" == "student" ]]; then
         /usr/local/sbin/lghs-check
     else
@@ -111,34 +163,41 @@ record_success() {
 }
 
 if apply_install; then
+    write_status "finishing" "Recording successful update" 96 "Saving installed commit"
     printf '%s\n' "$TARGET_COMMIT" > "$STATE_DIR/current-commit"
     printf '%s\n' "$TARGET_COMMIT" > /etc/lghs/source-commit
     rm -f "$STATE_DIR/pending-commit"
     record_success
+    write_status "complete" "LGHS update complete" 100 "Installed ${TARGET_COMMIT:0:12}"
     echo "LGHS update applied successfully: ${TARGET_COMMIT:0:12}"
     exit 0
 fi
 
 RC=$?
+write_status "rolling_back" "Validation failed; rolling back" 70 "Update validation failed with exit $RC"
 echo "LGHS update validation failed (exit $RC)." >&2
 
 if [[ "$PREVIOUS_COMMIT" != "unknown" ]]; then
     echo "Attempting rollback to ${PREVIOUS_COMMIT:0:12}..." >&2
     git fetch origin "$PREVIOUS_COMMIT" 2>/dev/null || true
     if git cat-file -e "${PREVIOUS_COMMIT}^{commit}" 2>/dev/null; then
+        write_status "rolling_back" "Restoring previous revision" 76 "Resetting to ${PREVIOUS_COMMIT:0:12}"
         git reset --hard "$PREVIOUS_COMMIT"
         printf '%s\n' "$PREVIOUS_COMMIT" > .lghs-source-commit
         chmod 0755 install.sh updater/lghs-update 2>/dev/null || true
+        write_status "rolling_back" "Re-applying previous configuration" 84 "Running previous install.sh"
         if /bin/bash ./install.sh "$ROLE"; then
             systemctl daemon-reload
             printf '%s\n' "$PREVIOUS_COMMIT" > "$STATE_DIR/current-commit"
             printf '%s\n' "$PREVIOUS_COMMIT" > /etc/lghs/source-commit
             rm -f "$STATE_DIR/pending-commit"
+            write_status "failed" "Update rolled back" 100 "New revision failed validation; restored ${PREVIOUS_COMMIT:0:12}"
             echo "LGHS rollback completed." >&2
             exit "$RC"
         fi
     fi
 fi
 
+write_status "failed" "LGHS update failed" 100 "Automatic rollback was unavailable or failed"
 echo "Automatic rollback was unavailable or failed. Manual repair is required." >&2
 exit "$RC"
