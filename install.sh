@@ -74,7 +74,9 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghsctl-wrapper" /usr/local/sbin/lghsctl
   install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-legacy
   install -m 0755 "$ROOT_DIR/controller/lghs-console-tunnel" /usr/local/libexec/lghs-console-base
-  install -m 0755 "$ROOT_DIR/controller/lghs-console-responsive" /usr/local/sbin/lghs-console
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-responsive" /usr/local/libexec/lghs-console-responsive-core
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day2" /usr/local/sbin/lghs-console
+  install -m 0755 "$ROOT_DIR/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-notify" /usr/local/sbin/lghs-fleet-notify
   install -m 0755 "$ROOT_DIR/controller/lghs-cloudflare-provision" /usr/local/sbin/lghs-cloudflare-provision
   install -m 0644 "$ROOT_DIR/systemd/lghs-fleet-notify.service" /etc/systemd/system/lghs-fleet-notify.service
