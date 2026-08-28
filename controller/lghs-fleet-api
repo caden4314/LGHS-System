@@ -17,6 +17,7 @@ MAX_BODY = 256 * 1024
 LOCK = threading.Lock()
 COMMAND_TTL = 24 * 60 * 60
 ALLOWED_COMMANDS = {"lghs-update", "os-update"}
+TERMINAL_COMMAND_STATES = {"complete", "failed", "reboot_required"}
 
 
 def load_json(path, default):
@@ -31,7 +32,7 @@ def atomic_json(path, value, mode=0o640):
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, sort_keys=True, separators=(",", ":"))
+            json.dump(value, handle, sort_keys=True, separators=(",", ","))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -59,6 +60,102 @@ def authorized(device, supplied):
     return bool(expected and supplied and hmac.compare_digest(expected, supplied))
 
 
+def command_state():
+    data = load_json(COMMANDS, {"version": 2, "devices": {}})
+    if not isinstance(data, dict):
+        data = {"version": 2, "devices": {}}
+    devices = data.setdefault("devices", {})
+    if not isinstance(devices, dict):
+        data["devices"] = {}
+    data["version"] = 2
+    return data
+
+
+def reconcile_command_states(device, reported):
+    """Merge student-side command lifecycle acknowledgements into controller state."""
+    if not isinstance(reported, list):
+        return
+    by_id = {
+        str(x.get("id")): x for x in reported
+        if isinstance(x, dict) and x.get("id")
+    }
+    if not by_id:
+        return
+    data = command_state()
+    rows = data.get("devices", {}).get(device, [])
+    changed = False
+    now = time.time()
+    order = {"pending": 0, "delivered": 1, "accepted": 2, "running": 3, "reboot_required": 4, "complete": 4, "failed": 4}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("id") or "")
+        remote = by_id.get(rid)
+        if not remote:
+            continue
+        new_state = str(remote.get("state") or "accepted").lower()
+        if new_state not in order:
+            continue
+        old_state = str(row.get("state") or "pending").lower()
+        # Never move a command backwards. Terminal states are immutable.
+        if old_state in TERMINAL_COMMAND_STATES or order[new_state] < order.get(old_state, 0):
+            continue
+        if new_state != old_state:
+            row["state"] = new_state
+            row[f"{new_state}_at"] = float(remote.get("updated_at") or now)
+            changed = True
+        for key in ("stage", "progress", "message", "updated_at"):
+            if key in remote and row.get(key) != remote.get(key):
+                row[key] = remote.get(key)
+                changed = True
+    if changed:
+        data["updated_at"] = now
+        atomic_json(COMMANDS, data, 0o600)
+
+
+def commands_for(device):
+    """Return commands awaiting student acceptance, recording delivery attempts."""
+    now = time.time()
+    data = command_state()
+    rows = data.get("devices", {}).get(device, [])
+    if not isinstance(rows, list):
+        return []
+    out, kept, changed = [], [], False
+    for row in rows:
+        if not isinstance(row, dict):
+            changed = True
+            continue
+        created = float(row.get("created_at") or 0)
+        # Keep terminal rows for the full TTL so the UI has useful history.
+        if created and now - created > COMMAND_TTL:
+            changed = True
+            continue
+        kept.append(row)
+        action = str(row.get("action") or "")
+        state = str(row.get("state") or "pending")
+        if state in ("pending", "delivered") and action in ALLOWED_COMMANDS and row.get("id"):
+            if state == "pending":
+                row["state"] = "delivered"
+                row["delivered_at"] = now
+            row["last_delivery_at"] = now
+            row["deliveries"] = int(row.get("deliveries") or 0) + 1
+            changed = True
+            out.append({"id": str(row["id"]), "action": action, "created_at": created})
+    if changed:
+        data.setdefault("devices", {})[device] = kept
+        data["updated_at"] = now
+        atomic_json(COMMANDS, data, 0o600)
+    return out[:16]
+
+
+def command_views(device):
+    data = command_state()
+    rows = data.get("devices", {}).get(device, [])
+    if not isinstance(rows, list):
+        return []
+    return [dict(x) for x in rows[-16:] if isinstance(x, dict)]
+
+
 def update_cache(device, report):
     now = time.time()
     cache = load_json(CACHE, {"version": 1, "devices": {}})
@@ -72,73 +169,14 @@ def update_cache(device, report):
     report = dict(report)
     report["device_id"] = device
     report["received_at"] = now
+    report["fleet_commands"] = command_views(device)
     devices[device] = report
     cache["updated_at"] = now
     atomic_json(CACHE, cache)
 
 
-def command_state():
-    data = load_json(COMMANDS, {"version": 1, "devices": {}})
-    if not isinstance(data, dict):
-        data = {"version": 1, "devices": {}}
-    devices = data.setdefault("devices", {})
-    if not isinstance(devices, dict):
-        data["devices"] = {}
-    data.setdefault("version", 1)
-    return data
-
-
-def acknowledge_commands(device, accepted_ids):
-    if not accepted_ids:
-        return
-    accepted = {str(x) for x in accepted_ids if x}
-    if not accepted:
-        return
-    now = time.time()
-    data = command_state()
-    rows = data.get("devices", {}).get(device, [])
-    changed = False
-    if isinstance(rows, list):
-        for row in rows:
-            if isinstance(row, dict) and str(row.get("id") or "") in accepted and row.get("state", "pending") == "pending":
-                row["state"] = "accepted"
-                row["accepted_at"] = now
-                changed = True
-    if changed:
-        data["updated_at"] = now
-        atomic_json(COMMANDS, data, 0o600)
-
-
-def commands_for(device):
-    now = time.time()
-    data = command_state()
-    rows = data.get("devices", {}).get(device, [])
-    if not isinstance(rows, list):
-        return []
-    out = []
-    changed = False
-    kept = []
-    for row in rows:
-        if not isinstance(row, dict):
-            changed = True
-            continue
-        created = float(row.get("created_at") or 0)
-        if created and now - created > COMMAND_TTL:
-            changed = True
-            continue
-        kept.append(row)
-        action = str(row.get("action") or "")
-        if row.get("state", "pending") == "pending" and action in ALLOWED_COMMANDS and row.get("id"):
-            out.append({"id": str(row["id"]), "action": action, "created_at": created})
-    if changed:
-        data.setdefault("devices", {})[device] = kept
-        data["updated_at"] = now
-        atomic_json(COMMANDS, data, 0o600)
-    return out[:16]
-
-
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LGHSFleetAPI/2"
+    server_version = "LGHSFleetAPI/3"
 
     def log_message(self, fmt, *args):
         return
@@ -153,8 +191,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        # Only the non-sensitive health check is exposed over HTTP. Fleet cache
-        # and command contents stay local to the controller filesystem.
         if self.path == "/health":
             self.reply(200, {"ok": True, "time": time.time()})
             return
@@ -193,13 +229,10 @@ class Handler(BaseHTTPRequestHandler):
         if claimed and claimed != device:
             self.reply(409, {"ok": False, "error": "device-mismatch"})
             return
-        accepted = report.get("accepted_commands")
-        if not isinstance(accepted, list):
-            accepted = []
         with LOCK:
-            acknowledge_commands(device, accepted)
-            update_cache(device, report)
+            reconcile_command_states(device, report.get("command_states"))
             commands = commands_for(device)
+            update_cache(device, report)
         self.reply(202, {"ok": True, "received_at": time.time(), "commands": commands})
 
 
@@ -213,7 +246,7 @@ def main():
     if not CACHE.exists():
         atomic_json(CACHE, {"version": 1, "devices": {}}, 0o640)
     if not COMMANDS.exists():
-        atomic_json(COMMANDS, {"version": 1, "devices": {}}, 0o600)
+        atomic_json(COMMANDS, {"version": 2, "devices": {}}, 0o600)
     server = ThreadingHTTPServer((BIND, PORT), Handler)
     server.daemon_threads = True
     server.serve_forever(poll_interval=0.25)
