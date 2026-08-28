@@ -32,7 +32,7 @@ def atomic_json(path, value, mode=0o640):
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, sort_keys=True, separators=(",", ","))
+            json.dump(value, handle, sort_keys=True, separators=(",", ":"))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -72,13 +72,9 @@ def command_state():
 
 
 def reconcile_command_states(device, reported):
-    """Merge student-side command lifecycle acknowledgements into controller state."""
     if not isinstance(reported, list):
         return
-    by_id = {
-        str(x.get("id")): x for x in reported
-        if isinstance(x, dict) and x.get("id")
-    }
+    by_id = {str(x.get("id")): x for x in reported if isinstance(x, dict) and x.get("id")}
     if not by_id:
         return
     data = command_state()
@@ -89,15 +85,13 @@ def reconcile_command_states(device, reported):
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):
             continue
-        rid = str(row.get("id") or "")
-        remote = by_id.get(rid)
+        remote = by_id.get(str(row.get("id") or ""))
         if not remote:
             continue
         new_state = str(remote.get("state") or "accepted").lower()
         if new_state not in order:
             continue
         old_state = str(row.get("state") or "pending").lower()
-        # Never move a command backwards. Terminal states are immutable.
         if old_state in TERMINAL_COMMAND_STATES or order[new_state] < order.get(old_state, 0):
             continue
         if new_state != old_state:
@@ -114,7 +108,6 @@ def reconcile_command_states(device, reported):
 
 
 def commands_for(device):
-    """Return commands awaiting student acceptance, recording delivery attempts."""
     now = time.time()
     data = command_state()
     rows = data.get("devices", {}).get(device, [])
@@ -126,7 +119,6 @@ def commands_for(device):
             changed = True
             continue
         created = float(row.get("created_at") or 0)
-        # Keep terminal rows for the full TTL so the UI has useful history.
         if created and now - created > COMMAND_TTL:
             changed = True
             continue
