@@ -16,6 +16,7 @@ from pathlib import Path
 COMMANDS = Path("/var/lib/lghs/fleet-commands.json")
 REGISTRY = Path("/etc/lghs/fleet.json")
 ALLOWED = {"lghs-update", "os-update"}
+OPEN_STATES = {"queued", "delivered", "accepted", "running"}
 
 
 def load_json(path, default):
@@ -57,21 +58,26 @@ def enqueue(device, action):
     known = known_devices()
     if known and device not in known:
         raise SystemExit(f"Unknown fleet device: {device}")
-    data = load_json(COMMANDS, {"version": 1, "devices": {}})
-    data.setdefault("version", 1)
+    data = load_json(COMMANDS, {"version": 2, "devices": {}})
+    data["version"] = 2
     devices = data.setdefault("devices", {})
     rows = devices.setdefault(device, [])
-    # Do not stack duplicate still-pending update requests.
     for row in rows:
-        if isinstance(row, dict) and row.get("action") == action and row.get("state", "pending") == "pending":
+        if isinstance(row, dict) and row.get("action") == action and str(row.get("state", "queued")) in OPEN_STATES:
             print(row.get("id"))
             return
     now = time.time()
     row = {
         "id": uuid.uuid4().hex,
+        "device": device,
         "action": action,
-        "state": "pending",
+        "state": "queued",
         "created_at": now,
+        "queued_at": now,
+        "updated_at": now,
+        "progress": 0,
+        "stage": "Waiting for device telemetry",
+        "message": "Queued on controller for HTTPS delivery",
     }
     rows.append(row)
     devices[device] = rows[-64:]
@@ -80,14 +86,39 @@ def enqueue(device, action):
     print(row["id"])
 
 
+def show(device=None):
+    data = load_json(COMMANDS, {"version": 2, "devices": {}})
+    if device:
+        rows = data.get("devices", {}).get(device.upper(), [])
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        print(json.dumps(data, indent=2, sort_keys=True))
+
+
 def main():
     if os.geteuid() != 0:
         raise SystemExit("Run as root")
     parser = argparse.ArgumentParser(description="Queue an HTTPS fleet update command")
-    parser.add_argument("device")
-    parser.add_argument("action", choices=sorted(ALLOWED))
+    sub = parser.add_subparsers(dest="cmd")
+    q = sub.add_parser("enqueue")
+    q.add_argument("device")
+    q.add_argument("action", choices=sorted(ALLOWED))
+    s = sub.add_parser("status")
+    s.add_argument("device", nargs="?")
+    # Backward-compatible two-argument form: lghs-fleet-command DEVICE ACTION
+    parser.add_argument("legacy", nargs="*")
     args = parser.parse_args()
-    enqueue(args.device, args.action)
+    if args.cmd == "enqueue":
+        enqueue(args.device, args.action)
+        return
+    if args.cmd == "status":
+        show(args.device)
+        return
+    if len(args.legacy) == 2:
+        enqueue(args.legacy[0], args.legacy[1])
+        return
+    parser.print_help()
+    raise SystemExit(2)
 
 
 if __name__ == "__main__":
