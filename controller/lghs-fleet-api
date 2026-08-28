@@ -81,7 +81,7 @@ def reconcile_command_states(device, reported):
     rows = data.get("devices", {}).get(device, [])
     changed = False
     now = time.time()
-    order = {"pending": 0, "delivered": 1, "accepted": 2, "running": 3, "reboot_required": 4, "complete": 4, "failed": 4}
+    order = {"queued": 0, "pending": 0, "delivered": 1, "received": 2, "accepted": 3, "running": 4, "reboot_required": 5, "complete": 5, "failed": 5}
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):
             continue
@@ -91,7 +91,7 @@ def reconcile_command_states(device, reported):
         new_state = str(remote.get("state") or "accepted").lower()
         if new_state not in order:
             continue
-        old_state = str(row.get("state") or "pending").lower()
+        old_state = str(row.get("state") or "queued").lower()
         if old_state in TERMINAL_COMMAND_STATES or order[new_state] < order.get(old_state, 0):
             continue
         if new_state != old_state:
@@ -124,11 +124,14 @@ def commands_for(device):
             continue
         kept.append(row)
         action = str(row.get("action") or "")
-        state = str(row.get("state") or "pending")
-        if state in ("pending", "delivered") and action in ALLOWED_COMMANDS and row.get("id"):
-            if state == "pending":
+        state = str(row.get("state") or "queued")
+        if state in ("queued", "pending", "delivered") and action in ALLOWED_COMMANDS and row.get("id"):
+            if state in ("queued", "pending"):
                 row["state"] = "delivered"
                 row["delivered_at"] = now
+                row["updated_at"] = now
+                row["stage"] = "Delivered to device"
+                row["message"] = "Waiting for device acceptance"
             row["last_delivery_at"] = now
             row["deliveries"] = int(row.get("deliveries") or 0) + 1
             changed = True
