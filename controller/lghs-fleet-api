@@ -12,8 +12,11 @@ BIND = os.environ.get("LGHS_FLEET_API_BIND", "127.0.0.1")
 PORT = int(os.environ.get("LGHS_FLEET_API_PORT", "8789"))
 TOKENS = Path("/etc/lghs/fleet-api-tokens.json")
 CACHE = Path("/var/lib/lghs/fleet-cache.json")
+COMMANDS = Path("/var/lib/lghs/fleet-commands.json")
 MAX_BODY = 256 * 1024
 LOCK = threading.Lock()
+COMMAND_TTL = 24 * 60 * 60
+ALLOWED_COMMANDS = {"lghs-update", "os-update"}
 
 
 def load_json(path, default):
@@ -58,25 +61,84 @@ def authorized(device, supplied):
 
 def update_cache(device, report):
     now = time.time()
-    with LOCK:
-        cache = load_json(CACHE, {"version": 1, "devices": {}})
-        if not isinstance(cache, dict):
-            cache = {"version": 1, "devices": {}}
-        cache.setdefault("version", 1)
-        devices = cache.setdefault("devices", {})
-        if not isinstance(devices, dict):
-            devices = {}
-            cache["devices"] = devices
-        report = dict(report)
-        report["device_id"] = device
-        report["received_at"] = now
-        devices[device] = report
-        cache["updated_at"] = now
-        atomic_json(CACHE, cache)
+    cache = load_json(CACHE, {"version": 1, "devices": {}})
+    if not isinstance(cache, dict):
+        cache = {"version": 1, "devices": {}}
+    cache.setdefault("version", 1)
+    devices = cache.setdefault("devices", {})
+    if not isinstance(devices, dict):
+        devices = {}
+        cache["devices"] = devices
+    report = dict(report)
+    report["device_id"] = device
+    report["received_at"] = now
+    devices[device] = report
+    cache["updated_at"] = now
+    atomic_json(CACHE, cache)
+
+
+def command_state():
+    data = load_json(COMMANDS, {"version": 1, "devices": {}})
+    if not isinstance(data, dict):
+        data = {"version": 1, "devices": {}}
+    devices = data.setdefault("devices", {})
+    if not isinstance(devices, dict):
+        data["devices"] = {}
+    data.setdefault("version", 1)
+    return data
+
+
+def acknowledge_commands(device, accepted_ids):
+    if not accepted_ids:
+        return
+    accepted = {str(x) for x in accepted_ids if x}
+    if not accepted:
+        return
+    now = time.time()
+    data = command_state()
+    rows = data.get("devices", {}).get(device, [])
+    changed = False
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("id") or "") in accepted and row.get("state", "pending") == "pending":
+                row["state"] = "accepted"
+                row["accepted_at"] = now
+                changed = True
+    if changed:
+        data["updated_at"] = now
+        atomic_json(COMMANDS, data, 0o600)
+
+
+def commands_for(device):
+    now = time.time()
+    data = command_state()
+    rows = data.get("devices", {}).get(device, [])
+    if not isinstance(rows, list):
+        return []
+    out = []
+    changed = False
+    kept = []
+    for row in rows:
+        if not isinstance(row, dict):
+            changed = True
+            continue
+        created = float(row.get("created_at") or 0)
+        if created and now - created > COMMAND_TTL:
+            changed = True
+            continue
+        kept.append(row)
+        action = str(row.get("action") or "")
+        if row.get("state", "pending") == "pending" and action in ALLOWED_COMMANDS and row.get("id"):
+            out.append({"id": str(row["id"]), "action": action, "created_at": created})
+    if changed:
+        data.setdefault("devices", {})[device] = kept
+        data["updated_at"] = now
+        atomic_json(COMMANDS, data, 0o600)
+    return out[:16]
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LGHSFleetAPI/1"
+    server_version = "LGHSFleetAPI/2"
 
     def log_message(self, fmt, *args):
         return
@@ -92,8 +154,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # Only the non-sensitive health check is exposed over HTTP. Fleet cache
-        # contents are read directly from disk by the local controller UI; they
-        # are intentionally not available through the Cloudflare reverse proxy.
+        # and command contents stay local to the controller filesystem.
         if self.path == "/health":
             self.reply(200, {"ok": True, "time": time.time()})
             return
@@ -132,8 +193,14 @@ class Handler(BaseHTTPRequestHandler):
         if claimed and claimed != device:
             self.reply(409, {"ok": False, "error": "device-mismatch"})
             return
-        update_cache(device, report)
-        self.reply(202, {"ok": True, "received_at": time.time()})
+        accepted = report.get("accepted_commands")
+        if not isinstance(accepted, list):
+            accepted = []
+        with LOCK:
+            acknowledge_commands(device, accepted)
+            update_cache(device, report)
+            commands = commands_for(device)
+        self.reply(202, {"ok": True, "received_at": time.time(), "commands": commands})
 
 
 def main():
@@ -145,6 +212,8 @@ def main():
         atomic_json(TOKENS, {"version": 1, "devices": {}}, 0o600)
     if not CACHE.exists():
         atomic_json(CACHE, {"version": 1, "devices": {}}, 0o640)
+    if not COMMANDS.exists():
+        atomic_json(COMMANDS, {"version": 1, "devices": {}}, 0o600)
     server = ThreadingHTTPServer((BIND, PORT), Handler)
     server.daemon_threads = True
     server.serve_forever(poll_interval=0.25)
