@@ -13,8 +13,14 @@ TOKEN = Path("/etc/lghs/secrets/fleet-api-token")
 SUDO_REQUEST_DIR = Path("/var/lib/lghs/sudo-requests")
 LGHS_STATUS = Path("/var/lib/lghs/update/lghs-status.json")
 OS_STATUS = Path("/var/lib/lghs/update/os-status.json")
+ACCEPTED_COMMANDS = Path("/var/lib/lghs/telemetry-accepted-commands.json")
+NETQUEUE = "/usr/local/sbin/lghs-netqueue"
 INTERVAL = float(os.environ.get("LGHS_TELEMETRY_SECONDS", "3"))
 TIMEOUT = float(os.environ.get("LGHS_TELEMETRY_TIMEOUT", "8"))
+ALLOWED_COMMANDS = {
+    "lghs-update": [NETQUEUE, "enqueue", "local-update"],
+    "os-update": [NETQUEUE, "enqueue", "os-update"],
+}
 
 
 def parse_conf():
@@ -49,6 +55,30 @@ def load_json(path):
         return value if isinstance(value, dict) else {}
     except Exception:
         return {}
+
+
+def atomic_json(path, value):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(value, separators=(",", ":")) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def accepted_commands():
+    data = load_json(ACCEPTED_COMMANDS)
+    rows = data.get("ids", []) if isinstance(data, dict) else []
+    return [str(x) for x in rows if x][-128:]
+
+
+def remember_accepted(command_id):
+    rows = accepted_commands()
+    if command_id not in rows:
+        rows.append(command_id)
+    atomic_json(ACCEPTED_COMMANDS, {"ids": rows[-128:], "updated_at": time.time()})
 
 
 def pending_sudo_requests():
@@ -87,9 +117,6 @@ def snapshot():
 
     lghs_status = load_json(LGHS_STATUS)
     os_status = load_json(OS_STATUS)
-    # /run/reboot-required is recreated by the current boot. If the previous
-    # update requested a reboot and the marker is gone now, the reboot happened
-    # and the persistent status file should no longer keep the UI in REBOOT!.
     if os_status.get("state") == "reboot_required" and not Path("/run/reboot-required").exists():
         os_status = dict(os_status)
         os_status["state"] = "complete"
@@ -99,7 +126,28 @@ def snapshot():
         os_status["updated_at"] = time.time()
     data["lghs_update"] = lghs_status
     data["os_update"] = os_status
+    data["accepted_commands"] = accepted_commands()
     return data
+
+
+def accept_commands(commands):
+    if not isinstance(commands, list):
+        return
+    already = set(accepted_commands())
+    for command in commands[:16]:
+        if not isinstance(command, dict):
+            continue
+        command_id = str(command.get("id") or "")
+        action = str(command.get("action") or "")
+        if not command_id or command_id in already or action not in ALLOWED_COMMANDS:
+            continue
+        try:
+            p = run(ALLOWED_COMMANDS[action])
+        except Exception:
+            continue
+        if p.returncode == 0:
+            remember_accepted(command_id)
+            already.add(command_id)
 
 
 def send_once():
@@ -120,12 +168,17 @@ def send_once():
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "User-Agent": "LGHS-Telemetry/2",
+            "User-Agent": "LGHS-Telemetry/3",
         },
     )
     with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
         if response.status not in (200, 202, 204):
             raise RuntimeError(f"HTTP {response.status}")
+        try:
+            result = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            result = {}
+    accept_commands(result.get("commands", []) if isinstance(result, dict) else [])
 
 
 def main():
