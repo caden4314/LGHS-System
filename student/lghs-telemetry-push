@@ -11,6 +11,8 @@ from pathlib import Path
 CONF = Path("/etc/lghs/fleet-api.conf")
 TOKEN = Path("/etc/lghs/secrets/fleet-api-token")
 SUDO_REQUEST_DIR = Path("/var/lib/lghs/sudo-requests")
+LGHS_STATUS = Path("/var/lib/lghs/update/lghs-status.json")
+OS_STATUS = Path("/var/lib/lghs/update/os-status.json")
 INTERVAL = float(os.environ.get("LGHS_TELEMETRY_SECONDS", "3"))
 TIMEOUT = float(os.environ.get("LGHS_TELEMETRY_TIMEOUT", "8"))
 
@@ -41,15 +43,16 @@ def parse_kv(text):
     return out
 
 
-def pending_sudo_requests():
-    """Read pending requests without invoking the mutating admin helper.
+def load_json(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
 
-    lghs-sudo-admin list creates/chmods files while expiring requests. The
-    telemetry service deliberately runs with ProtectSystem=strict, so calling
-    that helper from inside the service can fail even though a manual root
-    invocation succeeds. Telemetry only needs a read-only snapshot, so read
-    the request JSON files directly and filter by status/expiry here.
-    """
+
+def pending_sudo_requests():
+    """Read pending requests without invoking the mutating admin helper."""
     now = time.time()
     requests = []
     try:
@@ -78,11 +81,14 @@ def snapshot():
     data["device_id"] = str(data.get("hostname") or device).upper()
     data["sent_at"] = time.time()
 
-    # Always overwrite the summary's sudo_pending field with the read-only
-    # queue snapshot so a sandboxed lghs-report cannot hide real requests.
     requests = pending_sudo_requests()
     data["sudo_requests"] = requests
     data["sudo_pending"] = len(requests)
+
+    # Update state is written atomically by the two updater scripts. Keeping it
+    # nested avoids flattening structured progress data into key=value strings.
+    data["lghs_update"] = load_json(LGHS_STATUS)
+    data["os_update"] = load_json(OS_STATUS)
     return data
 
 
@@ -104,7 +110,7 @@ def send_once():
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "User-Agent": "LGHS-Telemetry/1",
+            "User-Agent": "LGHS-Telemetry/2",
         },
     )
     with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
