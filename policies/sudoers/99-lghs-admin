@@ -16,14 +16,11 @@ cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-export *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-sync
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-cloudflare-install
-# The desktop Fleet Control launcher is a single trusted management entrypoint.
-# It runs non-interactively so opening the desktop icon never produces an
-# administrator password warning/prompt, while general cs_admin sudo stays
-# password-protected by the PASSWD rule above.
+# Trusted Fleet Control entrypoints. The day-to-day dashboard lives in the
+# root-owned updater checkout and imports the installed responsive console.
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-console
+cs_admin ALL=(root) NOPASSWD: /usr/bin/python3 /opt/lghs/repo/controller/lghs-console-day2
 # lghs-telemetry-configure itself validates that the supplied endpoint is HTTPS.
-# Keep the sudoers command match syntax simple; ':' in an unescaped URL pattern
-# is parsed specially by sudoers on Raspberry Pi OS.
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-telemetry-configure *
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/poweroff
