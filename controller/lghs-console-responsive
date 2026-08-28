@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LGHS Fleet Control: cache-first responsive fleet administration UI.
+"""LGHS Fleet Control: responsive cache-first fleet administration UI.
 
 Passive browsing is always sourced from the controller HTTPS telemetry cache.
 Cloudflare SSH is used only for explicit administrator actions.
@@ -26,12 +26,14 @@ FRESH_SECONDS = max(3.0, float(os.environ.get("LGHS_FLEET_STALE_SECONDS", "15"))
 OFFLINE_SECONDS = max(FRESH_SECONDS + 5.0, float(os.environ.get("LGHS_FLEET_OFFLINE_SECONDS", "60")))
 TOAST_SECONDS = max(1.0, float(os.environ.get("LGHS_CONSOLE_TOAST_SECONDS", "4")))
 BELL_ENABLED = os.environ.get("LGHS_CONSOLE_BELL", "1").lower() not in ("0", "false", "no", "off")
-TEMP_WARN = 80.0
-TEMP_CRIT = 85.0
-DISK_WARN = 90.0
-DISK_CRIT = 96.0
 BACK_KEYS = (curses.KEY_BACKSPACE, 127, 8, ord("b"), ord("B"))
-workers = ThreadPoolExecutor(max_workers=6, thread_name_prefix="lghs-ui")
+TEMP_WARN, TEMP_CRIT = 80.0, 85.0
+DISK_WARN, DISK_CRIT = 90.0, 96.0
+ACTIVE_UPDATE_STATES = {
+    "checking", "downloading", "preparing", "installing", "validating", "cleaning",
+    "finishing", "rolling_back", "rebooting", "queued", "busy",
+}
+workers = ThreadPoolExecutor(max_workers=8, thread_name_prefix="lghs-ui")
 
 
 def load_base():
@@ -52,16 +54,16 @@ def number(value, default=0.0):
         return default
 
 
+def safe(win, y, x, text, attr=0):
+    mod.safe_add(win, y, x, text, attr)
+
+
 def hostname(d):
     return str(d.get("hostname") or d.get("device_id") or d.get("host") or d.get("addr") or "?")
 
 
 def device_id(d):
     return str(d.get("device_id") or d.get("name") or hostname(d)).upper()
-
-
-def safe(win, y, x, text, attr=0):
-    mod.safe_add(win, y, x, text, attr)
 
 
 def is_back(key):
@@ -79,13 +81,13 @@ def fmt_bytes(value):
     return f"{n:.0f}PB"
 
 
-def rate(value):
+def fmt_rate(value):
     n = max(0.0, number(value))
     for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
         if n < 1024:
-            return f"{n:.1f} {unit}" if n < 100 else f"{n:.0f} {unit}"
+            return f"{n:.1f}{unit}" if n < 100 else f"{n:.0f}{unit}"
         n /= 1024
-    return f"{n:.1f} TB/s"
+    return f"{n:.1f}TB/s"
 
 
 def cache_state(d):
@@ -108,12 +110,57 @@ def cache_age_text(d):
     return f"{age:.1f}s" if age < 100 else f"{int(age)}s"
 
 
-def update_state(d):
-    if str(d.get("update_service", "")) in ("active", "activating"):
-        return "UPDATING"
-    if number(d.get("netqueue_pending"), 0) > 0:
-        return "QUEUED"
-    return ""
+def normalized_update(raw, kind):
+    if not isinstance(raw, dict):
+        return {}
+    out = dict(raw)
+    out.setdefault("kind", kind)
+    return out
+
+
+def operation_for_device(d):
+    candidates = [
+        normalized_update(d.get("lghs_update"), "lghs"),
+        normalized_update(d.get("os_update"), "os"),
+    ]
+    candidates = [x for x in candidates if x]
+    active = [x for x in candidates if str(x.get("state", "")).lower() in ACTIVE_UPDATE_STATES or str(x.get("state", "")).lower() == "reboot_required"]
+    if active:
+        return max(active, key=lambda x: number(x.get("updated_at"), 0))
+    return max(candidates, key=lambda x: number(x.get("updated_at"), 0)) if candidates else {}
+
+
+def operation_label(op):
+    if not op:
+        return ""
+    kind = "LGHS" if op.get("kind") == "lghs" else "OS"
+    state = str(op.get("state", "")).lower()
+    mapping = {
+        "queued": "QUEUED", "checking": "CHECKING", "downloading": "DOWNLOAD",
+        "preparing": "PREP", "installing": f"{kind} UPDATE", "validating": "VALIDATE",
+        "cleaning": "CLEANING", "finishing": "FINISHING", "rolling_back": "ROLLBACK",
+        "reboot_required": "REBOOT!", "rebooting": "REBOOTING", "failed": "FAILED",
+        "busy": "BUSY",
+    }
+    return mapping.get(state, "")
+
+
+def progress_text(op):
+    if not op:
+        return ""
+    p = op.get("progress")
+    if p is None:
+        return str(op.get("stage") or op.get("state") or "")
+    return f"{int(number(p))}% {op.get('stage') or ''}".strip()
+
+
+def progress_bar(progress, width=24):
+    try:
+        p = max(0, min(100, int(float(progress))))
+    except Exception:
+        return "[" + ("-" * width) + "]"
+    filled = int(round(width * p / 100))
+    return "[" + ("#" * filled) + ("-" * (width - filled)) + f"] {p:3d}%"
 
 
 def controller_commit():
@@ -126,15 +173,16 @@ def controller_commit():
 def version_state(d, state):
     commit = str(d.get("commit") or "")
     current = state.get("controller_commit", "")
-    if commit and current and commit != "unknown" and current != "unknown" and commit != current:
+    if commit and current and commit not in ("unknown", current) and current != "unknown":
         return "OUTDATED"
     return ""
 
 
 def health(d, state=None):
-    progress = update_state(d)
-    if progress:
-        return progress
+    op = operation_for_device(d)
+    label = operation_label(op)
+    if label:
+        return label
     cstate = cache_state(d)
     if cstate != "ONLINE":
         return cstate
@@ -158,7 +206,6 @@ def load_registry():
 
 
 def load_devices():
-    """Use the cache-aware transport shim; never routine-SSH poll student Pis."""
     try:
         devices = mod.refresh_fleet(mod.discover_devices())
     except Exception:
@@ -170,27 +217,23 @@ def load_devices():
             d["group"] = str(meta.get("group") or meta.get("class") or meta.get("room") or "Ungrouped")
             d["tags"] = meta.get("tags") if isinstance(meta.get("tags"), list) else []
         else:
-            d["group"] = "Ungrouped"
-            d["tags"] = []
+            d["group"], d["tags"] = "Ungrouped", []
     return devices
 
 
 def traffic_sample(state, devices):
     now = time.monotonic()
     old = state.get("traffic_samples", {})
-    new = {}
-    down = up = 0.0
-    usable = 0
+    new, down, up, usable = {}, 0.0, 0.0, 0
     for d in devices:
         if cache_state(d) != "ONLINE":
             continue
-        key = device_id(d)
-        rx = number(d.get("rx_bytes"), -1)
-        tx = number(d.get("tx_bytes"), -1)
+        did = device_id(d)
+        rx, tx = number(d.get("rx_bytes"), -1), number(d.get("tx_bytes"), -1)
         if rx < 0 or tx < 0:
             continue
-        new[key] = (rx, tx, now)
-        prev = old.get(key)
+        new[did] = (rx, tx, now)
+        prev = old.get(did)
         if not prev:
             continue
         prx, ptx, pts = prev
@@ -205,8 +248,7 @@ def traffic_sample(state, devices):
 
 
 def pending_requests(devices):
-    out = []
-    now = time.time()
+    out, now = [], time.time()
     for d in devices:
         for req in d.get("sudo_requests") or []:
             if str(req.get("status", "pending")) != "pending":
@@ -227,8 +269,12 @@ def issues(devices, state):
         elif cstate == "OFFLINE":
             rows.append((d, "CRITICAL", "OFFLINE", f"last telemetry {cache_age_text(d)} ago"))
             continue
-        temp = number(d.get("temp_c"), -1)
-        disk = number(d.get("disk_pct"), -1)
+        op = operation_for_device(d)
+        if str(op.get("state", "")) == "failed":
+            rows.append((d, "CRITICAL", "UPDATE", str(op.get("message") or op.get("stage") or "update failed")))
+        if str(op.get("state", "")) == "reboot_required":
+            rows.append((d, "WARNING", "REBOOT", "Raspberry Pi OS update requires reboot"))
+        temp, disk = number(d.get("temp_c"), -1), number(d.get("disk_pct"), -1)
         if temp >= TEMP_CRIT:
             rows.append((d, "CRITICAL", "TEMP", f"{temp:.1f}C"))
         elif temp >= TEMP_WARN:
@@ -281,20 +327,18 @@ def add_notice(state, level, title, detail, toast=True, bell=False):
     state["notices"] = state["notices"][-250:]
     write_notices(state["notices"])
     if toast:
-        state["toast"] = item
-        state["toast_until"] = time.monotonic() + TOAST_SECONDS
+        state["toast"], state["toast_until"] = item, time.monotonic() + TOAST_SECONDS
     if bell:
         ring()
 
 
 def snapshot_signature(d, state):
+    op = operation_for_device(d)
     return {
-        "state": cache_state(d),
-        "health": health(d, state),
-        "commit": str(d.get("commit") or ""),
-        "temp": int(number(d.get("temp_c"), -1)),
-        "disk": int(number(d.get("disk_pct"), -1)),
-        "sudo": len(d.get("sudo_requests") or []),
+        "state": cache_state(d), "health": health(d, state), "commit": str(d.get("commit") or ""),
+        "temp": int(number(d.get("temp_c"), -1)), "disk": int(number(d.get("disk_pct"), -1)),
+        "sudo": len(d.get("sudo_requests") or []), "op_state": str(op.get("state") or ""),
+        "op_stage": str(op.get("stage") or ""), "op_progress": op.get("progress"),
     }
 
 
@@ -312,8 +356,9 @@ def detect_changes(state, devices):
         if cur["state"] != old.get("state"):
             level = "critical" if cur["state"] == "OFFLINE" else ("warning" if cur["state"] == "STALE" else "normal")
             add_notice(state, level, f"{did} {cur['state'].lower()}", f"Telemetry state changed from {old.get('state')} to {cur['state']}", bell=level == "critical")
-        if cur["health"] != old.get("health") and cur["health"] in ("CHECK", "OUTDATED", "UPDATING", "QUEUED"):
-            add_notice(state, "warning", f"{did} {cur['health'].lower()}", "Fleet health state changed")
+        if cur["op_state"] != old.get("op_state") and cur["op_state"]:
+            level = "critical" if cur["op_state"] == "failed" else ("warning" if cur["op_state"] in ("rolling_back", "reboot_required") else "normal")
+            add_notice(state, level, f"{did} update {cur['op_state'].replace('_',' ')}", cur["op_stage"] or "Update state changed", bell=level == "critical")
         if cur["temp"] >= int(TEMP_CRIT) and old.get("temp", -1) < int(TEMP_CRIT):
             add_notice(state, "critical", f"{did} temperature", f"Temperature reached {cur['temp']}C", bell=True)
         elif cur["temp"] >= int(TEMP_WARN) and old.get("temp", -1) < int(TEMP_WARN):
@@ -325,7 +370,7 @@ def detect_changes(state, devices):
 
 def refresh_cache(state, force=False):
     now = time.monotonic()
-    if force or now - state.get("cache_loaded", 0) >= 0.5:
+    if force or now - state.get("cache_loaded", 0) >= 0.75:
         state["devices"] = load_devices()
         state["cache_loaded"] = now
         state["generation"] += 1
@@ -335,18 +380,18 @@ def refresh_cache(state, force=False):
     return state["devices"]
 
 
-def controller_health(state, force=False):
-    now = time.monotonic()
-    if not force and now - state.get("controller_health_at", 0) < 5:
-        return state.get("controller_health", {})
+def controller_health_probe():
     services = ["lghs-fleet-api.service", "lghs-fleet-notify.service", "lghs-audit-sync.timer"]
     statuses = {}
     for name in services:
-        p = subprocess.run(["systemctl", "is-active", name], text=True, capture_output=True)
+        p = subprocess.run(["systemctl", "is-active", name], text=True, capture_output=True, timeout=3)
         statuses[name] = p.stdout.strip() or "unknown"
     cf = "unknown"
     for candidate in ("cloudflared.service", "lghs-cloudflared.service"):
-        p = subprocess.run(["systemctl", "is-active", candidate], text=True, capture_output=True)
+        try:
+            p = subprocess.run(["systemctl", "is-active", candidate], text=True, capture_output=True, timeout=3)
+        except Exception:
+            continue
         if p.stdout.strip() == "active":
             cf = "active"
             break
@@ -354,22 +399,31 @@ def controller_health(state, force=False):
             cf = p.stdout.strip()
     statuses["cloudflare"] = cf
     try:
-        age = max(0.0, time.time() - CACHE.stat().st_mtime)
+        statuses["cache_age"] = max(0.0, time.time() - CACHE.stat().st_mtime)
     except Exception:
-        age = None
-    statuses["cache_age"] = age
-    good = all(statuses.get(x) == "active" for x in services)
-    if cf not in ("active", "unknown"):
-        good = False
-    statuses["ok"] = good
-    old_ok = state.get("controller_health", {}).get("ok")
-    state["controller_health"] = statuses
-    state["controller_health_at"] = now
-    if old_ok is True and not good:
-        add_notice(state, "critical", "Controller degraded", "One or more controller services are unhealthy", bell=True)
-    elif old_ok is False and good:
-        add_notice(state, "normal", "Controller recovered", "Controller services are healthy again")
+        statuses["cache_age"] = None
+    statuses["ok"] = all(statuses.get(x) == "active" for x in services) and cf in ("active", "unknown")
     return statuses
+
+
+def service_health_tick(state, force=False):
+    now = time.monotonic()
+    future = state.get("controller_health_future")
+    if future is not None and future.done():
+        old_ok = state.get("controller_health", {}).get("ok")
+        try:
+            state["controller_health"] = future.result()
+        except Exception as exc:
+            state["controller_health"] = {"ok": False, "error": str(exc)}
+        state["controller_health_future"] = None
+        state["controller_health_at"] = now
+        new_ok = state["controller_health"].get("ok")
+        if old_ok is True and new_ok is False:
+            add_notice(state, "critical", "Controller degraded", "One or more controller services are unhealthy", bell=True)
+        elif old_ok is False and new_ok is True:
+            add_notice(state, "normal", "Controller recovered", "Controller services are healthy again")
+    if state.get("controller_health_future") is None and (force or now - state.get("controller_health_at", 0) >= 10):
+        state["controller_health_future"] = workers.submit(controller_health_probe)
 
 
 def active_jobs(state):
@@ -379,12 +433,10 @@ def active_jobs(state):
 def start_job(state, title, targets, command=None, runner=None, popup_result=True):
     if runner is None:
         def runner():
-            parts = []
-            rc = 0
+            parts, rc = [], 0
             for d in targets:
                 p = mod.ssh_capture(d["addr"], command)
-                if p.returncode != 0:
-                    rc = p.returncode
+                rc = rc or p.returncode
                 body = ((p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")).strip()
                 parts.append(f"{hostname(d)}: {'OK' if p.returncode == 0 else 'FAILED'}\n{body}")
             return subprocess.CompletedProcess([], rc, "\n\n".join(parts), "")
@@ -396,7 +448,7 @@ def start_job(state, title, targets, command=None, runner=None, popup_result=Tru
     state["next_job_id"] += 1
     job["future"] = workers.submit(runner)
     state["jobs"].append(job)
-    add_notice(state, "normal", f"Job #{job['id']} started", title, toast=True)
+    add_notice(state, "normal", f"Job #{job['id']} started", title)
     return job
 
 
@@ -411,78 +463,23 @@ def harvest_jobs(state):
             job["returncode"] = getattr(p, "returncode", 0)
             job["result"] = body or f"Exit code {job['returncode']}"
         except Exception as exc:
-            job["returncode"] = 255
-            job["result"] = f"Action failed: {exc}"
-        job["done"] = True
-        job["finished"] = time.time()
+            job["returncode"], job["result"] = 255, f"Action failed: {exc}"
+        job["done"], job["finished"] = True, time.time()
         level = "normal" if job["returncode"] == 0 else "critical"
         add_notice(state, level, f"Job #{job['id']} {'finished' if job['returncode'] == 0 else 'failed'}", job["title"], bell=level == "critical")
+        if job.get("popup_result"):
+            state["result_queue"].append(job)
         refresh_cache(state, True)
 
 
-def read_key(win, state, allow_lock=True):
-    if allow_lock and time.monotonic() - state["last_activity"] >= state["idle_seconds"]:
-        lock_prompt(win, state)
-    key = win.getch()
-    if key == 27:
-        return -1
-    if key != -1:
-        state["last_activity"] = time.monotonic()
-    return key
-
-
-def header(stdscr, state, title, subtitle=""):
-    controller_health(state)
-    stdscr.erase()
-    h, w = stdscr.getmaxyx()
-    devices = state.get("devices", [])
-    online = sum(cache_state(d) == "ONLINE" for d in devices)
-    stale = sum(cache_state(d) == "STALE" for d in devices)
-    warn = len(issues(devices, state))
-    sudo = len(pending_requests(devices))
-    jobs = len(active_jobs(state))
-    ctrl = "OK" if state.get("controller_health", {}).get("ok", True) else "CTRL!"
-    left = f" LGHS CONTROL | {title} "
-    right = f" {ctrl} | ONLINE {online}/{len(devices)} | STALE {stale} | WARN {warn} | SUDO {sudo} | JOBS {jobs} | ↓ {rate(state.get('down_bps',0))} ↑ {rate(state.get('up_bps',0))} "
-    usable = max(1, w - 1)
-    if len(left) + len(right) + 1 <= usable:
-        top = left + " " * (usable - len(left) - len(right)) + right
-    else:
-        top = (left + right)[:usable]
-    safe(stdscr, 0, 0, top.ljust(usable), curses.A_REVERSE | curses.A_BOLD)
-    if subtitle:
-        safe(stdscr, 1, 1, subtitle)
-    safe(stdscr, h - 2, 1, "F1 Help F2 Fleet F3 Telemetry F4 Sudo F5 Updates F6 Logs F7 Attention F8 Activity F9 Notices F10 Quit", curses.A_DIM)
-    safe(stdscr, h - 1, 1, "Backspace/B back | Enter open | Space mark | A actions | J jobs | / search | G group | R refresh", curses.A_DIM)
-    draw_toast(stdscr, state)
-
-
-def draw_toast(stdscr, state):
-    item = state.get("toast")
-    if not item or time.monotonic() >= state.get("toast_until", 0):
-        return
-    h, w = stdscr.getmaxyx()
-    detail = f"{item.get('title','')}: {item.get('detail','')}"
-    width = min(64, max(28, len(detail) + 4), max(28, w - 4))
-    try:
-        win = curses.newwin(4, width, max(1, h - 7), max(1, w - width - 2))
-        win.box()
-        safe(win, 0, 2, f" {str(item.get('level','INFO')).upper()} ", curses.A_BOLD)
-        safe(win, 1, 2, item.get("title", ""), curses.A_BOLD)
-        safe(win, 2, 2, item.get("detail", ""))
-        win.noutrefresh()
-    except curses.error:
-        pass
-
-
-def modal_window(stdscr, height, width, title):
+def modal_window(stdscr, height, width, title, timeout=-1):
     raw = getattr(stdscr, "_raw", stdscr)
     h, w = raw.getmaxyx()
     ph = min(max(6, height), max(6, h - 2))
     pw = min(max(30, width), max(30, w - 2))
     win = curses.newwin(ph, pw, max(0, (h - ph) // 2), max(0, (w - pw) // 2))
     win.keypad(True)
-    win.timeout(50)
+    win.timeout(timeout)
     win.erase(); win.box()
     safe(win, 0, 2, f" {title} ", curses.A_REVERSE | curses.A_BOLD)
     return win, ph, pw
@@ -501,7 +498,10 @@ def validate_password(password):
     if not password:
         return False
     try:
-        p = subprocess.run(["sudo", "-u", "cs_admin", "sudo", "-S", "-k", "-p", "", "-v"], input=password + "\n", text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        p = subprocess.run(
+            ["sudo", "-u", "cs_admin", "sudo", "-S", "-k", "-p", "", "-v"],
+            input=password + "\n", text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
         return p.returncode == 0
     except Exception:
         return False
@@ -512,7 +512,7 @@ def lock_prompt(stdscr, state):
     raw.timeout(-1)
     error = ""
     while True:
-        win, _, _ = modal_window(raw, 10, 58, "LGHS FLEET LOCKED")
+        win, _, _ = modal_window(raw, 10, 58, "LGHS FLEET LOCKED", timeout=-1)
         safe(win, 2, 3, "Fleet console locked due to inactivity", curses.A_BOLD)
         safe(win, 4, 3, "cs_admin password:")
         if error:
@@ -520,15 +520,32 @@ def lock_prompt(stdscr, state):
         chars = []
         while True:
             safe(win, 4, 23, "*" * len(chars) + " " * 26)
-            win.refresh(); key = win.getch()
-            if key in (10, 13): break
+            win.refresh()
+            key = win.getch()
+            if key in (10, 13):
+                break
             if key in (curses.KEY_BACKSPACE, 127, 8):
-                if chars: chars.pop()
+                if chars:
+                    chars.pop()
             elif 32 <= key <= 126 and key != 27 and len(chars) < 128:
                 chars.append(chr(key))
         if validate_password("".join(chars)):
-            state["last_activity"] = time.monotonic(); raw.timeout(50); raw.erase(); raw.refresh(); return
+            state["last_activity"] = time.monotonic()
+            raw.timeout(100)
+            raw.erase(); raw.refresh()
+            return
         error = "Incorrect password. Try again."
+
+
+def read_key(win, state, allow_lock=True):
+    if allow_lock and time.monotonic() - state["last_activity"] >= state["idle_seconds"]:
+        lock_prompt(win, state)
+    key = win.getch()
+    if key == 27:
+        return -1
+    if key != -1:
+        state["last_activity"] = time.monotonic()
+    return key
 
 
 def popup(stdscr, state, title, text, footer="Enter or Backspace/B close"):
@@ -541,14 +558,20 @@ def popup(stdscr, state, title, text, footer="Enter or Backspace/B close"):
     while True:
         win, ph, _ = modal_window(stdscr, height, width, title)
         visible = max(1, ph - 4)
-        for i, line in enumerate(lines[off:off + visible], 1): safe(win, i, 2, line)
-        safe(win, ph - 2, 2, footer, curses.A_DIM); win.refresh()
-        key = modal_key(win, state)
-        if key in (10, 13) or is_back(key): raw.touchwin(); raw.refresh(); return
-        if key in (curses.KEY_DOWN, ord("j")): off = min(max(0, len(lines) - visible), off + 1)
-        elif key in (curses.KEY_UP, ord("k")): off = max(0, off - 1)
-        elif key == curses.KEY_NPAGE: off = min(max(0, len(lines) - visible), off + visible)
-        elif key == curses.KEY_PPAGE: off = max(0, off - visible)
+        for i, line in enumerate(lines[off:off + visible], 1):
+            safe(win, i, 2, line)
+        safe(win, ph - 2, 2, footer, curses.A_DIM)
+        win.refresh(); key = modal_key(win, state)
+        if key in (10, 13) or is_back(key):
+            raw.touchwin(); raw.refresh(); return
+        if key in (curses.KEY_DOWN, ord("j")):
+            off = min(max(0, len(lines) - visible), off + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            off = max(0, off - 1)
+        elif key == curses.KEY_NPAGE:
+            off = min(max(0, len(lines) - visible), off + visible)
+        elif key == curses.KEY_PPAGE:
+            off = max(0, off - visible)
 
 
 def confirm(stdscr, state, text):
@@ -556,10 +579,12 @@ def confirm(stdscr, state, text):
     while True:
         win, _, _ = modal_window(stdscr, 9, min(94, max(58, len(text) + 8)), "CONFIRM")
         safe(win, 2, 3, text, curses.A_BOLD)
-        safe(win, 5, 3, "Y Yes    N No    Backspace/B Cancel", curses.A_BOLD); win.refresh()
-        key = modal_key(win, state)
-        if key in (ord("y"), ord("Y")): raw.touchwin(); raw.refresh(); return True
-        if key in (ord("n"), ord("N")) or is_back(key): raw.touchwin(); raw.refresh(); return False
+        safe(win, 5, 3, "Y Yes    N No    Backspace/B Cancel", curses.A_BOLD)
+        win.refresh(); key = modal_key(win, state)
+        if key in (ord("y"), ord("Y")):
+            raw.touchwin(); raw.refresh(); return True
+        if key in (ord("n"), ord("N")) or is_back(key):
+            raw.touchwin(); raw.refresh(); return False
 
 
 def prompt_text(stdscr, state, title, label, initial=""):
@@ -568,47 +593,23 @@ def prompt_text(stdscr, state, title, label, initial=""):
     while True:
         win, _, pw = modal_window(stdscr, 9, 72, title)
         safe(win, 2, 3, label)
-        shown = "".join(value)
-        safe(win, 4, 3, shown + " " * max(1, pw - 8), curses.A_REVERSE)
-        safe(win, 6, 3, "Enter apply | Backspace edits | B cancels only when field is empty", curses.A_DIM)
+        safe(win, 4, 3, "".join(value) + " " * max(1, pw - 8), curses.A_REVERSE)
+        safe(win, 6, 3, "Enter apply | Backspace edits | B cancels when field is empty", curses.A_DIM)
         win.refresh(); key = modal_key(win, state)
-        if key in (10, 13): raw.touchwin(); raw.refresh(); return "".join(value).strip()
+        if key in (10, 13):
+            raw.touchwin(); raw.refresh(); return "".join(value).strip()
         if key in (curses.KEY_BACKSPACE, 127, 8):
-            if value: value.pop()
+            if value:
+                value.pop()
         elif key in (ord("b"), ord("B")) and not value:
             raw.touchwin(); raw.refresh(); return None
         elif 32 <= key <= 126 and key != 27 and len(value) < 80:
             value.append(chr(key))
 
 
-def contextual_help(stdscr, state):
-    context = state.get("context", "main")
-    common = """Global keys
-F1 Help   F2 Fleet   F3 Telemetry   F4 Sudo   F5 Updates
-F6 Logs   F7 Attention   F8 Activity   F9 Notices   F10 Quit
-J Jobs    / Search   G Group filter
-
-Navigation
-Up/Down moves. Enter opens. 1-9 selects a visible row.
-Backspace or B goes back. Bare Esc is deliberately ignored.
-R refreshes the LOCAL telemetry cache. Passive screens never SSH poll.
-"""
-    extras = {
-        "fleet": "\nFleet\nSpace marks/unmarks Pis. A opens quick actions. U updates selected Pi.\nSearch matches device, group, version, state, and tags. G cycles groups.",
-        "sudo": "\nSudo\nY approves once. N denies. F1 shows complete request details.\nBackspace/B leaves a request pending.",
-        "attention": "\nAttention\nEnter opens one-click recovery for the highlighted problem.",
-        "updates": "\nUpdates\nUpdates are background jobs. You can leave this screen while they run.",
-        "notices": "\nNotices\nPersistent fleet events, job results, controller warnings, and alerts.",
-    }
-    popup(stdscr, state, f"Help - {context}", common + extras.get(context, ""))
-
-
 def request_age(req):
     started = number(req.get("requested_epoch"), 0)
-    if not started:
-        return "?"
-    age = max(0, int(time.time() - started))
-    return f"{age}s"
+    return "?" if not started else f"{max(0, int(time.time() - started))}s"
 
 
 def request_ttl(req):
@@ -623,10 +624,11 @@ def request_details(d, req):
     argv = req.get("argv") or []
     command = req.get("command") or (shlex.join([str(x) for x in argv]) if argv else "?")
     return "\n".join([
-        f"Device:       {hostname(d)}", f"Group:        {d.get('group','Ungrouped')}", f"Endpoint:     {d.get('addr','?')}",
-        f"Request ID:   {req.get('id','?')}", f"Requester:    {req.get('requester','?')}", f"Requested:    {req.get('requested_at','?')}",
-        f"Age:          {request_age(req)}", f"Expires:      {request_ttl(req)}", f"Working dir:  {req.get('cwd','?')}", f"Command:      {command}",
-        "", "Arguments:", *[f"  [{i}] {arg}" for i, arg in enumerate(argv)],
+        f"Device:       {hostname(d)}", f"Group:        {d.get('group','Ungrouped')}",
+        f"Request ID:   {req.get('id','?')}", f"Requester:    {req.get('requester','?')}",
+        f"Requested:    {req.get('requested_at','?')}", f"Age:          {request_age(req)}",
+        f"Expires:      {request_ttl(req)}", f"Working dir:  {req.get('cwd','?')}",
+        f"Command:      {command}", "", "Arguments:", *[f"  [{i}] {arg}" for i, arg in enumerate(argv)],
     ])
 
 
@@ -634,7 +636,7 @@ def sudo_popup(stdscr, state, d, req):
     rid = str(req.get("id") or "")
     raw = getattr(stdscr, "_raw", stdscr)
     while True:
-        win, _, _ = modal_window(stdscr, 16, 96, "SUDO REQUEST")
+        win, _, _ = modal_window(stdscr, 16, 96, "SUDO REQUEST", timeout=250)
         safe(win, 2, 3, f"{hostname(d)} | {d.get('group','Ungrouped')} | {req.get('requester','?')}", curses.A_BOLD)
         safe(win, 4, 3, str(req.get("command") or ""), curses.A_BOLD)
         safe(win, 6, 3, f"cwd: {req.get('cwd','?')}")
@@ -643,29 +645,95 @@ def sudo_popup(stdscr, state, d, req):
         safe(win, 11, 3, "Y Approve once   N Deny   F1 Full details", curses.A_BOLD)
         safe(win, 13, 3, "Backspace/B leaves this request pending.", curses.A_DIM)
         win.refresh(); key = modal_key(win, state)
+        if key == -1:
+            continue
         if key == curses.KEY_F1:
             popup(stdscr, state, f"Sudo details - {hostname(d)}", request_details(d, req)); continue
         if key in (ord("y"), ord("Y"), ord("n"), ord("N")):
             decision = "approve" if key in (ord("y"), ord("Y")) else "deny"
             start_job(state, f"Sudo {decision} - {hostname(d)}", [d], f"sudo -n /usr/local/sbin/lghs-sudo-admin {decision} {rid}")
             raw.touchwin(); raw.refresh(); return
-        if is_back(key): raw.touchwin(); raw.refresh(); return
+        if is_back(key):
+            raw.touchwin(); raw.refresh(); return
 
 
 def maybe_auto_sudo(stdscr, state):
     if state.get("sudo_popup_active"):
         return
     notified = state.setdefault("notified_sudo", set())
-    for d, req in pending_requests(refresh_cache(state)):
+    for d, req in pending_requests(state.get("devices", [])):
         rid = str(req.get("id") or "")
         key = f"{device_id(d)}:{rid}"
         if rid and key not in notified:
             notified.add(key)
-            add_notice(state, "critical", "Sudo request", f"{device_id(d)}: {req.get('command','')}", toast=True, bell=True)
+            add_notice(state, "critical", "Sudo request", f"{device_id(d)}: {req.get('command','')}", bell=True)
             state["sudo_popup_active"] = True
-            try: sudo_popup(stdscr, state, d, req)
-            finally: state["sudo_popup_active"] = False
+            try:
+                sudo_popup(stdscr, state, d, req)
+            finally:
+                state["sudo_popup_active"] = False
             return
+
+
+def maybe_result_popup(stdscr, state):
+    if not state["result_queue"] or state.get("sudo_popup_active"):
+        return
+    job = state["result_queue"].pop(0)
+    status = "SUCCESS" if job.get("returncode") == 0 else "FAILED"
+    popup(stdscr, state, f"{status} - Job #{job['id']}", job.get("result") or "No output")
+
+
+def maintenance(stdscr, state):
+    harvest_jobs(state)
+    refresh_cache(state)
+    service_health_tick(state)
+    maybe_auto_sudo(stdscr, state)
+    maybe_result_popup(stdscr, state)
+
+
+def controller_status_short(state):
+    h = state.get("controller_health", {})
+    if not h:
+        return "CTRL?"
+    return "CTRL OK" if h.get("ok") else "CTRL!"
+
+
+def draw_toast(stdscr, state):
+    item = state.get("toast")
+    if not item or time.monotonic() >= state.get("toast_until", 0):
+        return
+    h, w = stdscr.getmaxyx()
+    width = min(64, max(28, len(str(item.get("detail", ""))) + 4), max(28, w - 4))
+    try:
+        win = curses.newwin(4, width, max(1, h - 7), max(1, w - width - 2))
+        win.box()
+        safe(win, 0, 2, f" {str(item.get('level','INFO')).upper()} ", curses.A_BOLD)
+        safe(win, 1, 2, item.get("title", ""), curses.A_BOLD)
+        safe(win, 2, 2, item.get("detail", ""))
+        win.noutrefresh()
+    except curses.error:
+        pass
+
+
+def header(stdscr, state, title, subtitle=""):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    devices = state.get("devices", [])
+    online = sum(cache_state(d) == "ONLINE" for d in devices)
+    stale = sum(cache_state(d) == "STALE" for d in devices)
+    warn = len(issues(devices, state))
+    sudo = len(pending_requests(devices))
+    jobs = len(active_jobs(state))
+    left = f" LGHS CONTROL | {title} "
+    right = f" {controller_status_short(state)} | ONLINE {online}/{len(devices)} | STALE {stale} | WARN {warn} | SUDO {sudo} | JOBS {jobs} | d {fmt_rate(state.get('down_bps',0))} u {fmt_rate(state.get('up_bps',0))} "
+    usable = max(1, w - 1)
+    top = left + (" " * max(1, usable - len(left) - len(right))) + right if len(left) + len(right) + 1 <= usable else (left + right)[:usable]
+    safe(stdscr, 0, 0, top[:usable].ljust(usable), curses.A_REVERSE | curses.A_BOLD)
+    if subtitle:
+        safe(stdscr, 1, 1, subtitle)
+    safe(stdscr, h - 2, 1, "F1 Help F2 Fleet F3 Telemetry F4 Sudo F5 Updates F6 Logs F7 Attention F8 Activity F9 Notices F10 Quit", curses.A_DIM)
+    safe(stdscr, h - 1, 1, "Backspace/B back | Enter open | Space mark | A actions | J jobs | / search | G group | R refresh", curses.A_DIM)
+    draw_toast(stdscr, state)
 
 
 def global_action(key):
@@ -676,14 +744,40 @@ def global_action(key):
     }.get(key)
 
 
+def contextual_help(stdscr, state):
+    context = state.get("context", "main")
+    common = """Global
+F1 Help  F2 Fleet  F3 Telemetry  F4 Sudo  F5 Updates
+F6 Logs  F7 Attention  F8 Activity  F9 Notices  F10 Quit
+J Jobs   / Search   G Group filter
+
+Navigation
+Up/Down moves. Enter opens. 1-9 selects a visible row.
+Backspace or B goes back. Bare Esc is deliberately ignored.
+R reloads the local HTTPS telemetry cache. Passive screens never SSH poll.
+"""
+    extras = {
+        "fleet": "\nFleet\nSpace marks Pis. A opens quick actions. U updates selected Pi.\nP opens current update progress for the selected Pi.",
+        "updates": "\nUpdates\nUpdate commands launch in background. Progress comes back through HTTPS telemetry.\nJ shows controller jobs plus live per-Pi update stages.",
+        "sudo": "\nSudo\nY approves once. N denies. F1 shows full request details. B leaves pending.",
+        "attention": "\nAttention\nEnter opens one-click recovery for the highlighted problem.",
+    }
+    popup(stdscr, state, f"Help - {context}", common + extras.get(context, ""))
+
+
 def visible_devices(state, telemetry=False):
     rows = list(state.get("devices", []))
     group = state.get("group_filter")
-    if group and group != "All": rows = [d for d in rows if d.get("group", "Ungrouped") == group]
+    if group and group != "All":
+        rows = [d for d in rows if d.get("group", "Ungrouped") == group]
     query = state.get("search", "").lower().strip()
     if query:
         def hay(d):
-            return " ".join([hostname(d), device_id(d), str(d.get("group", "")), str(d.get("version", "")), health(d, state), " ".join(map(str, d.get("tags") or []))]).lower()
+            op = operation_for_device(d)
+            return " ".join([
+                hostname(d), device_id(d), str(d.get("group", "")), str(d.get("version", "")), health(d, state),
+                str(op.get("stage", "")), str(op.get("state", "")), " ".join(map(str, d.get("tags") or [])),
+            ]).lower()
         rows = [d for d in rows if query in hay(d)]
     if telemetry:
         rows.sort(key=lambda d: (cache_state(d) != "ONLINE", -number(d.get("cpu_pct")), hostname(d).lower()))
@@ -696,19 +790,25 @@ def cycle_group(state):
     groups = sorted({str(d.get("group") or "Ungrouped") for d in state.get("devices", [])})
     options = ["All"] + groups
     current = state.get("group_filter", "All")
-    try: idx = options.index(current)
-    except ValueError: idx = 0
+    try:
+        idx = options.index(current)
+    except ValueError:
+        idx = 0
     state["group_filter"] = options[(idx + 1) % len(options)] if options else "All"
-    add_notice(state, "normal", "Group filter", state["group_filter"], toast=True)
+    add_notice(state, "normal", "Group filter", state["group_filter"])
 
 
 def list_nav(key, selected, count, start, rows):
-    if key in (curses.KEY_DOWN, ord("j")) and count: selected = min(count - 1, selected + 1)
-    elif key in (curses.KEY_UP, ord("k")) and count: selected = max(0, selected - 1)
+    if key in (curses.KEY_DOWN, ord("j")) and count:
+        selected = min(count - 1, selected + 1)
+    elif key in (curses.KEY_UP, ord("k")) and count:
+        selected = max(0, selected - 1)
     elif ord("1") <= key <= ord("9"):
         idx = start + key - ord("1")
-        if idx < min(count, start + rows): return idx, True
-    elif key in (10, 13) and count: return selected, True
+        if idx < min(count, start + rows):
+            return idx, True
+    elif key in (10, 13) and count:
+        return selected, True
     return selected, False
 
 
@@ -719,42 +819,98 @@ def selected_targets(state, fallback=None):
     return [fallback] if fallback else []
 
 
+def update_progress_lines(d):
+    lines = [f"Device: {hostname(d)}", f"State:  {health(d)}", f"Cache:  {cache_age_text(d)}", ""]
+    for key, label in (("lghs_update", "LGHS System"), ("os_update", "Raspberry Pi OS")):
+        op = normalized_update(d.get(key), "lghs" if key == "lghs_update" else "os")
+        if not op:
+            continue
+        lines += [
+            label,
+            f"  State:    {str(op.get('state','unknown')).replace('_',' ')}",
+            f"  Stage:    {op.get('stage','?')}",
+            f"  Progress: {progress_bar(op.get('progress'), 28)}",
+            f"  Message:  {op.get('message','')}",
+        ]
+        if op.get("packages_total"):
+            lines.append(f"  Packages: {op.get('packages_total')}")
+        if op.get("current_package"):
+            lines.append(f"  Current:  {op.get('current_package')} ({op.get('package_progress','?')}%)")
+        if op.get("target_commit"):
+            lines.append(f"  Target:   {str(op.get('target_commit'))[:12]}")
+        if op.get("reboot_required") == "yes":
+            lines.append("  Reboot required: YES")
+        lines.append("")
+    if len(lines) == 4:
+        lines.append("No update progress has been reported yet.")
+    return lines
+
+
+def update_progress_popup(stdscr, state, d):
+    popup(stdscr, state, f"Update progress - {hostname(d)}", "\n".join(update_progress_lines(d)))
+
+
 def jobs_popup(stdscr, state):
+    raw = getattr(stdscr, "_raw", stdscr)
     while True:
         harvest_jobs(state)
-        jobs = list(reversed(state["jobs"][-40:]))
+        refresh_cache(state)
+        service_health_tick(state)
         lines = []
-        for job in jobs:
+        for job in reversed(state["jobs"][-20:]):
             status = "DONE" if job.get("done") and job.get("returncode") == 0 else ("FAILED" if job.get("done") else "RUNNING")
-            lines.append(f"#{job['id']:03d} {status:7} {job['title']} [{','.join(job.get('targets', []))}]")
-        if not lines: lines = ["No jobs yet."]
-        raw = getattr(stdscr, "_raw", stdscr); h, w = raw.getmaxyx(); win, ph, _ = modal_window(stdscr, min(h - 4, 20), min(w - 4, 110), "BACKGROUND JOBS")
+            elapsed = int((job.get("finished") or time.time()) - job.get("started", time.time()))
+            lines.append(f"JOB #{job['id']:03d} {status:7} {elapsed:4d}s {job['title']} [{','.join(job.get('targets', []))}]")
+        for d in state.get("devices", []):
+            op = operation_for_device(d)
+            if str(op.get("state", "")).lower() in ACTIVE_UPDATE_STATES or str(op.get("state", "")).lower() == "reboot_required":
+                p = "--" if op.get("progress") is None else f"{int(number(op.get('progress'))):3d}%"
+                lines.append(f"PI  {device_id(d):12} {str(op.get('state','')).upper()[:11]:11} {p:4} {str(op.get('stage',''))[:56]}")
+        if not lines:
+            lines = ["No controller jobs or active Pi updates."]
+        win, ph, _ = modal_window(stdscr, min(24, len(lines) + 5), 116, "BACKGROUND JOBS + PI PROGRESS", timeout=250)
         visible = max(1, ph - 4)
-        for i, line in enumerate(lines[:visible], 1): safe(win, i, 2, line)
-        safe(win, ph - 2, 2, "Enter opens newest completed result | Backspace/B close", curses.A_DIM); win.refresh()
-        key = modal_key(win, state)
-        if is_back(key): raw.touchwin(); raw.refresh(); return
+        for i, line in enumerate(lines[:visible], 1):
+            safe(win, i, 2, line)
+        safe(win, ph - 2, 2, "Enter newest completed result | Backspace/B close | refreshes from HTTPS cache", curses.A_DIM)
+        win.refresh(); key = modal_key(win, state)
+        if key == -1:
+            continue
+        if is_back(key):
+            raw.touchwin(); raw.refresh(); return
         if key in (10, 13):
-            done = next((j for j in jobs if j.get("done")), None)
-            if done: popup(stdscr, state, f"Job #{done['id']} - {done['title']}", done.get("result") or "No output")
+            done = next((j for j in reversed(state["jobs"]) if j.get("done")), None)
+            if done:
+                popup(stdscr, state, f"Job #{done['id']} - {done['title']}", done.get("result") or "No output")
 
 
 def quick_actions(stdscr, state, d):
     targets = selected_targets(state, d)
     label = f"{len(targets)} marked Pi(s)" if state.get("marked") else hostname(d)
-    opts = ["LGHS update", "OS update", "Validate + enforce", "Reboot", "Live logs", "SSH shell", "Clear marks"]
+    opts = ["LGHS update", "OS update", "Validate + enforce", "Reboot", "Live logs", "SSH shell", "Update progress", "Clear marks"]
     sel = 0
     while True:
-        win, ph, _ = modal_window(stdscr, 14, 70, f"QUICK ACTIONS - {label}")
-        for i, item in enumerate(opts): safe(win, 2 + i, 3, f"{i+1}. {item}", curses.A_REVERSE if i == sel else 0)
-        safe(win, ph - 2, 3, "Enter select | Backspace/B cancel", curses.A_DIM); win.refresh(); key = modal_key(win, state)
-        if is_back(key): return
-        if key in (curses.KEY_DOWN, ord("j")): sel = min(len(opts)-1, sel+1)
-        elif key in (curses.KEY_UP, ord("k")): sel = max(0, sel-1)
-        elif ord("1") <= key <= ord(str(len(opts))): sel = key - ord("1"); key = 10
-        if key not in (10, 13): continue
-        if sel == 6: state["marked"].clear(); add_notice(state, "normal", "Selection cleared", "No Pis are marked"); return
-        if not targets: popup(stdscr, state, "Actions", "No eligible Pi selected."); return
+        win, ph, _ = modal_window(stdscr, 15, 72, f"QUICK ACTIONS - {label}")
+        for i, item in enumerate(opts):
+            safe(win, 2 + i, 3, f"{i+1}. {item}", curses.A_REVERSE if i == sel else 0)
+        safe(win, ph - 2, 3, "Enter select | Backspace/B cancel", curses.A_DIM)
+        win.refresh(); key = modal_key(win, state)
+        if is_back(key):
+            return
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(opts) - 1, sel + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel - 1)
+        elif ord("1") <= key <= ord("8"):
+            sel = key - ord("1"); key = 10
+        if key not in (10, 13):
+            continue
+        if sel == 7:
+            state["marked"].clear(); add_notice(state, "normal", "Selection cleared", "No Pis are marked"); return
+        if sel == 6:
+            update_progress_popup(stdscr, state, d); continue
+        if not targets:
+            popup(stdscr, state, "Actions", "No eligible Pi selected."); return
         if sel == 0 and confirm(stdscr, state, f"Run LGHS update on {len(targets)} Pi(s)?"):
             start_job(state, "LGHS update", targets, "sudo -n /usr/local/sbin/lghs-update"); return
         if sel == 1 and confirm(stdscr, state, f"Run Raspberry Pi OS update on {len(targets)} Pi(s)?"):
@@ -766,293 +922,469 @@ def quick_actions(stdscr, state, d):
         if sel == 4:
             start_job(state, "Live logs", targets[:1], "sudo -n /usr/local/sbin/lghs-report logs all"); return
         if sel == 5:
-            if len(targets) != 1: popup(stdscr, state, "SSH", "SSH shell requires exactly one Pi."); return
-            curses.endwin(); subprocess.call(mod.ssh_args(targets[0]["addr"], batch=False)); getattr(stdscr, "_raw", stdscr).refresh(); curses.curs_set(0); state["last_activity"] = time.monotonic(); return
+            if len(targets) != 1:
+                popup(stdscr, state, "SSH", "SSH shell requires exactly one Pi."); return
+            curses.endwin(); subprocess.call(mod.ssh_args(targets[0]["addr"], batch=False)); raw = getattr(stdscr, "_raw", stdscr); raw.refresh(); curses.curs_set(0); state["last_activity"] = time.monotonic(); return
+
+
+def recovery_popup(stdscr, state, d, kind):
+    opts = ["Run lghs-check", "Re-apply policy + check", "Restart related service", "Open live logs", "LGHS update", "Reboot Pi"]
+    service_map = {"SSH": "ssh.service", "POLICY": "lghs-policy.service", "UPDATE": "lghs-update.timer", "RECONCILE": "lghs-reconcile.timer"}
+    sel = 0
+    while True:
+        win, ph, _ = modal_window(stdscr, 14, 78, f"RECOVERY - {hostname(d)} - {kind}")
+        for i, item in enumerate(opts):
+            safe(win, 2 + i, 3, f"{i+1}. {item}", curses.A_REVERSE if i == sel else 0)
+        safe(win, ph - 2, 3, "Enter run | Backspace/B cancel", curses.A_DIM)
+        win.refresh(); key = modal_key(win, state)
+        if is_back(key):
+            return
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(opts)-1, sel+1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel-1)
+        elif ord("1") <= key <= ord("6"):
+            sel = key - ord("1"); key = 10
+        if key not in (10, 13):
+            continue
+        if sel == 0:
+            start_job(state, f"Check - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-check"); return
+        if sel == 1:
+            start_job(state, f"Enforce - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-enforce && sudo -n /usr/local/sbin/lghs-check"); return
+        if sel == 2:
+            svc = service_map.get(kind)
+            if not svc:
+                popup(stdscr, state, "Recovery", f"No specific service mapping for {kind}."); continue
+            start_job(state, f"Restart {svc} - {hostname(d)}", [d], f"sudo -n systemctl restart {svc}"); return
+        if sel == 3:
+            start_job(state, f"Logs - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-report logs all"); return
+        if sel == 4:
+            start_job(state, f"LGHS update - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-update"); return
+        if sel == 5 and confirm(stdscr, state, f"Reboot {hostname(d)}?"):
+            start_job(state, f"Reboot - {hostname(d)}", [d], "sudo -n /usr/sbin/reboot"); return
 
 
 def device_menu(stdscr, state, original):
     state["context"] = "fleet"
-    actions = ["Cached summary", "Cached telemetry", "Pending sudo requests", "Quick actions", "Live logs", "Update LGHS", "Validate/recover", "SSH shell", "Reboot"]
-    sel = 0; did = device_id(original)
+    actions = ["Cached summary", "Cached telemetry", "Current update progress", "Pending sudo requests", "Quick actions", "Live logs", "Update LGHS", "Validate/recover", "SSH shell"]
+    sel, did = 0, device_id(original)
     while True:
-        harvest_jobs(state); devices = refresh_cache(state); d = next((x for x in devices if device_id(x) == did), original)
-        header(stdscr, state, f"Pi - {hostname(d)}", f"{d.get('group','Ungrouped')} | {health(d,state)} | cache {cache_age_text(d)} | commit {str(d.get('commit','?'))[:8]}")
-        for i, name in enumerate(actions): safe(stdscr, 3+i, 4, f"{i+1}. {name}", curses.A_REVERSE if i == sel else 0)
+        maintenance(stdscr, state)
+        devices = state["devices"]
+        d = next((x for x in devices if device_id(x) == did), original)
+        op = operation_for_device(d)
+        subtitle = f"{d.get('group','Ungrouped')} | {health(d,state)} | cache {cache_age_text(d)} | {progress_text(op) if operation_label(op) else 'idle'}"
+        header(stdscr, state, f"Pi - {hostname(d)}", subtitle)
+        for i, name in enumerate(actions):
+            safe(stdscr, 3+i, 4, f"{i+1}. {name}", curses.A_REVERSE if i == sel else 0)
         stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
-        if action == "help": contextual_help(stdscr, state); continue
-        if action: return action
-        if is_back(key): return "fleet"
-        if key in (curses.KEY_DOWN, ord("j")): sel = min(len(actions)-1, sel+1)
-        elif key in (curses.KEY_UP, ord("k")): sel = max(0, sel-1)
-        elif ord("1") <= key <= ord("9"): sel = key - ord("1"); key = 10
-        if key not in (10, 13): continue
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if is_back(key):
+            return "fleet"
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(actions)-1, sel+1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel-1)
+        elif ord("1") <= key <= ord("9"):
+            sel = key - ord("1"); key = 10
+        if key not in (10, 13):
+            continue
         n = sel + 1
-        if n == 1: popup(stdscr, state, f"Cached summary - {hostname(d)}", "\n".join(f"{k}={v}" for k,v in sorted(d.items()) if k not in ("sudo_requests","tags")))
-        elif n == 2: popup(stdscr, state, f"Cached telemetry - {hostname(d)}", f"CPU {d.get('cpu_pct','?')}%\nRAM {d.get('mem_pct','?')}%\nDisk {d.get('disk_pct','?')}%\nTemp {d.get('temp_c','?')}C\nRX {fmt_bytes(d.get('rx_bytes'))}\nTX {fmt_bytes(d.get('tx_bytes'))}\nCache {cache_age_text(d)}")
+        if n == 1:
+            popup(stdscr, state, f"Cached summary - {hostname(d)}", "\n".join(f"{k}={v}" for k,v in sorted(d.items()) if k not in ("sudo_requests","tags","lghs_update","os_update")))
+        elif n == 2:
+            popup(stdscr, state, f"Cached telemetry - {hostname(d)}", f"CPU {d.get('cpu_pct','?')}%\nRAM {d.get('mem_pct','?')}%\nDisk {d.get('disk_pct','?')}%\nTemp {d.get('temp_c','?')}C\nRX {fmt_bytes(d.get('rx_bytes'))}\nTX {fmt_bytes(d.get('tx_bytes'))}\nCache {cache_age_text(d)}")
         elif n == 3:
+            update_progress_popup(stdscr, state, d)
+        elif n == 4:
             reqs = [r for r in (d.get("sudo_requests") or []) if str(r.get("status","pending")) == "pending"]
-            if not reqs: popup(stdscr, state, "Sudo", "No pending requests for this Pi.")
-            else: sudo_popup(stdscr, state, d, reqs[0])
-        elif n == 4: quick_actions(stdscr, state, d)
-        elif n == 5: start_job(state, f"Logs - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-report logs all")
-        elif n == 6 and confirm(stdscr, state, f"Force LGHS update on {hostname(d)}?"): start_job(state, f"LGHS update - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-update")
-        elif n == 7: recovery_popup(stdscr, state, d, "CHECK")
+            if not reqs:
+                popup(stdscr, state, "Sudo", "No pending requests for this Pi.")
+            else:
+                sudo_popup(stdscr, state, d, reqs[0])
+        elif n == 5:
+            quick_actions(stdscr, state, d)
+        elif n == 6:
+            start_job(state, f"Logs - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-report logs all")
+        elif n == 7 and confirm(stdscr, state, f"Force LGHS update on {hostname(d)}?"):
+            start_job(state, f"LGHS update - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-update")
         elif n == 8:
-            curses.endwin(); subprocess.call(mod.ssh_args(d["addr"], batch=False)); getattr(stdscr, "_raw", stdscr).refresh(); curses.curs_set(0); state["last_activity"] = time.monotonic()
-        elif n == 9 and confirm(stdscr, state, f"Reboot {hostname(d)}?"): start_job(state, f"Reboot - {hostname(d)}", [d], "sudo -n /usr/sbin/reboot")
+            recovery_popup(stdscr, state, d, "CHECK")
+        elif n == 9:
+            curses.endwin(); subprocess.call(mod.ssh_args(d["addr"], batch=False)); stdscr.refresh(); curses.curs_set(0); state["last_activity"] = time.monotonic()
 
 
 def fleet_screen(stdscr, state, telemetry=False):
     state["context"] = "telemetry" if telemetry else "fleet"
     sel = state.get("selected", 0)
     while True:
-        harvest_jobs(state); devices = refresh_cache(state); maybe_auto_sudo(stdscr, state); rows_data = visible_devices(state, telemetry)
-        sel = min(sel, max(0, len(rows_data)-1)); h,_ = stdscr.getmaxyx(); rows=max(1,h-7); start=max(0,sel-rows+1) if sel>=rows else 0
+        maintenance(stdscr, state)
+        devices = state["devices"]
+        rows_data = visible_devices(state, telemetry)
+        sel = min(sel, max(0, len(rows_data)-1))
+        h, _ = stdscr.getmaxyx(); rows = max(1, h-7); start = max(0, sel-rows+1) if sel >= rows else 0
         filt = f"search={state.get('search') or '-'} | group={state.get('group_filter','All')} | marked={len(state.get('marked',set()))}"
         header(stdscr, state, "Telemetry" if telemetry else "Fleet", f"Local HTTPS cache only | {filt}")
-        if telemetry: safe(stdscr,3,1,"M # DEVICE           GROUP       STATE     CPU    RAM    DISK   TEMP   RX       TX",curses.A_BOLD|curses.A_UNDERLINE)
-        else: safe(stdscr,3,1,"M # DEVICE           GROUP       STATE     VER      CPU    RAM    TEMP   CACHE",curses.A_BOLD|curses.A_UNDERLINE)
-        for pos,d in enumerate(rows_data[start:start+rows]):
-            idx=start+pos; mark="*" if device_id(d) in state["marked"] else " "; attr=curses.A_REVERSE if idx==sel else 0
-            st=health(d,state)
-            if telemetry: line=f"{mark} {pos+1 if pos<9 else ' ':>1} {hostname(d)[:16]:16} {str(d.get('group',''))[:11]:11} {st[:9]:9} {str(d.get('cpu_pct','?'))+'%':6} {str(d.get('mem_pct','?'))+'%':6} {str(d.get('disk_pct','?'))+'%':6} {str(d.get('temp_c','?'))+'C':6} {fmt_bytes(d.get('rx_bytes')):8} {fmt_bytes(d.get('tx_bytes')):8}"
-            else: line=f"{mark} {pos+1 if pos<9 else ' ':>1} {hostname(d)[:16]:16} {str(d.get('group',''))[:11]:11} {st[:9]:9} {str(d.get('version','?'))[:8]:8} {str(d.get('cpu_pct','?'))+'%':6} {str(d.get('mem_pct','?'))+'%':6} {str(d.get('temp_c','?'))+'C':6} {cache_age_text(d):7}"
-            safe(stdscr,4+pos,1,line,attr)
-        if not rows_data: safe(stdscr,5,3,"No Pis match the current filter.")
-        stdscr.refresh(); key=read_key(stdscr,state); action=global_action(key)
-        if action=="help": contextual_help(stdscr,state); continue
-        if action: state["selected"]=sel; return action
-        if is_back(key): state["selected"]=sel; return "main"
-        if key in (ord("r"),ord("R")): refresh_cache(state,True); continue
-        if key==ord("/"):
-            q=prompt_text(stdscr,state,"SEARCH","Device/group/version/state/tag contains:",state.get("search", ""));
-            if q is not None: state["search"]=q; sel=0
-            continue
-        if key in (ord("g"),ord("G")): cycle_group(state); sel=0; continue
-        if key==ord(" ") and rows_data:
-            did=device_id(rows_data[sel]); state["marked"].discard(did) if did in state["marked"] else state["marked"].add(did); continue
-        if key in (ord("a"),ord("A")) and rows_data: quick_actions(stdscr,state,rows_data[sel]); continue
-        if key in (ord("u"),ord("U")) and rows_data:
-            d=rows_data[sel]
-            if confirm(stdscr,state,f"Update {hostname(d)} now?"): start_job(state,f"LGHS update - {hostname(d)}",[d],"sudo -n /usr/local/sbin/lghs-update")
-            continue
-        if key==ord("J"): jobs_popup(stdscr,state); continue
-        sel,opened=list_nav(key,sel,len(rows_data),start,rows)
-        if opened and rows_data:
-            state["selected"]=next((i for i,x in enumerate(devices) if device_id(x)==device_id(rows_data[sel])),0)
-            nxt=device_menu(stdscr,state,rows_data[sel])
-            if nxt!="fleet": return nxt
-
-
-def recovery_popup(stdscr, state, d, kind):
-    opts = ["Run lghs-check", "Re-apply policy + check", "Restart related service", "Open live logs", "LGHS update"]
-    sel=0
-    service_map={"SSH":"ssh.service","POLICY":"lghs-policy.service","UPDATE":"lghs-update.timer","RECONCILE":"lghs-reconcile.timer"}
-    while True:
-        win,ph,_=modal_window(stdscr,13,76,f"RECOVERY - {hostname(d)} - {kind}")
-        for i,item in enumerate(opts): safe(win,2+i,3,f"{i+1}. {item}",curses.A_REVERSE if i==sel else 0)
-        safe(win,ph-2,3,"Enter run | Backspace/B cancel",curses.A_DIM);win.refresh();key=modal_key(win,state)
-        if is_back(key):return
-        if key in (curses.KEY_DOWN,ord("j")):sel=min(len(opts)-1,sel+1)
-        elif key in (curses.KEY_UP,ord("k")):sel=max(0,sel-1)
-        elif ord("1")<=key<=ord("5"):sel=key-ord("1");key=10
-        if key not in (10,13):continue
-        if sel==0:start_job(state,f"Check - {hostname(d)}",[d],"sudo -n /usr/local/sbin/lghs-check");return
-        if sel==1:start_job(state,f"Enforce - {hostname(d)}",[d],"sudo -n /usr/local/sbin/lghs-enforce && sudo -n /usr/local/sbin/lghs-check");return
-        if sel==2:
-            svc=service_map.get(kind)
-            if not svc:popup(stdscr,state,"Recovery",f"No specific service mapping for {kind}.");continue
-            start_job(state,f"Restart {svc} - {hostname(d)}",[d],f"sudo -n systemctl restart {svc}");return
-        if sel==3:start_job(state,f"Logs - {hostname(d)}",[d],"sudo -n /usr/local/sbin/lghs-report logs all");return
-        if sel==4:start_job(state,f"LGHS update - {hostname(d)}",[d],"sudo -n /usr/local/sbin/lghs-update");return
-
-
-def sudo_screen(stdscr,state):
-    state["context"]="sudo";sel=0
-    while True:
-        harvest_jobs(state);queue=pending_requests(refresh_cache(state));sel=min(sel,max(0,len(queue)-1));h,_=stdscr.getmaxyx();rows=max(1,h-7);start=max(0,sel-rows+1) if sel>=rows else 0
-        header(stdscr,state,"Sudo requests",f"{len(queue)} cached pending request(s)")
-        safe(stdscr,3,1,"# DEVICE           USER         AGE    TTL       COMMAND",curses.A_BOLD|curses.A_UNDERLINE)
-        for pos,(d,r) in enumerate(queue[start:start+rows]):safe(stdscr,4+pos,1,f"{pos+1 if pos<9 else ' ':>1} {hostname(d)[:16]:16} {str(r.get('requester','?'))[:12]:12} {request_age(r):6} {request_ttl(r):9} {str(r.get('command',''))[:55]}",curses.A_REVERSE if start+pos==sel else 0)
-        if not queue:safe(stdscr,5,3,"No pending sudo requests.")
-        stdscr.refresh();key=read_key(stdscr,state);action=global_action(key)
-        if action=="help":contextual_help(stdscr,state);continue
-        if action:return action
-        if is_back(key):return "main"
-        if key==ord("J"):jobs_popup(stdscr,state);continue
-        sel,opened=list_nav(key,sel,len(queue),start,rows)
-        if opened and queue:sudo_popup(stdscr,state,*queue[sel])
-
-
-def attention_screen(stdscr,state):
-    state["context"]="attention";sel=0
-    while True:
-        harvest_jobs(state);rows_data=issues(refresh_cache(state),state);sel=min(sel,max(0,len(rows_data)-1));h,_=stdscr.getmaxyx();rows=max(1,h-7);start=max(0,sel-rows+1) if sel>=rows else 0
-        header(stdscr,state,"Needs Attention",f"{len(rows_data)} active cached issue(s) | Enter opens recovery")
-        safe(stdscr,3,1,"# SEVERITY DEVICE           GROUP       ISSUE        DETAIL",curses.A_BOLD|curses.A_UNDERLINE)
-        for pos,(d,sev,kind,detail) in enumerate(rows_data[start:start+rows]):safe(stdscr,4+pos,1,f"{pos+1 if pos<9 else ' ':>1} {sev:8} {hostname(d)[:16]:16} {str(d.get('group',''))[:11]:11} {kind[:11]:11} {detail[:48]}",curses.A_REVERSE if start+pos==sel else 0)
-        if not rows_data:safe(stdscr,5,3,"All cached Pis look healthy.",curses.A_BOLD)
-        stdscr.refresh();key=read_key(stdscr,state);action=global_action(key)
-        if action=="help":contextual_help(stdscr,state);continue
-        if action:return action
-        if is_back(key):return "main"
-        sel,opened=list_nav(key,sel,len(rows_data),start,rows)
-        if opened and rows_data:recovery_popup(stdscr,state,rows_data[sel][0],rows_data[sel][2])
-
-
-def activity_rows(limit=200):
-    try:
-        data=[]
-        for line in reversed(ACTIVITY.read_text(encoding="utf-8",errors="replace").splitlines()[-limit:]):
-            try:data.append(json.loads(line))
-            except Exception:pass
-        return data
-    except Exception:return []
-
-
-def activity_screen(stdscr,state):
-    state["context"]="activity";sel=0
-    while True:
-        data=activity_rows();sel=min(sel,max(0,len(data)-1));h,_=stdscr.getmaxyx();rows=max(1,h-7);start=max(0,sel-rows+1) if sel>=rows else 0
-        header(stdscr,state,"Fleet Activity",f"{len(data)} recent controller event(s)")
-        for pos,row in enumerate(data[start:start+rows]):
-            stamp=time.strftime("%H:%M:%S",time.localtime(number(row.get("ts"),0)));safe(stdscr,4+pos,1,f"{pos+1 if pos<9 else ' ':>1} {stamp:8} {str(row.get('host','?'))[:16]:16} {str(row.get('event',''))[:22]:22} {str(row.get('detail',''))[:55]}",curses.A_REVERSE if start+pos==sel else 0)
-        if not data:safe(stdscr,5,3,"No fleet activity recorded yet.")
-        stdscr.refresh();key=read_key(stdscr,state);action=global_action(key)
-        if action=="help":contextual_help(stdscr,state);continue
-        if action:return action
-        if is_back(key):return "main"
-        sel,_=list_nav(key,sel,len(data),start,rows)
-
-
-def notices_screen(stdscr,state):
-    state["context"]="notices";sel=0
-    while True:
-        rows_data=list(reversed(state["notices"]));sel=min(sel,max(0,len(rows_data)-1));h,_=stdscr.getmaxyx();rows=max(1,h-7);start=max(0,sel-rows+1) if sel>=rows else 0
-        header(stdscr,state,"Notifications",f"{len(rows_data)} persistent UI notification(s)")
-        safe(stdscr,3,1,"# TIME     LEVEL     TITLE                         DETAIL",curses.A_BOLD|curses.A_UNDERLINE)
-        for pos,row in enumerate(rows_data[start:start+rows]):
-            stamp=time.strftime("%H:%M:%S",time.localtime(number(row.get("ts"),0)));safe(stdscr,4+pos,1,f"{pos+1 if pos<9 else ' ':>1} {stamp:8} {str(row.get('level','normal')).upper()[:8]:8} {str(row.get('title',''))[:28]:28} {str(row.get('detail',''))[:55]}",curses.A_REVERSE if start+pos==sel else 0)
-        if not rows_data:safe(stdscr,5,3,"No notifications yet.")
-        stdscr.refresh();key=read_key(stdscr,state);action=global_action(key)
-        if action=="help":contextual_help(stdscr,state);continue
-        if action and action!="notices":return action
-        if is_back(key):return "main"
-        if key in (ord("c"),ord("C")) and confirm(stdscr,state,"Clear persistent notification history?"):state["notices"].clear();write_notices([]);sel=0;continue
-        sel,opened=list_nav(key,sel,len(rows_data),start,rows)
-        if opened and rows_data:popup(stdscr,state,rows_data[sel].get("title","Notice"),rows_data[sel].get("detail",""))
-
-
-def updates_screen(stdscr,state):
-    state["context"]="updates";opts=["Selected Pi: LGHS update","Marked Pis: LGHS update","All online Pis: LGHS update","Selected Pi: OS update","Marked Pis: OS update","All online Pis: OS update"];sel=0
-    while True:
-        harvest_jobs(state);devices=refresh_cache(state);selected=devices[state.get("selected",0)] if devices and state.get("selected",0)<len(devices) else None
-        header(stdscr,state,"Updates",f"Selected {hostname(selected) if selected else 'none'} | Marked {len(state['marked'])} | jobs run in background")
-        for i,x in enumerate(opts):safe(stdscr,3+i,4,f"{i+1}. {x}",curses.A_REVERSE if i==sel else 0)
-        stdscr.refresh();key=read_key(stdscr,state);action=global_action(key)
-        if action=="help":contextual_help(stdscr,state);continue
-        if action:return action
-        if is_back(key):return "main"
-        if key==ord("J"):jobs_popup(stdscr,state);continue
-        if key in (curses.KEY_DOWN,ord("j")):sel=min(len(opts)-1,sel+1)
-        elif key in (curses.KEY_UP,ord("k")):sel=max(0,sel-1)
-        elif ord("1")<=key<=ord("6"):sel=key-ord("1");key=10
-        if key not in (10,13):continue
-        mode=sel%3;osup=sel>=3
-        if mode==0:targets=[selected] if selected and cache_state(selected)!="OFFLINE" else []
-        elif mode==1:targets=[d for d in devices if device_id(d) in state["marked"] and cache_state(d)!="OFFLINE"]
-        else:targets=[d for d in devices if cache_state(d)=="ONLINE"]
-        if not targets:popup(stdscr,state,"Updates","No eligible Pi targets.");continue
-        if not confirm(stdscr,state,f"Run {'OS' if osup else 'LGHS'} update on {len(targets)} Pi(s)?"):continue
-        start_job(state,"OS update" if osup else "LGHS update",targets,"sudo -n /usr/local/sbin/lghs-os-update" if osup else "sudo -n /usr/local/sbin/lghs-update")
-
-
-def logs_screen(stdscr,state):
-    state["context"]="logs";opts=["Fleet sudo command log","Fleet sudo approval audit","LGHS update history","Raspberry Pi OS update history","Selected Pi live logs (SSH)"];paths=[Path('/var/log/lghs-fleet/sudo.log'),Path('/var/log/lghs-fleet/audit.jsonl'),Path('/var/log/lghs-fleet/update.log'),Path('/var/log/lghs-fleet/os-update.log')];sel=0
-    while True:
-        harvest_jobs(state);header(stdscr,state,"Audit & logs","Controller copies are local; only selected Pi live logs use SSH.")
-        for i,x in enumerate(opts):safe(stdscr,3+i,4,f"{i+1}. {x}",curses.A_REVERSE if i==sel else 0)
-        stdscr.refresh();key=read_key(stdscr,state);action=global_action(key)
-        if action=="help":contextual_help(stdscr,state);continue
-        if action:return action
-        if is_back(key):return "main"
-        if key in (curses.KEY_DOWN,ord("j")):sel=min(4,sel+1)
-        elif key in (curses.KEY_UP,ord("k")):sel=max(0,sel-1)
-        elif ord("1")<=key<=ord("5"):sel=key-ord("1");key=10
-        if key in (10,13):
-            if sel<4:
-                try:text='\n'.join(paths[sel].read_text(encoding='utf-8',errors='replace').splitlines()[-180:])
-                except Exception as exc:text=str(exc)
-                popup(stdscr,state,opts[sel],text or 'No entries.')
+        if telemetry:
+            safe(stdscr, 3, 1, "M # DEVICE           GROUP       STATE       PROG  CPU   RAM   DISK  TEMP  RX      TX", curses.A_BOLD|curses.A_UNDERLINE)
+        else:
+            safe(stdscr, 3, 1, "M # DEVICE           GROUP       STATE       PROG  STAGE                    CACHE", curses.A_BOLD|curses.A_UNDERLINE)
+        for pos, d in enumerate(rows_data[start:start+rows]):
+            idx = start + pos; mark = "*" if device_id(d) in state["marked"] else " "; attr = curses.A_REVERSE if idx == sel else 0
+            op = operation_for_device(d); prog = "--" if not operation_label(op) or op.get("progress") is None else f"{int(number(op.get('progress'))):3d}%"
+            st = health(d, state)
+            if telemetry:
+                line = f"{mark} {pos+1 if pos<9 else ' ':>1} {hostname(d)[:16]:16} {str(d.get('group',''))[:11]:11} {st[:11]:11} {prog:5} {str(d.get('cpu_pct','?'))+'%':5} {str(d.get('mem_pct','?'))+'%':5} {str(d.get('disk_pct','?'))+'%':5} {str(d.get('temp_c','?'))+'C':5} {fmt_bytes(d.get('rx_bytes')):7} {fmt_bytes(d.get('tx_bytes')):7}"
             else:
-                devices=refresh_cache(state);d=devices[state.get('selected',0)] if devices and state.get('selected',0)<len(devices) else None
-                if d:start_job(state,f"Live logs - {hostname(d)}",[d],"sudo -n /usr/local/sbin/lghs-report logs all")
-                else:popup(stdscr,state,"Logs","No selected Pi.")
-
-
-def controller_screen(stdscr,state):
-    state["context"]="controller"
-    while True:
-        ch=controller_health(state,True);header(stdscr,state,"Controller status","Local controller checks; no student SSH.")
-        y=3
-        for name,value in ch.items():
-            if name=="ok":continue
-            shown=f"{number(value):.1f}s" if name=="cache_age" and value is not None else str(value)
-            safe(stdscr,y,4,f"{name:30} {shown}");y+=1
-        safe(stdscr,y+1,4,f"Controller commit: {state.get('controller_commit','unknown')}")
-        safe(stdscr,y+2,4,f"Fleet cache: {CACHE} | {'present' if CACHE.exists() else 'missing'}")
-        stdscr.refresh();key=read_key(stdscr,state);action=global_action(key)
-        if action=="help":contextual_help(stdscr,state);continue
-        if action:return action
-        if is_back(key):return "main"
-        if key in (ord("r"),ord("R")):controller_health(state,True)
-
-
-def main_menu(stdscr,state):
-    state["context"]="main";items=[("Fleet overview","fleet"),("Needs Attention","attention"),("Fleet Activity","activity"),("Telemetry","telemetry"),("Sudo requests","sudo"),("Updates","updates"),("Audit & logs","logs"),("Controller status","controller")];sel=state.get("menu_selected",0)
-    while True:
-        harvest_jobs(state);devices=refresh_cache(state);maybe_auto_sudo(stdscr,state);problems=issues(devices,state);pending=len(pending_requests(devices));outdated=sum(bool(version_state(d,state)) for d in devices)
-        header(stdscr,state,"Main menu",f"{len(problems)} issue(s) | {pending} sudo | {outdated} outdated | group {state.get('group_filter','All')} | search {state.get('search') or '-'}")
-        counts={"fleet":len(devices),"attention":len(problems),"activity":len(activity_rows()),"telemetry":len(devices),"sudo":pending,"updates":outdated,"logs":0,"controller":0}
-        for i,(name,target) in enumerate(items):
-            badge=f" [{counts[target]}]" if counts.get(target) else "";safe(stdscr,3+i,4,f"{i+1}. {name}{badge}",curses.A_REVERSE|curses.A_BOLD if i==sel else 0)
-        stdscr.refresh();key=read_key(stdscr,state);action=global_action(key)
-        if action=="help":contextual_help(stdscr,state);continue
-        if action:state["menu_selected"]=sel;return action
-        if key in (ord("q"),ord("Q")):return "quit"
-        if key==ord("J"):jobs_popup(stdscr,state);continue
-        if key==ord("/"):
-            q=prompt_text(stdscr,state,"SEARCH","Device/group/version/state/tag contains:",state.get("search",""));
-            if q is not None:state["search"]=q
+                stage = str(op.get("stage") or ("LGHS " + str(d.get("version","?")) if not operation_label(op) else ""))
+                line = f"{mark} {pos+1 if pos<9 else ' ':>1} {hostname(d)[:16]:16} {str(d.get('group',''))[:11]:11} {st[:11]:11} {prog:5} {stage[:24]:24} {cache_age_text(d):7}"
+            safe(stdscr, 4+pos, 1, line, attr)
+        if not rows_data:
+            safe(stdscr, 5, 3, "No Pis match the current filter.")
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action:
+            state["selected"] = sel; return action
+        if is_back(key):
+            state["selected"] = sel; return "main"
+        if key in (ord("r"), ord("R")):
+            refresh_cache(state, True); continue
+        if key == ord("/"):
+            q = prompt_text(stdscr, state, "SEARCH", "Device/group/version/state/stage/tag contains:", state.get("search", ""))
+            if q is not None:
+                state["search"], sel = q, 0
             continue
-        if key in (ord("g"),ord("G")):cycle_group(state);continue
-        if key in (curses.KEY_DOWN,ord("j")):sel=min(len(items)-1,sel+1)
-        elif key in (curses.KEY_UP,ord("k")):sel=max(0,sel-1)
-        elif ord("1")<=key<=ord("8"):return items[key-ord("1")][1]
-        elif key in (10,13):return items[sel][1]
+        if key in (ord("g"), ord("G")):
+            cycle_group(state); sel = 0; continue
+        if key == ord(" ") and rows_data:
+            did = device_id(rows_data[sel])
+            state["marked"].discard(did) if did in state["marked"] else state["marked"].add(did)
+            continue
+        if key in (ord("a"), ord("A")) and rows_data:
+            quick_actions(stdscr, state, rows_data[sel]); continue
+        if key in (ord("p"), ord("P")) and rows_data:
+            update_progress_popup(stdscr, state, rows_data[sel]); continue
+        if key in (ord("u"), ord("U")) and rows_data:
+            d = rows_data[sel]
+            if confirm(stdscr, state, f"Update {hostname(d)} now?"):
+                start_job(state, f"LGHS update - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-update")
+            continue
+        if key == ord("J"):
+            jobs_popup(stdscr, state); continue
+        sel, opened = list_nav(key, sel, len(rows_data), start, rows)
+        if opened and rows_data:
+            state["selected"] = next((i for i,x in enumerate(devices) if device_id(x)==device_id(rows_data[sel])), 0)
+            nxt = device_menu(stdscr, state, rows_data[sel])
+            if nxt != "fleet":
+                return nxt
+
+
+def sudo_screen(stdscr, state):
+    state["context"] = "sudo"; sel = 0
+    while True:
+        maintenance(stdscr, state)
+        queue = pending_requests(state["devices"]); sel = min(sel, max(0, len(queue)-1))
+        h, _ = stdscr.getmaxyx(); rows = max(1, h-7); start = max(0, sel-rows+1) if sel >= rows else 0
+        header(stdscr, state, "Sudo requests", f"{len(queue)} cached pending request(s)")
+        safe(stdscr, 3, 1, "# DEVICE           USER         AGE    EXPIRES      COMMAND", curses.A_BOLD|curses.A_UNDERLINE)
+        for pos, (d, req) in enumerate(queue[start:start+rows]):
+            safe(stdscr, 4+pos, 1, f"{pos+1 if pos<9 else ' ':>1} {hostname(d)[:16]:16} {str(req.get('requester','?'))[:12]:12} {request_age(req):6} {request_ttl(req):12} {str(req.get('command',''))[:55]}", curses.A_REVERSE if start+pos == sel else 0)
+        if not queue:
+            safe(stdscr, 5, 3, "No pending sudo requests.")
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if is_back(key):
+            return "main"
+        sel, opened = list_nav(key, sel, len(queue), start, rows)
+        if opened and queue:
+            sudo_popup(stdscr, state, *queue[sel])
+
+
+def attention_screen(stdscr, state):
+    state["context"] = "attention"; sel = 0
+    while True:
+        maintenance(stdscr, state)
+        rows_data = issues(state["devices"], state); sel = min(sel, max(0, len(rows_data)-1))
+        h, _ = stdscr.getmaxyx(); rows = max(1, h-7); start = max(0, sel-rows+1) if sel >= rows else 0
+        header(stdscr, state, "Needs Attention", f"{len(rows_data)} cached issue(s) | Enter opens recovery")
+        safe(stdscr, 3, 1, "# SEVERITY DEVICE           ISSUE       DETAIL", curses.A_BOLD|curses.A_UNDERLINE)
+        for pos, (d, sev, kind, detail) in enumerate(rows_data[start:start+rows]):
+            safe(stdscr, 4+pos, 1, f"{pos+1 if pos<9 else ' ':>1} {sev:8} {hostname(d)[:16]:16} {kind:11} {detail[:70]}", curses.A_REVERSE if start+pos == sel else 0)
+        if not rows_data:
+            safe(stdscr, 5, 3, "All cached Pis look healthy.")
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if is_back(key):
+            return "main"
+        sel, opened = list_nav(key, sel, len(rows_data), start, rows)
+        if opened and rows_data:
+            recovery_popup(stdscr, state, rows_data[sel][0], rows_data[sel][2])
+
+
+def activity_rows(state, limit=200):
+    now = time.monotonic()
+    if now - state.get("activity_loaded", 0) < 1:
+        return state.get("activity_cache", [])
+    try:
+        data = []
+        for line in reversed(ACTIVITY.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]):
+            try:
+                data.append(json.loads(line))
+            except Exception:
+                pass
+    except Exception:
+        data = []
+    state["activity_cache"], state["activity_loaded"] = data, now
+    return data
+
+
+def activity_screen(stdscr, state):
+    state["context"] = "activity"; sel = 0
+    while True:
+        maintenance(stdscr, state)
+        data = activity_rows(state); sel = min(sel, max(0, len(data)-1))
+        h, _ = stdscr.getmaxyx(); rows = max(1, h-7); start = max(0, sel-rows+1) if sel >= rows else 0
+        header(stdscr, state, "Fleet Activity", f"{len(data)} recent controller event(s)")
+        for pos, row in enumerate(data[start:start+rows]):
+            stamp = time.strftime("%H:%M:%S", time.localtime(number(row.get("ts"), 0)))
+            safe(stdscr, 4+pos, 1, f"{pos+1 if pos<9 else ' ':>1} {stamp:8} {str(row.get('host','?'))[:16]:16} {str(row.get('event',''))[:22]:22} {str(row.get('detail',''))[:55]}", curses.A_REVERSE if start+pos == sel else 0)
+        if not data:
+            safe(stdscr, 5, 3, "No fleet activity recorded yet.")
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if is_back(key):
+            return "main"
+        sel, _ = list_nav(key, sel, len(data), start, rows)
+
+
+def notices_screen(stdscr, state):
+    state["context"] = "notices"; sel = 0
+    while True:
+        maintenance(stdscr, state)
+        rows_data = list(reversed(state["notices"])); sel = min(sel, max(0, len(rows_data)-1))
+        h, _ = stdscr.getmaxyx(); rows = max(1, h-7); start = max(0, sel-rows+1) if sel >= rows else 0
+        header(stdscr, state, "Notifications", f"{len(rows_data)} persistent UI notification(s) | C clears")
+        safe(stdscr, 3, 1, "# TIME     LEVEL     TITLE                         DETAIL", curses.A_BOLD|curses.A_UNDERLINE)
+        for pos, row in enumerate(rows_data[start:start+rows]):
+            stamp = time.strftime("%H:%M:%S", time.localtime(number(row.get("ts"), 0)))
+            safe(stdscr, 4+pos, 1, f"{pos+1 if pos<9 else ' ':>1} {stamp:8} {str(row.get('level','normal')).upper()[:8]:8} {str(row.get('title',''))[:28]:28} {str(row.get('detail',''))[:55]}", curses.A_REVERSE if start+pos == sel else 0)
+        if not rows_data:
+            safe(stdscr, 5, 3, "No notifications yet.")
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action and action != "notices":
+            return action
+        if is_back(key):
+            return "main"
+        if key in (ord("c"), ord("C")) and confirm(stdscr, state, "Clear persistent notification history?"):
+            state["notices"].clear(); write_notices([]); sel = 0; continue
+        sel, opened = list_nav(key, sel, len(rows_data), start, rows)
+        if opened and rows_data:
+            popup(stdscr, state, rows_data[sel].get("title", "Notice"), rows_data[sel].get("detail", ""))
+
+
+def updates_screen(stdscr, state):
+    state["context"] = "updates"
+    opts = ["Selected Pi: LGHS update", "Marked Pis: LGHS update", "All online Pis: LGHS update", "Selected Pi: OS update", "Marked Pis: OS update", "All online Pis: OS update", "View live progress"]
+    sel = 0
+    while True:
+        maintenance(stdscr, state)
+        devices = state["devices"]
+        selected = devices[state.get("selected",0)] if devices and state.get("selected",0) < len(devices) else None
+        header(stdscr, state, "Updates", f"Selected {hostname(selected) if selected else 'none'} | Marked {len(state['marked'])} | J jobs | progress arrives via HTTPS")
+        for i, x in enumerate(opts):
+            safe(stdscr, 3+i, 4, f"{i+1}. {x}", curses.A_REVERSE if i == sel else 0)
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if is_back(key):
+            return "main"
+        if key == ord("J"):
+            jobs_popup(stdscr, state); continue
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(opts)-1, sel+1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel-1)
+        elif ord("1") <= key <= ord("7"):
+            sel = key - ord("1"); key = 10
+        if key not in (10, 13):
+            continue
+        if sel == 6:
+            jobs_popup(stdscr, state); continue
+        mode, osup = sel % 3, sel >= 3
+        if mode == 0:
+            targets = [selected] if selected and cache_state(selected) != "OFFLINE" else []
+        elif mode == 1:
+            targets = [d for d in devices if device_id(d) in state["marked"] and cache_state(d) != "OFFLINE"]
+        else:
+            targets = [d for d in devices if cache_state(d) == "ONLINE"]
+        if not targets:
+            popup(stdscr, state, "Updates", "No eligible Pi targets."); continue
+        if not confirm(stdscr, state, f"Run {'OS' if osup else 'LGHS'} update on {len(targets)} Pi(s)?"):
+            continue
+        start_job(state, "OS update" if osup else "LGHS update", targets, "sudo -n /usr/local/sbin/lghs-os-update" if osup else "sudo -n /usr/local/sbin/lghs-update")
+
+
+def logs_screen(stdscr, state):
+    state["context"] = "logs"
+    opts = ["Fleet sudo command log", "Fleet sudo approval audit", "LGHS update history", "Raspberry Pi OS update history", "Selected Pi live logs (SSH)"]
+    paths = [Path('/var/log/lghs-fleet/sudo.log'), Path('/var/log/lghs-fleet/audit.jsonl'), Path('/var/log/lghs-fleet/update.log'), Path('/var/log/lghs-fleet/os-update.log')]
+    sel = 0
+    while True:
+        maintenance(stdscr, state)
+        header(stdscr, state, "Audit & logs", "Controller copies are local; only selected Pi live logs use SSH.")
+        for i, x in enumerate(opts):
+            safe(stdscr, 3+i, 4, f"{i+1}. {x}", curses.A_REVERSE if i == sel else 0)
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if is_back(key):
+            return "main"
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(4, sel+1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel-1)
+        elif ord("1") <= key <= ord("5"):
+            sel = key - ord("1"); key = 10
+        if key in (10, 13):
+            if sel < 4:
+                try:
+                    text = '\n'.join(paths[sel].read_text(encoding='utf-8', errors='replace').splitlines()[-180:])
+                except Exception as exc:
+                    text = str(exc)
+                popup(stdscr, state, opts[sel], text or 'No entries.')
+            else:
+                devices = state["devices"]
+                d = devices[state.get('selected',0)] if devices and state.get('selected',0) < len(devices) else None
+                if d:
+                    start_job(state, f"Live logs - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-report logs all")
+                else:
+                    popup(stdscr, state, "Logs", "No selected Pi.")
+
+
+def controller_screen(stdscr, state):
+    state["context"] = "controller"
+    service_health_tick(state, True)
+    while True:
+        maintenance(stdscr, state)
+        ch = state.get("controller_health", {})
+        header(stdscr, state, "Controller status", "Checks run in a background worker; this screen never blocks the UI.")
+        y = 3
+        if not ch:
+            safe(stdscr, y, 4, "Checking controller services..."); y += 1
+        for name, value in ch.items():
+            if name == "ok":
+                continue
+            shown = f"{number(value):.1f}s" if name == "cache_age" and value is not None else str(value)
+            safe(stdscr, y, 4, f"{name:30} {shown}"); y += 1
+        safe(stdscr, y+1, 4, f"Controller commit: {state.get('controller_commit','unknown')}")
+        safe(stdscr, y+2, 4, f"Fleet cache: {CACHE} | {'present' if CACHE.exists() else 'missing'}")
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if is_back(key):
+            return "main"
+        if key in (ord("r"), ord("R")):
+            service_health_tick(state, True)
+
+
+def main_menu(stdscr, state):
+    state["context"] = "main"
+    items = [("Fleet overview", "fleet"), ("Needs Attention", "attention"), ("Fleet Activity", "activity"), ("Telemetry", "telemetry"), ("Sudo requests", "sudo"), ("Updates", "updates"), ("Audit & logs", "logs"), ("Controller status", "controller")]
+    sel = state.get("menu_selected", 0)
+    while True:
+        maintenance(stdscr, state)
+        devices = state["devices"]
+        problems, pending = issues(devices, state), len(pending_requests(devices))
+        outdated = sum(bool(version_state(d, state)) for d in devices)
+        active_updates = sum(bool(operation_label(operation_for_device(d))) for d in devices)
+        header(stdscr, state, "Main menu", f"{len(problems)} issue(s) | {pending} sudo | {outdated} outdated | {active_updates} updating | group {state.get('group_filter','All')} | search {state.get('search') or '-'}")
+        counts = {"fleet": len(devices), "attention": len(problems), "activity": len(activity_rows(state)), "telemetry": len(devices), "sudo": pending, "updates": active_updates or outdated, "logs": 0, "controller": 0}
+        for i, (name, target) in enumerate(items):
+            badge = f" [{counts[target]}]" if counts.get(target) else ""
+            safe(stdscr, 3+i, 4, f"{i+1}. {name}{badge}", curses.A_REVERSE|curses.A_BOLD if i == sel else 0)
+        stdscr.refresh(); key = read_key(stdscr, state); action = global_action(key)
+        if action == "help":
+            contextual_help(stdscr, state); continue
+        if action:
+            state["menu_selected"] = sel; return action
+        if key in (ord("q"), ord("Q")):
+            return "quit"
+        if key == ord("J"):
+            jobs_popup(stdscr, state); continue
+        if key == ord("/"):
+            q = prompt_text(stdscr, state, "SEARCH", "Device/group/version/state/stage/tag contains:", state.get("search", ""))
+            if q is not None:
+                state["search"] = q
+            continue
+        if key in (ord("g"), ord("G")):
+            cycle_group(state); continue
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(items)-1, sel+1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel-1)
+        elif ord("1") <= key <= ord("8"):
+            return items[key-ord("1")][1]
+        elif key in (10, 13):
+            return items[sel][1]
 
 
 def app(stdscr):
-    curses.curs_set(0);curses.set_escdelay(250);stdscr.keypad(True);stdscr.timeout(50)
-    state={"devices":[],"selected":0,"menu_selected":0,"cache_loaded":0.0,"generation":0,"last_activity":time.monotonic(),"idle_seconds":IDLE_SECONDS,"notified_sudo":set(),"sudo_popup_active":False,"traffic_samples":{},"down_bps":0.0,"up_bps":0.0,"marked":set(),"search":"","group_filter":"All","jobs":[],"next_job_id":1,"notices":read_notices(),"toast":None,"toast_until":0.0,"last_snapshot":None,"controller_commit":controller_commit(),"controller_health":{},"controller_health_at":0.0,"context":"main"}
-    screen="main"
-    while screen!="quit":
-        harvest_jobs(state);refresh_cache(state);maybe_auto_sudo(stdscr,state)
-        if screen=="main":screen=main_menu(stdscr,state)
-        elif screen=="fleet":screen=fleet_screen(stdscr,state,False)
-        elif screen=="telemetry":screen=fleet_screen(stdscr,state,True)
-        elif screen=="sudo":screen=sudo_screen(stdscr,state)
-        elif screen=="updates":screen=updates_screen(stdscr,state)
-        elif screen=="logs":screen=logs_screen(stdscr,state)
-        elif screen=="attention":screen=attention_screen(stdscr,state)
-        elif screen=="activity":screen=activity_screen(stdscr,state)
-        elif screen=="notices":screen=notices_screen(stdscr,state)
-        elif screen=="controller":screen=controller_screen(stdscr,state)
-        elif screen=="help":contextual_help(stdscr,state);screen="main"
-        else:screen="main"
+    curses.curs_set(0)
+    curses.set_escdelay(250)
+    stdscr.keypad(True)
+    stdscr.timeout(100)
+    state = {
+        "devices": [], "selected": 0, "menu_selected": 0, "cache_loaded": 0.0, "generation": 0,
+        "last_activity": time.monotonic(), "idle_seconds": IDLE_SECONDS, "notified_sudo": set(),
+        "sudo_popup_active": False, "traffic_samples": {}, "down_bps": 0.0, "up_bps": 0.0,
+        "marked": set(), "search": "", "group_filter": "All", "jobs": [], "next_job_id": 1,
+        "result_queue": [], "notices": read_notices(), "toast": None, "toast_until": 0.0,
+        "last_snapshot": None, "controller_commit": controller_commit(), "controller_health": {},
+        "controller_health_at": 0.0, "controller_health_future": None, "activity_cache": [],
+        "activity_loaded": 0.0, "context": "main",
+    }
+    service_health_tick(state, True)
+    screen = "main"
+    while screen != "quit":
+        maintenance(stdscr, state)
+        if screen == "main": screen = main_menu(stdscr, state)
+        elif screen == "fleet": screen = fleet_screen(stdscr, state, False)
+        elif screen == "telemetry": screen = fleet_screen(stdscr, state, True)
+        elif screen == "sudo": screen = sudo_screen(stdscr, state)
+        elif screen == "updates": screen = updates_screen(stdscr, state)
+        elif screen == "logs": screen = logs_screen(stdscr, state)
+        elif screen == "attention": screen = attention_screen(stdscr, state)
+        elif screen == "activity": screen = activity_screen(stdscr, state)
+        elif screen == "notices": screen = notices_screen(stdscr, state)
+        elif screen == "controller": screen = controller_screen(stdscr, state)
+        elif screen == "help": contextual_help(stdscr, state); screen = "main"
+        else: screen = "main"
 
 
-if __name__=="__main__":
-    mod.ensure_root();mod.ensure_dirs()
-    try:curses.wrapper(app)
-    finally:workers.shutdown(wait=False,cancel_futures=True)
+if __name__ == "__main__":
+    mod.ensure_root(); mod.ensure_dirs()
+    try:
+        curses.wrapper(app)
+    finally:
+        workers.shutdown(wait=False, cancel_futures=True)
