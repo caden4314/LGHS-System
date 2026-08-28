@@ -22,6 +22,7 @@ ALLOWED_COMMANDS = {
     "os-update": [NETQUEUE, "enqueue", "os-update"],
 }
 ACTIVE_UPDATE_STATES = {"checking", "queued", "downloading", "preparing", "installing", "validating", "cleaning", "finishing", "rolling_back", "busy", "rebooting"}
+TERMINAL_UPDATE_STATES = {"complete", "failed", "reboot_required"}
 
 
 def parse_conf():
@@ -79,6 +80,15 @@ def save_command_rows(rows):
     atomic_json(COMMAND_STATE, {"commands": rows[-64:], "updated_at": time.time()})
 
 
+def set_command_state(row, state, now=None):
+    now = time.time() if now is None else float(now)
+    old = str(row.get("state") or "")
+    if old != state:
+        row["state"] = state
+        row.setdefault(f"{state}_at", now)
+    row["updated_at"] = now
+
+
 def update_command_progress(rows, lghs_status, os_status):
     now = time.time()
     for row in rows:
@@ -89,16 +99,18 @@ def update_command_progress(rows, lghs_status, os_status):
         if not status or not started_at or started_at + 1 < accepted_at:
             continue
         s = str(status.get("state") or "").lower()
+        updated_at = float(status.get("updated_at") or now)
         if s in ACTIVE_UPDATE_STATES:
-            row["state"] = "running"
-        elif s in ("complete", "failed", "reboot_required"):
-            row["state"] = s
+            set_command_state(row, "running", updated_at)
+        elif s in TERMINAL_UPDATE_STATES:
+            set_command_state(row, s, updated_at)
         else:
             continue
         row["stage"] = str(status.get("stage") or "")
         row["message"] = str(status.get("message") or "")
         row["progress"] = status.get("progress")
-        row["updated_at"] = float(status.get("updated_at") or now)
+        row["update_state"] = s
+        row["update_started_at"] = started_at
     return rows
 
 
@@ -156,7 +168,6 @@ def accept_commands(commands):
     rows = command_rows()
     by_id = {str(x.get("id")): x for x in rows}
     changed = False
-    now = time.time()
     for command in commands[:16]:
         if not isinstance(command, dict):
             continue
@@ -166,20 +177,43 @@ def accept_commands(commands):
             continue
         if command_id in by_id:
             continue
-        row = {"id": command_id, "action": action, "state": "received", "received_at": now, "updated_at": now}
+        now = time.time()
+        row = {
+            "id": command_id,
+            "action": action,
+            "state": "received",
+            "received_at": now,
+            "updated_at": now,
+            "stage": "Received by device",
+            "message": "Command arrived over HTTPS telemetry",
+            "progress": 0,
+        }
         rows.append(row)
         by_id[command_id] = row
         changed = True
+        # Persist the receive acknowledgement before touching the local queue so
+        # an interrupted enqueue never looks like the command was never seen.
+        save_command_rows(rows)
         try:
             p = run(ALLOWED_COMMANDS[action])
         except Exception as exc:
-            row.update({"state": "failed", "message": str(exc), "updated_at": time.time()})
+            set_command_state(row, "failed")
+            row["stage"] = "Local queue failed"
+            row["message"] = str(exc)
+            save_command_rows(rows)
             continue
         if p.returncode == 0:
-            row.update({"state": "accepted", "accepted_at": time.time(), "updated_at": time.time(), "message": "Queued locally on Pi"})
+            accepted = time.time()
+            set_command_state(row, "accepted", accepted)
+            row["accepted_at"] = accepted
+            row["stage"] = "Accepted by device"
+            row["message"] = "Queued locally on Pi"
         else:
             detail = (p.stderr or p.stdout or "queue command failed").strip()[-500:]
-            row.update({"state": "failed", "message": detail, "updated_at": time.time()})
+            set_command_state(row, "failed")
+            row["stage"] = "Local queue failed"
+            row["message"] = detail
+        save_command_rows(rows)
     if changed:
         save_command_rows(rows)
 
@@ -197,7 +231,7 @@ def send_once():
     body = json.dumps(payload, separators=(",", ":")).encode()
     req = urllib.request.Request(
         f"{base}/v1/report/{device}", data=body, method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "LGHS-Telemetry/4"},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "LGHS-Telemetry/5"},
     )
     with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
         if response.status not in (200, 202, 204):
