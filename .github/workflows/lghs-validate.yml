@@ -67,13 +67,15 @@ jobs:
       - name: Release invariants
         run: |
           grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION
-          grep -q 'controller/lghs-console-responsive' install.sh
+          grep -q 'controller/lghs-console-responsive.*lghs-console-responsive-core' install.sh
+          grep -q 'controller/lghs-console-day2.*lghs-console' install.sh
+          grep -q 'controller/lghs-fleet-command.*lghs-fleet-command' install.sh
           grep -q 'lghs-fleet-notify.service' install.sh
           grep -q 'lghs-install-success-notify.service' install.sh
           grep -q 'MEMORY_GB="$(read_value MEMORY_GB' student/lghs-firstboot-provision
           grep -q '"$MEMORY_GB" == "4" || "$MEMORY_GB" == "8"' student/lghs-firstboot-provision
           grep -q 'Visual Studio Code.desktop' student/lghs-dev-setup
-          grep -q 'lghs-console-day2' student/lghs-dev-setup
+          grep -q 'Exec=/usr/bin/sudo -n /usr/local/sbin/lghs-console' student/lghs-dev-setup
           grep -q 'metadata::trusted true' student/lghs-dev-setup
           grep -q 'find_code_icon' student/lghs-dev-setup
           grep -q 'wfpanelctl notify' updater/lghs-install-success-notify
