@@ -5,6 +5,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 [[ "$ROLE" == controller || "$ROLE" == student ]] || { echo 'Usage: lghs-0.5-install <controller|student>' >&2; exit 2; }
 
+BT_PKGS=(bluez rfkill python3-cryptography network-manager)
+MISSING_PKGS=()
+for pkg in "${BT_PKGS[@]}"; do
+  dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg")
+done
+if (( ${#MISSING_PKGS[@]} )); then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PKGS[@]}"
+fi
+install -d -m 0755 /usr/local/lib/lghs-bt
+install -m 0644 "$ROOT/bluetooth/lghs_bt_protocol.py" /usr/local/lib/lghs-bt/lghs_bt_protocol.py
+systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
+
 if [[ "$ROLE" == controller ]]; then
   install -d -m 0755 /usr/local/lib/lghs-python/lghs
   install -m 0644 "$ROOT/controller/lghs/__init__.py" /usr/local/lib/lghs-python/lghs/__init__.py
@@ -16,14 +29,16 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
   install -m 0755 "$ROOT/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
+  install -m 0750 "$ROOT/controller/lghs-bt-provision" /usr/local/sbin/lghs-bt-provision
+  install -m 0644 "$ROOT/systemd/lghs-bt-provision.service" /etc/systemd/system/lghs-bt-provision.service
   /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
   chmod 0640 /var/lib/lghs/db-migration-last.json
-  # Keep the historical timer enabled for updater compatibility. On 0.5 the
-  # sync command exits before SSH; explicit backfill requires
-  # LGHS_AUDIT_SSH_RECOVERY=1.
+  systemctl daemon-reload
   systemctl enable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
+  systemctl enable --now lghs-bt-provision.service
   systemctl try-restart lghs-fleet-api.service || true
-  echo 'LGHS 0.5 controller SQLite/HTTPS foundation installed.'
+  systemctl try-restart lghs-bt-provision.service || true
+  echo 'LGHS 0.5 controller SQLite/HTTPS + Bluetooth bootstrap foundation installed.'
   exit 0
 fi
 
@@ -32,12 +47,15 @@ if ! id lghs-agent >/dev/null 2>&1; then
   useradd --system --gid lghs-agent --home-dir /var/lib/lghs-agent --shell /usr/sbin/nologin lghs-agent
 fi
 install -d -o lghs-agent -g lghs-agent -m 0700 /var/lib/lghs-agent
+install -d -o root -g root -m 0700 /var/lib/lghs/bootstrap
 install -m 0755 "$ROOT/student/lghs-agent" /usr/local/sbin/lghs-agent
 install -m 0750 "$ROOT/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
 install -m 0755 "$ROOT/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
+install -m 0750 "$ROOT/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap
 install -m 0644 "$ROOT/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
 install -m 0644 "$ROOT/systemd/lghs-command-executor.service" /etc/systemd/system/lghs-command-executor.service
 install -m 0644 "$ROOT/systemd/lghs-discovery-advertise.service" /etc/systemd/system/lghs-discovery-advertise.service
+install -m 0644 "$ROOT/systemd/lghs-bt-bootstrap.service" /etc/systemd/system/lghs-bt-bootstrap.service
 if [[ -s /etc/lghs/secrets/fleet-api-token ]]; then
   install -o lghs-agent -g lghs-agent -m 0400 /etc/lghs/secrets/fleet-api-token /var/lib/lghs-agent/fleet-api-token
 fi
@@ -47,11 +65,23 @@ fi
 printf '%s\n' "$(cat "$ROOT/VERSION")" > /var/lib/lghs-agent/version
 chown lghs-agent:lghs-agent /var/lib/lghs-agent/version
 chmod 0400 /var/lib/lghs-agent/version
+
+# Existing enrolled Pis are not automatically re-provisioned. Fresh image
+# builds opt into Bluetooth bootstrap and stop permanently after HTTPS health
+# succeeds and wifi-provisioned.json is written.
+if [[ "${LGHS_IMAGE_BUILD:-0}" == "1" ]]; then
+  install -m 0600 /dev/null /etc/lghs/bluetooth-bootstrap-enabled
+fi
+
 systemctl daemon-reload
 systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
 systemctl enable --now lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service
+systemctl enable lghs-bt-bootstrap.service
+if [[ -f /etc/lghs/bluetooth-bootstrap-enabled && ! -f /var/lib/lghs/bootstrap/wifi-provisioned.json ]]; then
+  systemctl start lghs-bt-bootstrap.service || true
+fi
 sleep 1
 systemctl is-active --quiet lghs-command-executor.service
 systemctl is-active --quiet lghs-agent.service
 systemctl is-active --quiet lghs-discovery-advertise.service
-echo 'LGHS 0.5 unprivileged student agent installed.'
+echo 'LGHS 0.5 unprivileged student agent + Bluetooth bootstrap foundation installed.'
