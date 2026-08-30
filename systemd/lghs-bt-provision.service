@@ -1,7 +1,8 @@
 [Unit]
 Description=LGHS Bluetooth Wi-Fi Provisioning Server
-After=bluetooth.service NetworkManager.service
-Wants=bluetooth.service NetworkManager.service
+After=bluetooth.service lghs-bt-prepare.service NetworkManager.service
+Requires=bluetooth.service lghs-bt-prepare.service
+Wants=NetworkManager.service
 PartOf=bluetooth.service
 ConditionPathExists=/etc/lghs/role
 
