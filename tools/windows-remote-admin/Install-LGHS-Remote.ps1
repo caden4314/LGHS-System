@@ -13,16 +13,53 @@ function Require-Command([string]$Name, [string]$Help) {
     }
 }
 
+function Refresh-ProcessPath {
+    $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $user = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = (($machine, $user) -join ';')
+}
+
+function Find-Cloudflared {
+    $cmd = Get-Command "cloudflared.exe" -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $candidates = @(
+        "$env:ProgramFiles\cloudflared\cloudflared.exe",
+        "${env:ProgramFiles(x86)}\cloudflared\cloudflared.exe",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\cloudflared.exe"
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    if ($candidates.Count -gt 0) { return $candidates[0] }
+
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Microsoft\WinGet\Packages") |
+        Where-Object { $_ -and (Test-Path $_) }
+    foreach ($root in $roots) {
+        $found = Get-ChildItem -Path $root -Filter cloudflared.exe -File -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+    return $null
+}
+
 Require-Command "ssh.exe" "Install the Windows OpenSSH Client optional feature."
 Require-Command "ssh-keygen.exe" "Install the Windows OpenSSH Client optional feature."
 
-if (-not (Get-Command "cloudflared.exe" -ErrorAction SilentlyContinue)) {
+$cloudflared = Find-Cloudflared
+if (-not $cloudflared) {
     if (Get-Command "winget.exe" -ErrorAction SilentlyContinue) {
-        Write-Host "cloudflared is not installed. Installing Cloudflare.cloudflared with winget..."
+        Write-Host "cloudflared is not installed or is not visible in this PowerShell session. Installing Cloudflare.cloudflared with winget..."
         & winget.exe install --id Cloudflare.cloudflared --exact --accept-package-agreements --accept-source-agreements
+        if ($LASTEXITCODE -notin @(0, -1978335189)) {
+            Write-Warning "winget returned exit code $LASTEXITCODE; checking for an installed cloudflared anyway."
+        }
+        Refresh-ProcessPath
+        $cloudflared = Find-Cloudflared
     }
 }
-Require-Command "cloudflared.exe" "Install cloudflared from Cloudflare before continuing."
+if (-not $cloudflared) {
+    throw "cloudflared.exe is installed but could not be located. Open a new PowerShell window and rerun this installer, or verify 'where.exe cloudflared' returns a path."
+}
+Write-Host "Using cloudflared: $cloudflared" -ForegroundColor DarkGray
 
 $sshDir = Split-Path -Parent $KeyPath
 New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
@@ -51,6 +88,7 @@ $escapedBegin = [regex]::Escape($begin)
 $escapedEnd = [regex]::Escape($end)
 $config = [regex]::Replace($config, "(?s)$escapedBegin.*?$escapedEnd\s*", "")
 $keyForConfig = $KeyPath -replace '\\','/'
+$cloudflaredForConfig = $cloudflared -replace '\\','/'
 $block = @"
 $begin
 Host $Alias
@@ -66,7 +104,7 @@ Host $Alias
     ClearAllForwardings yes
     ServerAliveInterval 20
     ServerAliveCountMax 3
-    ProxyCommand cloudflared.exe access ssh --hostname %h
+    ProxyCommand "$cloudflaredForConfig" access ssh --hostname %h
 $end
 "@
 Set-Content -Path $configPath -Value (($config.TrimEnd() + "`r`n`r`n" + $block).TrimStart()) -Encoding ascii
