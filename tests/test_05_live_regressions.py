@@ -66,11 +66,15 @@ class LiveRegressionSourceTests(unittest.TestCase):
         self.assertIn('systemctl enable --now lghs-telemetry-push.service', source)
         self.assertIn('systemctl is-active --quiet lghs-telemetry-push.service', source)
 
-    def test_managed_sudo_uses_blocking_wait_instead_of_fast_status_poll(self):
+    def test_managed_sudo_uses_one_persistent_waiter(self):
         broker = (ROOT / 'student' / 'lghs-sudo-broker').read_text(encoding='utf-8')
         wrapper = (ROOT / 'student' / 'sudo').read_text(encoding='utf-8')
         self.assertIn("elif action == 'wait'", broker)
-        self.assertIn("p = broker('wait', rid, [str(wait_seconds)])", wrapper)
+        self.assertIn('BROKER_WAIT_SECONDS = 600', wrapper)
+        self.assertIn("waiter = broker_waiter(rid)", wrapper)
+        self.assertIn("'/usr/local/sbin/lghs-sudo-broker', 'wait', rid, str(BROKER_WAIT_SECONDS)", wrapper)
+        self.assertNotIn("request_status(rid, 2", wrapper)
+        self.assertNotIn("request_status(rid, 15", wrapper)
         self.assertNotIn('POLL_SECONDS = 0.35', wrapper)
 
 
