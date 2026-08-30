@@ -15,6 +15,7 @@ KNOWN_HOSTS = "/var/lib/lghs/ssh_known_hosts"
 CONTROL_DIR = "/run/lghs-ssh"
 FLEET_LOG_DIR = Path('/var/log/lghs-fleet')
 REGISTRY_FILE = Path('/etc/lghs/fleet.json')
+FLEET_COMMAND = '/usr/local/sbin/lghs-fleet-command'
 CLOUDFLARED = shutil.which('cloudflared') or '/usr/local/bin/cloudflared'
 
 
@@ -260,6 +261,28 @@ def run_fleet_command(targets, remote, label):
     return 1 if failures else 0
 
 
+def queue_https_commands(targets, action, label):
+    """Queue remote maintenance without opening an SSH session to a Pi."""
+    if not targets:
+        print("No LGHS devices registered or discovered.")
+        return 0
+    if not os.path.exists(FLEET_COMMAND):
+        print(f"LGHS HTTPS command helper missing: {FLEET_COMMAND}", file=sys.stderr)
+        return 127
+    failures = 0
+    for target in targets:
+        device = target_meta(target).get('device', target).upper()
+        p = run(["sudo", "-n", FLEET_COMMAND, "enqueue", device, action])
+        if p.returncode == 0:
+            command_id = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else "unknown"
+            print(f"{device:20} {label:14} QUEUED  {command_id}")
+        else:
+            failures += 1
+            detail = (p.stderr or p.stdout or "queue failed").strip()
+            print(f"{device:20} {label:14} FAILED  {detail}", file=sys.stderr)
+    return 1 if failures else 0
+
+
 def enroll_all(targets):
     if not targets:
         print("No LGHS devices registered or discovered.")
@@ -312,11 +335,13 @@ def main():
     if args.cmd == "enroll": return enroll_all(targets_all() if args.all or not args.target else [args.target])
     if args.cmd == "info": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-report summary")
     if args.cmd == "logs": return ssh_cmd(args.target, f"sudo -n /usr/local/sbin/lghs-report logs {args.group}")
-    if args.cmd == "update": return run_fleet_command(targets_all() if args.all or not args.target else [args.target], "sudo -n /usr/local/sbin/lghs-update", "LGHS UPDATE")
+    if args.cmd == "update":
+        return queue_https_commands(targets_all() if args.all or not args.target else [args.target], "lghs-update", "LGHS UPDATE")
     if args.cmd == "os-update":
-        targets = targets_all() if args.all or not args.target else [args.target]
-        remote = "sudo -n /usr/local/sbin/lghs-os-update" + (" --reboot" if args.reboot else "")
-        return run_fleet_command(targets, remote, "OS UPDATE")
+        if args.reboot:
+            print("--reboot is intentionally not queued with HTTPS OS updates in 0.4.1; reboot separately after the device reports reboot_required.", file=sys.stderr)
+            return 2
+        return queue_https_commands(targets_all() if args.all or not args.target else [args.target], "os-update", "OS UPDATE")
     if args.cmd == "check": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-check")
     if args.cmd == "enforce": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-enforce")
     if args.cmd == "reboot": return ssh_cmd(args.target, "sudo -n /usr/sbin/reboot")

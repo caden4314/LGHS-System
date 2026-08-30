@@ -29,7 +29,11 @@ jobs:
             student/lghs-approved-exec \
             student/lghs-sudo-admin \
             student/lghs-audit-export \
-            student/sudo
+            student/sudo \
+            tests/test_command_plane.py
+
+      - name: Command-plane regression tests
+        run: python3 -m unittest -v tests/test_command_plane.py
 
       - name: Shell syntax
         run: |
@@ -63,6 +67,20 @@ jobs:
           sudo visudo -cf policies/sudoers/89-lghs-audit
           sudo visudo -cf policies/sudoers/90-lghs-student
           sudo visudo -cf policies/sudoers/99-lghs-admin
+
+      - name: Telemetry sandbox invariants
+        run: |
+          grep -q '^ProtectSystem=strict$' systemd/lghs-telemetry-push.service
+          grep -q '^StateDirectory=lghs/telemetry$' systemd/lghs-telemetry-push.service
+          grep -q '^ReadWritePaths=/var/lib/lghs/netqueue /var/log/lghs-netqueue.log$' systemd/lghs-telemetry-push.service
+          grep -q '/var/lib/lghs/telemetry/command-state.json' student/lghs-telemetry-push
+
+      - name: Fleet API sandbox invariants
+        run: |
+          grep -q '^ProtectSystem=strict$' systemd/lghs-fleet-api.service
+          grep -q '^ReadWritePaths=/var/lib/lghs /etc/lghs /run/lock$' systemd/lghs-fleet-api.service
+          grep -q '/run/lock/lghs-fleet-commands.lock' controller/lghs-fleet-api
+          grep -q '/run/lock/lghs-fleet-commands.lock' controller/lghs-fleet-command
 
       - name: Release invariants
         run: |

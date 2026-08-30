@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+import fcntl
 import hmac
 import json
 import os
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -13,15 +15,22 @@ PORT = int(os.environ.get("LGHS_FLEET_API_PORT", "8789"))
 TOKENS = Path("/etc/lghs/fleet-api-tokens.json")
 CACHE = Path("/var/lib/lghs/fleet-cache.json")
 COMMANDS = Path("/var/lib/lghs/fleet-commands.json")
+COMMAND_LOCK_FILE = Path("/run/lock/lghs-fleet-commands.lock")
 MAX_BODY = 256 * 1024
-LOCK = threading.Lock()
-COMMAND_TTL = 24 * 60 * 60
+LOCK = threading.RLock()
+COMMAND_TTL = int(os.environ.get("LGHS_COMMAND_TTL_SECONDS", str(24 * 60 * 60)))
 ALLOWED_COMMANDS = {"lghs-update", "os-update"}
-TERMINAL_COMMAND_STATES = {"complete", "failed", "reboot_required"}
-COMMAND_ORDER = {"queued": 0, "pending": 0, "delivered": 1, "received": 2, "accepted": 3, "running": 4, "reboot_required": 5, "complete": 5, "failed": 5}
+TERMINAL_COMMAND_STATES = {"succeeded", "failed", "timed_out", "rejected", "canceled"}
+COMMAND_ORDER = {
+    "queued": 0, "pending": 0, "delivered": 1, "received": 2,
+    "accepted": 3, "running": 4,
+    "succeeded": 5, "complete": 5, "reboot_required": 5,
+    "failed": 5, "timed_out": 5, "rejected": 5, "canceled": 5,
+}
 TIMELINE_KEYS = (
     "queued_at", "delivered_at", "received_at", "accepted_at", "running_at",
-    "complete_at", "failed_at", "reboot_required_at", "update_started_at",
+    "succeeded_at", "failed_at", "timed_out_at", "rejected_at", "canceled_at",
+    "complete_at", "reboot_required_at", "update_started_at",
 )
 
 
@@ -48,6 +57,26 @@ def atomic_json(path, value, mode=0o640):
             os.unlink(tmp)
         except FileNotFoundError:
             pass
+
+
+@contextmanager
+def command_file_lock():
+    COMMAND_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with COMMAND_LOCK_FILE.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def normalize_state(value):
+    state = str(value or "queued").lower()
+    if state == "pending":
+        return "queued"
+    if state in {"complete", "reboot_required"}:
+        return "succeeded"
+    return state
 
 
 def token_for(device):
@@ -92,15 +121,21 @@ def reconcile_command_states(device, reported):
         remote = by_id.get(str(row.get("id") or ""))
         if not remote:
             continue
-        new_state = str(remote.get("state") or "accepted").lower()
+        raw_state = str(remote.get("state") or "accepted").lower()
+        new_state = normalize_state(raw_state)
         if new_state not in COMMAND_ORDER:
             continue
-        old_state = str(row.get("state") or "queued").lower()
+        old_state = normalize_state(row.get("state") or "queued")
         if old_state in TERMINAL_COMMAND_STATES or COMMAND_ORDER[new_state] < COMMAND_ORDER.get(old_state, 0):
             continue
         if new_state != old_state:
             row["state"] = new_state
-            transition_time = float(remote.get(f"{new_state}_at") or remote.get("updated_at") or now)
+            transition_time = float(
+                remote.get(f"{new_state}_at")
+                or remote.get(f"{raw_state}_at")
+                or remote.get("updated_at")
+                or now
+            )
             row.setdefault(f"{new_state}_at", transition_time)
             changed = True
         for key in TIMELINE_KEYS + ("stage", "progress", "message", "updated_at", "update_state"):
@@ -124,20 +159,35 @@ def commands_for(device):
             changed = True
             continue
         created = float(row.get("created_at") or 0)
-        if created and now - created > COMMAND_TTL:
+        state = normalize_state(row.get("state") or "queued")
+        if row.get("state") != state:
+            row["state"] = state
             changed = True
-            continue
+        if created and now - created > COMMAND_TTL and state not in TERMINAL_COMMAND_STATES:
+            row["state"] = "timed_out"
+            row.setdefault("timed_out_at", now)
+            row["updated_at"] = now
+            row["stage"] = "Command timed out"
+            row["message"] = "Device did not accept the command before its deadline"
+            row["progress"] = row.get("progress", 0)
+            state = "timed_out"
+            changed = True
         kept.append(row)
         action = str(row.get("action") or "")
-        state = str(row.get("state") or "queued")
-        if state in ("queued", "pending", "delivered") and action in ALLOWED_COMMANDS and row.get("id"):
-            if state in ("queued", "pending"):
+        if state in {"queued", "delivered", "received"} and action in ALLOWED_COMMANDS and row.get("id"):
+            if state == "queued":
                 row["state"] = "delivered"
-                row["delivered_at"] = now
+                row.setdefault("delivered_at", now)
                 row["updated_at"] = now
                 row["stage"] = "Delivered to device"
                 row["message"] = "Waiting for device acceptance"
                 row["progress"] = 0
+            elif state == "received":
+                # RECEIVED is not durable acceptance. Keep redelivering until
+                # the Pi confirms that the command reached its local queue.
+                row["stage"] = "Received; awaiting local acceptance"
+                row["message"] = "Redelivering until the device accepts the command"
+                row["updated_at"] = now
             row["last_delivery_at"] = now
             row["deliveries"] = int(row.get("deliveries") or 0) + 1
             changed = True
@@ -177,7 +227,7 @@ def update_cache(device, report):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LGHSFleetAPI/4"
+    server_version = "LGHSFleetAPI/5"
 
     def log_message(self, fmt, *args):
         return
@@ -230,10 +280,13 @@ class Handler(BaseHTTPRequestHandler):
         if claimed and claimed != device:
             self.reply(409, {"ok": False, "error": "device-mismatch"})
             return
+        # Thread lock protects concurrent request handlers; flock protects this
+        # transaction against lghs-fleet-command and any other process writer.
         with LOCK:
-            reconcile_command_states(device, report.get("command_states"))
-            commands = commands_for(device)
-            update_cache(device, report)
+            with command_file_lock():
+                reconcile_command_states(device, report.get("command_states"))
+                commands = commands_for(device)
+                update_cache(device, report)
         self.reply(202, {"ok": True, "received_at": time.time(), "commands": commands})
 
 
@@ -246,8 +299,9 @@ def main():
         atomic_json(TOKENS, {"version": 1, "devices": {}}, 0o600)
     if not CACHE.exists():
         atomic_json(CACHE, {"version": 1, "devices": {}}, 0o640)
-    if not COMMANDS.exists():
-        atomic_json(COMMANDS, {"version": 2, "devices": {}}, 0o600)
+    with command_file_lock():
+        if not COMMANDS.exists():
+            atomic_json(COMMANDS, {"version": 2, "devices": {}}, 0o600)
     server = ThreadingHTTPServer((BIND, PORT), Handler)
     server.daemon_threads = True
     server.serve_forever(poll_interval=0.25)

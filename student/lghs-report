@@ -14,7 +14,31 @@ os_pretty="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}
 
 cpu_percent(){ local a b;a="$(awk '/^cpu / {idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print total, idle}' /proc/stat)";sleep 0.12;b="$(awk '/^cpu / {idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print total, idle}' /proc/stat)";awk -v a="$a" -v b="$b" 'BEGIN{split(a,A," ");split(b,B," ");dt=B[1]-A[1];di=B[2]-A[2];if(dt<=0)print "0.0";else printf "%.1f",100*(dt-di)/dt}';}
 telemetry(){ local mem_total mem_avail mem_used_pct disk_total disk_used disk_pct temp rx tx load1;mem_total="$(awk '/MemTotal:/ {print $2*1024}' /proc/meminfo)";mem_avail="$(awk '/MemAvailable:/ {print $2*1024}' /proc/meminfo)";mem_used_pct="$(awk -v t="$mem_total" -v a="$mem_avail" 'BEGIN{if(t>0)printf "%.1f",100*(t-a)/t;else print "0.0"}')";read -r disk_total disk_used disk_pct < <(df -B1 --output=size,used,pcent /|tail -n1|awk '{gsub("%","",$3);print $1,$2,$3}');temp="$(awk 'BEGIN{v=""}{if($1+0>0){printf "%.1f",$1/1000;exit}}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null||true)";[[ -n "$temp" ]]||temp="n/a";rx="$(awk -F'[: ]+' 'NR>2&&$2!="lo"{s+=$3}END{printf "%.0f",s}' /proc/net/dev)";tx="$(awk -F'[: ]+' 'NR>2&&$2!="lo"{s+=$11}END{printf "%.0f",s}' /proc/net/dev)";load1="$(awk '{print $1}' /proc/loadavg)";echo "cpu_pct=$(cpu_percent)";echo "load1=$load1";echo "mem_pct=$mem_used_pct";echo "mem_total=$mem_total";echo "mem_available=$mem_avail";echo "disk_pct=$disk_pct";echo "disk_total=$disk_total";echo "disk_used=$disk_used";echo "temp_c=$temp";echo "rx_bytes=$rx";echo "tx_bytes=$tx";}
-pending_sudo(){ if [[ -x /usr/local/sbin/lghs-sudo-admin ]];then sudo -n /usr/local/sbin/lghs-sudo-admin list --json 2>/dev/null|python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null||echo 0;else echo 0;fi;}
+pending_sudo(){
+  local dir=/var/lib/lghs/sudo-requests
+  [[ -d "$dir" ]] || { echo 0; return; }
+  python3 - "$dir" <<'PY'
+import json, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+now = time.time()
+count = 0
+for path in root.glob("*.json"):
+    try:
+        item = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if not isinstance(item, dict) or item.get("status") != "pending":
+        continue
+    try:
+        expires = float(item.get("expires_epoch", 0) or 0)
+    except Exception:
+        expires = 0
+    if expires and now > expires:
+        continue
+    count += 1
+print(count)
+PY
+}
 pending_netqueue(){ if [[ -d /var/lib/lghs/netqueue/jobs ]];then find /var/lib/lghs/netqueue/jobs -maxdepth 1 -type f -name '*.json' -printf . 2>/dev/null|wc -c;else echo 0;fi;}
 student_sudo(){ if [[ "$role" == "student" ]] && id lg_cs_cont >/dev/null 2>&1; then if id -nG lg_cs_cont 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then echo yes; else echo no; fi; else echo n/a; fi; }
 

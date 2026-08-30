@@ -6,17 +6,20 @@ queue consumed by lghs-fleet-api; the student receives work in the response to
 its normal outbound HTTPS telemetry POST.
 """
 import argparse
+import fcntl
 import json
 import os
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 COMMANDS = Path("/var/lib/lghs/fleet-commands.json")
+COMMAND_LOCK = Path("/run/lock/lghs-fleet-commands.lock")
 REGISTRY = Path("/etc/lghs/fleet.json")
 ALLOWED = {"lghs-update", "os-update"}
-OPEN_STATES = {"queued", "delivered", "accepted", "running"}
+OPEN_STATES = {"queued", "delivered", "received", "accepted", "running"}
 
 
 def load_json(path, default):
@@ -45,6 +48,17 @@ def atomic_json(path, value):
             pass
 
 
+@contextmanager
+def command_file_lock():
+    COMMAND_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with COMMAND_LOCK.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def known_devices():
     data = load_json(REGISTRY, {})
     devices = data.get("devices", {}) if isinstance(data, dict) else {}
@@ -58,36 +72,38 @@ def enqueue(device, action):
     known = known_devices()
     if known and device not in known:
         raise SystemExit(f"Unknown fleet device: {device}")
-    data = load_json(COMMANDS, {"version": 2, "devices": {}})
-    data["version"] = 2
-    devices = data.setdefault("devices", {})
-    rows = devices.setdefault(device, [])
-    for row in rows:
-        if isinstance(row, dict) and row.get("action") == action and str(row.get("state", "queued")) in OPEN_STATES:
-            print(row.get("id"))
-            return
-    now = time.time()
-    row = {
-        "id": uuid.uuid4().hex,
-        "device": device,
-        "action": action,
-        "state": "queued",
-        "created_at": now,
-        "queued_at": now,
-        "updated_at": now,
-        "progress": 0,
-        "stage": "Waiting for device telemetry",
-        "message": "Queued on controller for HTTPS delivery",
-    }
-    rows.append(row)
-    devices[device] = rows[-64:]
-    data["updated_at"] = now
-    atomic_json(COMMANDS, data)
+    with command_file_lock():
+        data = load_json(COMMANDS, {"version": 2, "devices": {}})
+        data["version"] = 2
+        devices = data.setdefault("devices", {})
+        rows = devices.setdefault(device, [])
+        for row in rows:
+            if isinstance(row, dict) and row.get("action") == action and str(row.get("state", "queued")) in OPEN_STATES:
+                print(row.get("id"))
+                return
+        now = time.time()
+        row = {
+            "id": uuid.uuid4().hex,
+            "device": device,
+            "action": action,
+            "state": "queued",
+            "created_at": now,
+            "queued_at": now,
+            "updated_at": now,
+            "progress": 0,
+            "stage": "Waiting for device telemetry",
+            "message": "Queued on controller for HTTPS delivery",
+        }
+        rows.append(row)
+        devices[device] = rows[-64:]
+        data["updated_at"] = now
+        atomic_json(COMMANDS, data)
     print(row["id"])
 
 
 def show(device=None):
-    data = load_json(COMMANDS, {"version": 2, "devices": {}})
+    with command_file_lock():
+        data = load_json(COMMANDS, {"version": 2, "devices": {}})
     if device:
         rows = data.get("devices", {}).get(device.upper(), [])
         print(json.dumps(rows, indent=2, sort_keys=True))

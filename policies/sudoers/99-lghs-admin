@@ -16,6 +16,9 @@ cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-export *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-sync
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-cloudflare-install
+# This helper only accepts registered device IDs and an internal allowlist of
+# HTTPS fleet actions; it does not execute arbitrary commands.
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-fleet-command *
 # Trusted Fleet Control entrypoints. The day-to-day dashboard lives in the
 # root-owned updater checkout and imports the installed responsive console.
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-console
