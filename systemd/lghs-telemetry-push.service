@@ -17,6 +17,12 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/etc/lghs /usr/local/sbin
+# Keep telemetry sandboxed while explicitly granting only the state locations
+# used by command acknowledgement and the persistent network queue. The
+# StateDirectory entry creates /var/lib/lghs/telemetry before ExecStart.
+StateDirectory=lghs/telemetry
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/lghs/netqueue /var/log/lghs-netqueue.log
 
 [Install]
 WantedBy=multi-user.target
