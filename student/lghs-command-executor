@@ -2,7 +2,7 @@
 """Tiny root executor for typed LGHS 0.5 agent commands."""
 import grp,json,os,shutil,socket,subprocess,time
 from pathlib import Path
-SOCK=Path('/run/lghs-command-executor/socket');NETQUEUE='/usr/local/sbin/lghs-netqueue';SEEN=Path('/var/lib/lghs/executor-seen.json')
+SOCK=Path('/run/lghs-command-executor/socket');NETQUEUE='/usr/local/sbin/lghs-netqueue';SEEN=Path('/var/lib/lghs/executor-seen.json');SUDO_DIR=Path('/var/lib/lghs/sudo-requests')
 ACTIONS={'lghs-update':[NETQUEUE,'enqueue','local-update'],'os-update':[NETQUEUE,'enqueue','os-update']}
 STATUS={'lghs-update':Path('/var/lib/lghs/update/lghs-status.json'),'os-update':Path('/var/lib/lghs/update/os-status.json')}
 AUDIT={'sudo':Path('/var/log/sudo.log'),'audit':Path('/var/log/lghs-sudo-audit.jsonl'),'update':Path('/var/log/lghs-update.log'),'os-update':Path('/var/log/lghs-os-update.log')}
@@ -15,8 +15,7 @@ def save_seen(x):
 def service_states():
     out={}
     for unit in SERVICES:
-        try:
-            p=subprocess.run(['systemctl','is-active',unit],text=True,capture_output=True,timeout=2);out[unit]=(p.stdout or '').strip() or 'unknown'
+        try:p=subprocess.run(['systemctl','is-active',unit],text=True,capture_output=True,timeout=2);out[unit]=(p.stdout or '').strip() or 'unknown'
         except Exception:out[unit]='unknown'
     return out
 def pi_health():
@@ -27,6 +26,16 @@ def pi_health():
             out.update({'throttled_raw':raw,'undervoltage_now':bool(flags&1),'frequency_capped_now':bool(flags&2),'throttled_now':bool(flags&4),'soft_temp_limit_now':bool(flags&8),'undervoltage_occurred':bool(flags&(1<<16)),'frequency_capped_occurred':bool(flags&(1<<17)),'throttled_occurred':bool(flags&(1<<18)),'soft_temp_limit_occurred':bool(flags&(1<<19))})
         except Exception:pass
     return out
+def pending_sudo():
+    out=[];now=time.time()
+    for path in sorted(SUDO_DIR.glob('*.json')) if SUDO_DIR.exists() else []:
+        item=load_json(path,{})
+        if not isinstance(item,dict) or item.get('status')!='pending':continue
+        try:expires=float(item.get('expires_epoch') or 0)
+        except Exception:expires=0
+        if expires and now>expires:continue
+        out.append({k:item.get(k) for k in ('id','device_id','requester','command','argv','cwd','requested_at','requested_epoch','expires_epoch','status')})
+    return out[-64:]
 def audit_chunk(req):
     kind=str(req.get('kind') or '');path=AUDIT.get(kind)
     if path is None:return {'ok':False,'error':'unknown-audit-kind'}
@@ -46,7 +55,8 @@ def handle(c):
         data+=chunk
     try:req=json.loads(data.split(b'\n',1)[0])
     except Exception:reply(c,{'ok':False,'error':'invalid-json'});return
-    if req.get('op')=='status':reply(c,{'ok':True,'updates':{k:load_json(v,{}) for k,v in STATUS.items()},'health':pi_health(),'services':service_states()});return
+    if req.get('op')=='status':reply(c,{'ok':True,'updates':{k:load_json(v,{}) for k,v in STATUS.items()},'health':pi_health(),'services':service_states(),'sudo_requests':pending_sudo()});return
+    if req.get('op')=='sudo':reply(c,{'ok':True,'sudo_requests':pending_sudo()});return
     if req.get('op')=='audit':reply(c,audit_chunk(req));return
     cid=str(req.get('id') or '');action=str(req.get('action') or '')
     if not cid or len(cid)>128:reply(c,{'ok':False,'error':'invalid-command-id'});return
