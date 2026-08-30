@@ -11,6 +11,7 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0644 "$ROOT/controller/lghs/protocol.py" /usr/local/lib/lghs-python/lghs/protocol.py
   install -m 0644 "$ROOT/controller/lghs/database.py" /usr/local/lib/lghs-python/lghs/database.py
   install -m 0644 "$ROOT/controller/lghs/audit.py" /usr/local/lib/lghs-python/lghs/audit.py
+  install -m 0644 "$ROOT/controller/lghs/sudo_state.py" /usr/local/lib/lghs-python/lghs/sudo_state.py
   install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
