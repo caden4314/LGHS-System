@@ -45,18 +45,38 @@ class BluetoothProtocolTests(unittest.TestCase):
 
 
 class BluetoothSourceInvariants(unittest.TestCase):
-    def test_student_is_opt_in_and_one_shot(self):
+    def test_student_is_opt_in_one_shot_and_event_driven(self):
         src = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
         self.assertIn("/etc/lghs/bluetooth-bootstrap-enabled", src)
         self.assertIn("wifi-provisioned.json", src)
-        self.assertIn("SCAN_INTERVAL", src)
-        self.assertIn('"15"', src)
+        self.assertIn('["btmgmt", "find", "-b"]', src)
+        self.assertIn("select.select", src)
+        self.assertNotIn("SCAN_INTERVAL", src)
+
+    def test_zero_touch_link_layer_keeps_application_authentication(self):
+        student = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
+        controller = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
+        for src in (student, controller):
+            self.assertIn('["btmgmt", "io-cap", "3"]', src)
+            self.assertIn("set_app_authenticated_security", src)
+        self.assertIn('verify_proof(token, "student"', controller)
+        self.assertIn('verify_proof(token, "controller"', student)
+        self.assertIn("decrypt_payload", student)
+        self.assertIn("encrypt_payload", controller)
 
     def test_controller_authenticates_against_device_token_registry(self):
         src = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
         self.assertIn("fleet-api-tokens.json", src)
         self.assertIn('verify_proof(token, "student"', src)
         self.assertIn("encrypt_payload", src)
+
+    def test_controller_publishes_rfcomm_sdp_service(self):
+        src = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
+        install = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("ensure_sdp_record", src)
+        self.assertIn('"sdptool", "add"', src)
+        self.assertIn("bluetoothd --compat", install)
+        self.assertIn("50-lghs-sdp-compat.conf", install)
 
     def test_no_static_wifi_secret_in_repository_protocol(self):
         combined = "\n".join([
