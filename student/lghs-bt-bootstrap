@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, "/usr/local/lib/lghs-bt")
+from lghs_bt_protocol import (PROTOCOL_VERSION, decrypt_payload, derive_key,
+                              new_ephemeral, proof, recv_frame, send_frame,
+                              transcript, verify_proof)
+
+CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
+SCAN_INTERVAL = float(os.environ.get("LGHS_BT_SCAN_INTERVAL", "15"))
+SCAN_SECONDS = int(os.environ.get("LGHS_BT_SCAN_SECONDS", "6"))
+ALIAS_PREFIX = "LGHS-PROVISION-"
+ENABLED = Path("/etc/lghs/bluetooth-bootstrap-enabled")
+STATE_DIR = Path("/var/lib/lghs/bootstrap")
+PROVISIONED = STATE_DIR / "wifi-provisioned.json"
+TOKEN_PATHS = (Path("/etc/lghs/secrets/fleet-api-token"), Path("/var/lib/lghs-agent/fleet-api-token"))
+CONF_PATHS = (Path("/etc/lghs/fleet-api.conf"), Path("/var/lib/lghs-agent/fleet-api.conf"))
+
+
+def run(cmd, timeout=None):
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+
+
+def device_id():
+    try:
+        for line in Path("/etc/lghs/device.conf").read_text(encoding="utf-8").splitlines():
+            if line.startswith("DEVICE_ID="):
+                return line.split("=", 1)[1].strip().upper()
+    except Exception:
+        pass
+    return socket.gethostname().upper()
+
+
+def fleet_token():
+    for path in TOKEN_PATHS:
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                return value.encode("utf-8")
+        except Exception:
+            pass
+    raise RuntimeError("no Fleet API token is installed")
+
+
+def configure_adapter():
+    run(["rfkill", "unblock", "bluetooth"])
+    run(["bluetoothctl", "power", "on"])
+
+
+def discover_controller():
+    try:
+        run(["bluetoothctl", "--timeout", str(SCAN_SECONDS), "scan", "on"], timeout=SCAN_SECONDS + 3)
+    except subprocess.TimeoutExpired:
+        pass
+    devices = run(["bluetoothctl", "devices"])
+    if devices.returncode != 0:
+        return None
+    for line in devices.stdout.splitlines():
+        # BlueZ emits: Device AA:BB:CC:DD:EE:FF LGHS-PROVISION-LGCSCONT
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) == 3 and parts[0] == "Device" and parts[2].startswith(ALIAS_PREFIX):
+            return parts[1], parts[2]
+    return None
+
+
+def read_conf():
+    values = {}
+    for path in CONF_PATHS:
+        try:
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                values[k.strip()] = v.strip().strip("'\"")
+            if values:
+                break
+        except Exception:
+            pass
+    return values
+
+
+def fleet_health_ok():
+    conf = read_conf()
+    base = conf.get("LGHS_FLEET_API_URL") or conf.get("FLEET_API_URL") or "https://fleet-api.scenicrouteservers.com"
+    url = base.rstrip("/") + "/health"
+    try:
+        with urllib.request.urlopen(url, timeout=12) as response:
+            body = json.loads(response.read(8192))
+            return response.status == 200 and bool(body.get("ok"))
+    except Exception:
+        return False
+
+
+def apply_wifi(wifi):
+    ssid = str(wifi.get("ssid") or "")
+    key_mgmt = str(wifi.get("key_mgmt") or "open").lower()
+    psk = str(wifi.get("psk") or "")
+    hidden = bool(wifi.get("hidden"))
+    if not ssid or len(ssid.encode("utf-8")) > 32:
+        raise ValueError("invalid SSID")
+    if key_mgmt not in ("open", "wpa-psk", "sae", "wpa-psk sae"):
+        raise ValueError("unsupported Wi-Fi security mode")
+    if key_mgmt != "open" and not psk:
+        raise ValueError("secured Wi-Fi profile has no PSK")
+
+    name = "LGHS-Bootstrap-" + "".join(c if c.isalnum() or c in "._-" else "_" for c in ssid)[:40]
+    run(["nmcli", "connection", "delete", name])
+    cmd = ["nmcli", "connection", "add", "type", "wifi", "ifname", "*", "con-name", name, "ssid", ssid]
+    p = run(cmd)
+    if p.returncode != 0:
+        raise RuntimeError("NetworkManager could not create bootstrap Wi-Fi profile")
+    if hidden:
+        run(["nmcli", "connection", "modify", name, "802-11-wireless.hidden", "yes"])
+    if key_mgmt != "open":
+        effective = "sae" if key_mgmt == "sae" else "wpa-psk"
+        p = run(["nmcli", "connection", "modify", name,
+                 "802-11-wireless-security.key-mgmt", effective,
+                 "802-11-wireless-security.psk", psk])
+        if p.returncode != 0:
+            raise RuntimeError("NetworkManager rejected bootstrap Wi-Fi security settings")
+    run(["nmcli", "connection", "modify", name, "connection.autoconnect", "yes", "connection.permissions", ""])
+    p = run(["nmcli", "--wait", "20", "connection", "up", name])
+    if p.returncode != 0:
+        raise RuntimeError("bootstrap Wi-Fi connection failed")
+    return name
+
+
+def provision(address):
+    token = fleet_token()
+    did = device_id()
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    sock.settimeout(20)
+    try:
+        sock.connect((address, CHANNEL))
+        hello = recv_frame(sock)
+        if hello.get("v") != PROTOCOL_VERSION or hello.get("type") != "controller_hello":
+            raise ValueError("invalid controller hello")
+        cid = str(hello.get("controller_id") or "").upper()
+        server_nonce = str(hello.get("server_nonce") or "")
+        server_pub = str(hello.get("server_pub") or "")
+        private, client_pub = new_ephemeral()
+        client_nonce = os.urandom(24).hex()
+        tx = transcript(cid, did, server_nonce, client_nonce, server_pub, client_pub)
+        send_frame(sock, {
+            "v": PROTOCOL_VERSION,
+            "type": "student_hello",
+            "device_id": did,
+            "client_nonce": client_nonce,
+            "client_pub": client_pub,
+            "proof": proof(token, "student", tx),
+        })
+        response = recv_frame(sock)
+        if response.get("v") != PROTOCOL_VERSION or response.get("type") != "provision":
+            raise PermissionError("controller rejected bootstrap request")
+        if not verify_proof(token, "controller", tx, str(response.get("controller_proof") or "")):
+            raise PermissionError("controller authentication failed")
+        key = derive_key(private, server_pub, token, tx)
+        payload = decrypt_payload(key, tx, response)
+        if payload.get("type") != "wifi_profile" or not isinstance(payload.get("wifi"), dict):
+            raise ValueError("invalid Wi-Fi provisioning payload")
+        connection = apply_wifi(payload["wifi"])
+        ok = fleet_health_ok()
+        send_frame(sock, {"v": PROTOCOL_VERSION, "type": "result", "status": "fleet-online" if ok else "wifi-online"})
+        if not ok:
+            raise RuntimeError("Wi-Fi joined but Fleet API health check failed")
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(STATE_DIR, 0o700)
+        marker = {
+            "device_id": did,
+            "controller_id": cid,
+            "connection": connection,
+            "provisioned_at": time.time(),
+            "protocol": PROTOCOL_VERSION,
+        }
+        tmp = PROVISIONED.with_suffix(".tmp")
+        tmp.write_text(json.dumps(marker, separators=(",", ":")) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, PROVISIONED)
+        return True
+    finally:
+        sock.close()
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("Run as root")
+    if not ENABLED.exists():
+        print("LGHS Bluetooth bootstrap is not enabled on this device.")
+        return 0
+    if PROVISIONED.exists():
+        print("LGHS Bluetooth bootstrap already completed.")
+        return 0
+    if not hasattr(socket, "AF_BLUETOOTH"):
+        raise SystemExit("Python lacks AF_BLUETOOTH support")
+    configure_adapter()
+    print(f"LGHS Bluetooth bootstrap scanning every {SCAN_INTERVAL:g} seconds", flush=True)
+    while not PROVISIONED.exists():
+        found = discover_controller()
+        if found:
+            address, name = found
+            try:
+                print(f"Found {name}; attempting authenticated provisioning", flush=True)
+                if provision(address):
+                    print("LGHS Bluetooth Wi-Fi bootstrap completed.", flush=True)
+                    return 0
+            except Exception as exc:
+                print(f"Bluetooth bootstrap attempt failed: {exc}", file=sys.stderr, flush=True)
+        time.sleep(SCAN_INTERVAL)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
