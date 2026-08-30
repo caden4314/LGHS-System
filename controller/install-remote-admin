@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { echo "Run with sudo" >&2; exit 1; }
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REMOTE_USER=lghs_remote
+
+[[ -f /etc/lghs/role ]] || { echo "LGHS is not installed on this machine" >&2; exit 1; }
+[[ "$(cat /etc/lghs/role)" == "controller" ]] || { echo "Remote admin is installed only on the LGHS controller" >&2; exit 1; }
+
+if ! id "$REMOTE_USER" >/dev/null 2>&1; then
+    useradd --create-home --shell /bin/bash "$REMOTE_USER"
+fi
+passwd -l "$REMOTE_USER" >/dev/null 2>&1 || true
+install -d -m 0700 -o "$REMOTE_USER" -g "$REMOTE_USER" "/home/$REMOTE_USER/.ssh"
+install -d -m 0700 /etc/lghs/remote-admins
+
+install -m 0755 "$ROOT_DIR/controller/lghs-remote-shell" /usr/local/sbin/lghs-remote-shell
+install -m 0755 "$ROOT_DIR/controller/lghs-remote-admin" /usr/local/sbin/lghs-remote-admin
+install -m 0440 "$ROOT_DIR/policies/sudoers/98-lghs-remote" /etc/sudoers.d/98-lghs-remote
+visudo -cf /etc/sudoers.d/98-lghs-remote >/dev/null
+
+install -d -m 0755 /etc/ssh/sshd_config.d
+cat >/etc/ssh/sshd_config.d/91-lghs-remote-admin.conf <<'EOF'
+Match User lghs_remote
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PubkeyAuthentication yes
+    AuthenticationMethods publickey
+    X11Forwarding no
+    AllowAgentForwarding no
+    AllowTcpForwarding no
+    PermitTunnel no
+    GatewayPorts no
+    PermitUserRC no
+EOF
+chmod 0644 /etc/ssh/sshd_config.d/91-lghs-remote-admin.conf
+
+# Rebuild authorized_keys from enrolled per-workstation public keys. The helper
+# adds a forced command and forwarding restrictions to every identity.
+/usr/local/sbin/lghs-remote-admin list >/dev/null
+
+sshd -t
+systemctl try-restart ssh.service >/dev/null 2>&1 || true
+
+echo "LGHS remote administration installed."
+echo "Controller host-key fingerprint:"
+/usr/local/sbin/lghs-remote-admin fingerprint
+cat <<'EOF'
+
+Next:
+  1. Run tools/windows-remote-admin/Install-LGHS-Remote.ps1 on the Windows PC.
+  2. Copy the PUBLIC KEY it prints.
+  3. On this controller run: sudo lghs-remote-admin enroll main-pc
+     Paste the public key, then press Ctrl+D.
+  4. From Windows run: lghs
+EOF
