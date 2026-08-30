@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, "/usr/local/lib/lghs-bt")
+from lghs_bt_protocol import (PROTOCOL_VERSION, decrypt_payload, derive_key,
+                              encrypt_payload, new_ephemeral, proof, recv_frame,
+                              send_frame, transcript, verify_proof)
+
+CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
+TOKENS = Path(os.environ.get("LGHS_FLEET_API_TOKENS", "/etc/lghs/fleet-api-tokens.json"))
+ROLE = Path("/etc/lghs/role")
+ALIAS_PREFIX = "LGHS-PROVISION-"
+SOCKET_TIMEOUT = 20
+
+
+def run(cmd):
+    return subprocess.run(cmd, text=True, capture_output=True)
+
+
+def controller_id():
+    return socket.gethostname().upper()
+
+
+def token_for(device_id):
+    try:
+        data = json.loads(TOKENS.read_text(encoding="utf-8"))
+    except Exception:
+        return b""
+    if isinstance(data, dict) and "devices" in data:
+        data = data["devices"]
+    value = data.get(device_id) if isinstance(data, dict) else None
+    if isinstance(value, dict):
+        value = value.get("token")
+    return str(value or "").encode("utf-8")
+
+
+def active_wifi_profile():
+    p = run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+    if p.returncode != 0:
+        raise RuntimeError("NetworkManager active-connection query failed")
+    connection = None
+    for line in p.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3 and parts[1] in ("wifi", "802-11-wireless") and parts[2]:
+            connection = parts[0].replace("\\:", ":")
+            break
+    if not connection:
+        raise RuntimeError("controller has no active Wi-Fi connection")
+
+    def field(name, secrets=False):
+        cmd = ["nmcli"]
+        if secrets:
+            cmd.append("--show-secrets")
+        cmd += ["-g", name, "connection", "show", connection]
+        out = run(cmd)
+        return out.stdout.strip() if out.returncode == 0 else ""
+
+    ssid = field("802-11-wireless.ssid")
+    key_mgmt = field("802-11-wireless-security.key-mgmt")
+    psk = field("802-11-wireless-security.psk", secrets=True)
+    hidden = field("802-11-wireless.hidden").lower() in ("yes", "true", "1")
+    if not ssid:
+        raise RuntimeError("active Wi-Fi profile has no SSID")
+    if key_mgmt and key_mgmt not in ("wpa-psk", "sae", "wpa-psk sae"):
+        raise RuntimeError("Bluetooth bootstrap currently supports open/WPA-PSK/SAE Wi-Fi only")
+    if key_mgmt and not psk:
+        raise RuntimeError("active Wi-Fi profile requires a secret that NetworkManager did not expose")
+    return {
+        "ssid": ssid,
+        "key_mgmt": key_mgmt or "open",
+        "psk": psk,
+        "hidden": hidden,
+        "autoconnect": True,
+    }
+
+
+def configure_adapter():
+    run(["rfkill", "unblock", "bluetooth"])
+    run(["bluetoothctl", "power", "on"])
+    run(["bluetoothctl", "system-alias", ALIAS_PREFIX + controller_id()])
+    run(["bluetoothctl", "discoverable-timeout", "0"])
+    run(["bluetoothctl", "discoverable", "on"])
+
+
+def handle_client(conn, address):
+    conn.settimeout(SOCKET_TIMEOUT)
+    server_private, server_pub = new_ephemeral()
+    server_nonce = os.urandom(24).hex()
+    cid = controller_id()
+    send_frame(conn, {
+        "v": PROTOCOL_VERSION,
+        "type": "controller_hello",
+        "controller_id": cid,
+        "server_nonce": server_nonce,
+        "server_pub": server_pub,
+    })
+
+    hello = recv_frame(conn)
+    if hello.get("v") != PROTOCOL_VERSION or hello.get("type") != "student_hello":
+        raise ValueError("invalid student hello")
+    device_id = str(hello.get("device_id") or "").upper()
+    client_nonce = str(hello.get("client_nonce") or "")
+    client_pub = str(hello.get("client_pub") or "")
+    supplied = str(hello.get("proof") or "")
+    if not device_id or len(device_id) > 64:
+        raise ValueError("invalid device id")
+
+    token = token_for(device_id)
+    if not token:
+        raise PermissionError("device is not enrolled in the Fleet API token registry")
+    tx = transcript(cid, device_id, server_nonce, client_nonce, server_pub, client_pub)
+    if not verify_proof(token, "student", tx, supplied):
+        raise PermissionError("student authentication failed")
+
+    key = derive_key(server_private, client_pub, token, tx)
+    wifi = active_wifi_profile()
+    encrypted = encrypt_payload(key, tx, {"type": "wifi_profile", "wifi": wifi, "issued_at": time.time()})
+    send_frame(conn, {
+        "v": PROTOCOL_VERSION,
+        "type": "provision",
+        "controller_proof": proof(token, "controller", tx),
+        **encrypted,
+    })
+    result = recv_frame(conn)
+    if result.get("type") == "result":
+        status = str(result.get("status") or "unknown")
+        print(f"Bluetooth bootstrap {device_id} from {address[0]}: {status}", flush=True)
+
+
+def client_thread(conn, address):
+    try:
+        handle_client(conn, address)
+    except Exception as exc:
+        print(f"Bluetooth bootstrap rejected {address[0]}: {exc}", file=sys.stderr, flush=True)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("Run as root")
+    if ROLE.read_text(encoding="utf-8").strip() != "controller":
+        raise SystemExit("Bluetooth provisioning server is controller-only")
+    configure_adapter()
+    if not hasattr(socket, "AF_BLUETOOTH"):
+        raise SystemExit("Python lacks AF_BLUETOOTH support")
+    server = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((socket.BDADDR_ANY, CHANNEL))
+    server.listen(5)
+    print(f"LGHS Bluetooth provisioning listening on RFCOMM channel {CHANNEL}", flush=True)
+    while True:
+        conn, address = server.accept()
+        threading.Thread(target=client_thread, args=(conn, address), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()
