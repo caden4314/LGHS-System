@@ -42,15 +42,17 @@ jobs:
             tests/test_command_plane.py \
             tests/test_fleet_database.py \
             tests/test_audit_ingest.py \
-            tests/test_sudo_state.py
+            tests/test_sudo_state.py \
+            tests/test_fleet_api_integration.py
 
-      - name: Runtime-independent unit tests
+      - name: Runtime-independent unit and integration tests
         run: |
           python3 -m unittest -v \
             tests/test_command_plane.py \
             tests/test_fleet_database.py \
             tests/test_audit_ingest.py \
-            tests/test_sudo_state.py
+            tests/test_sudo_state.py \
+            tests/test_fleet_api_integration.py
 
       - name: Shell syntax
         run: |
