@@ -11,6 +11,7 @@ if [[ "$ROLE" != "controller" && "$ROLE" != "student" ]]; then echo "Usage: sudo
 getent group "$ADMIN_GROUP" >/dev/null 2>&1 || groupadd --system "$ADMIN_GROUP"
 install -d -o root -g "$ADMIN_GROUP" -m 0750 /opt/lghs /etc/lghs /var/lib/lghs /var/lib/lghs/update
 install -d -m 0700 /etc/lghs/secrets /var/lib/lghs/netqueue /var/lib/lghs/netqueue/jobs
+install -d -m 0755 /usr/local/lib/lghs-bt
 printf '%s\n' "$ROLE" > /etc/lghs/role
 printf '%s\n' "$(cat "$ROOT_DIR/VERSION")" > /etc/lghs/version
 
@@ -32,6 +33,7 @@ install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/updater/lghs-install-succes
 install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-report" /usr/local/sbin/lghs-report
 install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
 install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
+install -m 0644 "$ROOT_DIR/bluetooth/lghs_bt_protocol.py" /usr/local/lib/lghs-bt/lghs_bt_protocol.py
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
 install -m 0644 "$ROOT_DIR/systemd/lghs-firstboot-provision.service" /etc/systemd/system/lghs-firstboot-provision.service
@@ -48,7 +50,7 @@ touch /var/log/lghs-netqueue.log
 chown root:adm /var/log/lghs-netqueue.log 2>/dev/null || true
 chmod 0640 /var/log/lghs-netqueue.log
 
-COMMON_PKGS=(git curl python3 openssh-client sudo logrotate libnotify-bin)
+COMMON_PKGS=(git curl python3 openssh-client sudo logrotate libnotify-bin bluez rfkill python3-cryptography network-manager)
 if ! command -v flock >/dev/null 2>&1; then COMMON_PKGS+=(util-linux); fi
 MISSING_PKGS=()
 for pkg in "${COMMON_PKGS[@]}"; do dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg"); done
@@ -86,6 +88,8 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-api-cloudflare" /usr/local/sbin/lghs-fleet-api-cloudflare
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-api-provision" /usr/local/sbin/lghs-fleet-api-provision
   install -m 0644 "$ROOT_DIR/systemd/lghs-fleet-api.service" /etc/systemd/system/lghs-fleet-api.service
+  install -m 0750 "$ROOT_DIR/controller/lghs-bt-provision" /usr/local/sbin/lghs-bt-provision
+  install -m 0644 "$ROOT_DIR/systemd/lghs-bt-provision.service" /etc/systemd/system/lghs-bt-provision.service
 
   if [[ ! -f /etc/lghs/fleet.json ]]; then
     printf '%s\n' '{"version":1,"devices":{}}' > /etc/lghs/fleet.json
@@ -123,17 +127,17 @@ EOF
   /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
   chmod 0640 /var/lib/lghs/db-migration-last.json
 else
-  # Create the unprivileged agent identity before systemd sees its unit. This
-  # makes fresh installs and updates use the same privilege boundary.
   getent group lghs-agent >/dev/null 2>&1 || groupadd --system lghs-agent
   if ! id lghs-agent >/dev/null 2>&1; then useradd --system --gid lghs-agent --home-dir /var/lib/lghs-agent --shell /usr/sbin/nologin lghs-agent; fi
   install -d -o lghs-agent -g lghs-agent -m 0700 /var/lib/lghs-agent
+  install -d -o root -g root -m 0700 /var/lib/lghs/bootstrap
 
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-enforce" /usr/local/sbin/lghs-enforce
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
   install -o root -g root -m 0755 "$ROOT_DIR/student/lghs-agent" /usr/local/sbin/lghs-agent
   install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
   install -o root -g root -m 0755 "$ROOT_DIR/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
+  install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-network-ui-apply" /usr/local/sbin/lghs-network-ui-apply
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-install-network-ui" /usr/local/sbin/lghs-install-network-ui
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-broker" /usr/local/sbin/lghs-sudo-broker
@@ -143,12 +147,12 @@ else
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-cloudflare-install" /usr/local/sbin/lghs-cloudflare-install
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-telemetry-configure" /usr/local/sbin/lghs-telemetry-configure
-  # Legacy telemetry remains installed but disabled for rollback compatibility.
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-telemetry-push" /usr/local/sbin/lghs-telemetry-push
   install -m 0644 "$ROOT_DIR/systemd/lghs-telemetry-push.service" /etc/systemd/system/lghs-telemetry-push.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-command-executor.service" /etc/systemd/system/lghs-command-executor.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-discovery-advertise.service" /etc/systemd/system/lghs-discovery-advertise.service
+  install -m 0644 "$ROOT_DIR/systemd/lghs-bt-bootstrap.service" /etc/systemd/system/lghs-bt-bootstrap.service
   install -m 0755 "$ROOT_DIR/student/sudo" /usr/local/bin/sudo
   install -d -m 0700 /var/lib/lghs/sudo-requests
   touch /var/log/lghs-sudo-audit.jsonl /var/log/sudo.log /var/log/lghs-update.log /var/log/lghs-os-update.log
@@ -186,6 +190,10 @@ EOF
   printf '%s\n' "$(cat "$ROOT_DIR/VERSION")" > /var/lib/lghs-agent/version
   chown lghs-agent:lghs-agent /var/lib/lghs-agent/version; chmod 0400 /var/lib/lghs-agent/version
 
+  if [[ "${LGHS_IMAGE_BUILD:-0}" == "1" ]]; then
+    install -m 0600 /dev/null /etc/lghs/bluetooth-bootstrap-enabled
+  fi
+
   if [[ ! -f /usr/local/lib/lghs/libnetman.so.hardened ]]; then /usr/local/sbin/lghs-install-network-ui; else /usr/local/sbin/lghs-network-ui-apply; fi
 fi
 
@@ -194,17 +202,22 @@ fi
 visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
 systemctl enable lghs-update.service lghs-firstboot-provision.service
-systemctl enable --now avahi-daemon.service
+systemctl enable --now avahi-daemon.service bluetooth.service
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
   systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
   systemctl enable --now lghs-policy.service lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service ssh.service
+  systemctl enable lghs-bt-bootstrap.service
+  if [[ -f /etc/lghs/bluetooth-bootstrap-enabled && ! -f /var/lib/lghs/bootstrap/wifi-provisioned.json ]]; then
+    systemctl start lghs-bt-bootstrap.service || true
+  fi
   systemctl restart lghs-policy.service lghs-command-executor.service lghs-agent.service
   systemctl try-restart ssh.service >/dev/null 2>&1 || true
 else
-  systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service lghs-fleet-api.service
+  systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service lghs-fleet-api.service lghs-bt-provision.service
   systemctl try-restart lghs-fleet-notify.service
   systemctl try-restart lghs-fleet-api.service
+  systemctl try-restart lghs-bt-provision.service
 fi
 systemctl enable lghs-install-success-notify.service
 systemctl start --no-block lghs-install-success-notify.service >/dev/null 2>&1 || true
