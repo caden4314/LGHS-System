@@ -5,7 +5,7 @@ from pathlib import Path
 
 STATE_ROOT=Path('/var/lib/lghs-agent');CONF=STATE_ROOT/'fleet-api.conf';TOKEN=STATE_ROOT/'fleet-api-token';STATE=STATE_ROOT/'state.json';VERSION=STATE_ROOT/'version';BOOT=Path('/proc/sys/kernel/random/boot_id');EXECUTOR='/run/lghs-command-executor/socket'
 REPORT_INTERVAL=float(os.environ.get('LGHS_AGENT_REPORT_SECONDS','5'));LONG_POLL=float(os.environ.get('LGHS_AGENT_LONG_POLL_SECONDS','25'));TIMEOUT=35
-LOCK=threading.RLock();STOP=threading.Event();ACTIVE={'checking','queued','downloading','preparing','installing','validating','cleaning','finishing','rolling_back','busy','rebooting'}
+LOCK=threading.RLock();STOP=threading.Event();WAKE=threading.Event();ACTIVE={'checking','queued','downloading','preparing','installing','validating','cleaning','finishing','rolling_back','busy','rebooting'}
 
 def load_json(path,default):
     try:return json.loads(path.read_text(encoding='utf-8'))
@@ -62,10 +62,7 @@ def wifi_signal():
     except Exception:pass
     return {}
 
-def clock_synced():
-    p=Path('/run/systemd/timesync/synchronized')
-    return p.exists()
-
+def clock_synced():return Path('/run/systemd/timesync/synchronized').exists()
 def metrics():
     mem={}
     for line in Path('/proc/meminfo').read_text().splitlines():
@@ -79,9 +76,8 @@ def metrics():
 def executor_status():
     try:return rpc({'op':'status'})
     except Exception:return {'ok':False,'updates':{},'health':{}}
-
 def update_progress(rows,status_blob):
-    now=time.time();statuses=status_blob.get('updates',{}) if isinstance(status_blob,dict) else {}
+    now=time.time();statuses=status_blob.get('updates',{}) if isinstance(status_blob,dict) else {};changed=False
     for row in rows:
         status=statuses.get(row.get('action'),{});started=float(status.get('started_at') or 0);accepted=float(row.get('accepted_at') or 0)
         if not started or started+1<accepted:continue
@@ -90,20 +86,20 @@ def update_progress(rows,status_blob):
         elif u=='failed':st='failed'
         elif u in {'complete','reboot_required'}:st='succeeded'
         else:continue
+        before=(row.get('state'),row.get('stage'),row.get('progress'),row.get('message'))
         row['state']=st;row.setdefault(st+'_at',float(status.get('updated_at') or now));row['updated_at']=float(status.get('updated_at') or now);row['stage']=status.get('stage','');row['message']=status.get('message','');row['progress']=status.get('progress');row['update_state']=u
+        changed|=before!=(row.get('state'),row.get('stage'),row.get('progress'),row.get('message'))
+    if changed:WAKE.set()
     return rows
 
 def command_states(status_blob):
     with LOCK:STATE_DATA['commands']=update_progress(STATE_DATA.get('commands',[]),status_blob)[-64:];save();return [dict(x) for x in STATE_DATA['commands'][-32:]]
-
 def envelope():
     status=executor_status();health=dict(status.get('health') or {});health['clock_synchronized']=clock_synced();payload={'metrics':metrics(),'health':health,'command_states':command_states(status),'version':version(),'uptime_seconds':time.clock_gettime(time.CLOCK_BOOTTIME)}
     return {'protocol':1,'agent_version':version(),'device_id':device(),'boot_id':boot_id(),'sequence':next_sequence(),'sent_at':time.time(),'payload':payload}
-
 def request(url,method='GET',body=None):
     data=None if body is None else json.dumps(body,separators=(',',':')).encode();req=urllib.request.Request(url,data=data,method=method,headers={'Authorization':'Bearer '+token(),'Content-Type':'application/json','User-Agent':'LGHS-Agent/0.5'})
     with urllib.request.urlopen(req,timeout=TIMEOUT) as r:return json.loads(r.read().decode() or '{}')
-
 def accept(commands):
     if not isinstance(commands,list):return
     with LOCK:by={str(x.get('id')):x for x in STATE_DATA.get('commands',[])}
@@ -114,15 +110,14 @@ def accept(commands):
             row=by.get(cid)
             if row and row.get('state')!='received':continue
             if row is None:
-                row={'id':cid,'action':cmd['action'],'state':'received','received_at':time.time(),'updated_at':time.time(),'stage':'Received','message':'Command received over HTTPS','progress':0};STATE_DATA['commands'].append(row);by[cid]=row;save()
+                row={'id':cid,'action':cmd['action'],'state':'received','received_at':time.time(),'updated_at':time.time(),'stage':'Received','message':'Command received over HTTPS','progress':0};STATE_DATA['commands'].append(row);by[cid]=row;save();WAKE.set()
         try:result=rpc({'id':cid,'action':cmd['action'],'payload':cmd.get('payload') or {}})
         except Exception as exc:result={'ok':False,'error':str(exc)}
         with LOCK:
             if result.get('ok'):
                 row['state']='accepted';row['accepted_at']=float(result.get('accepted_at') or time.time());row['updated_at']=row['accepted_at'];row['stage']='Accepted by executor';row['message']=result.get('message','Queued locally')
             else:row['stage']='Local acceptance retry pending';row['message']=str(result.get('error','executor unavailable'))[-500:];row['updated_at']=time.time()
-            save()
-
+            save();WAKE.set()
 def reporter():
     delay=1
     while not STOP.is_set():
@@ -130,20 +125,17 @@ def reporter():
         try:
             base=parse_conf().get('URL','').rstrip('/');result=request(f'{base}/v1/report/{device()}','POST',envelope());accept(result.get('commands',[]));delay=REPORT_INTERVAL
         except Exception:delay=min(max(REPORT_INTERVAL,delay*1.7),60)
-        STOP.wait(max(.25,delay-(time.monotonic()-started)))
-
+        remaining=max(.25,delay-(time.monotonic()-started));WAKE.wait(remaining);WAKE.clear()
 def longpoll():
     while not STOP.is_set():
         try:
             base=parse_conf().get('URL','').rstrip('/');result=request(f'{base}/v1/commands/{device()}?wait={min(LONG_POLL,30)}');accept(result.get('commands',[]))
         except Exception:STOP.wait(2)
-
 def main():
     if os.geteuid()==0:raise SystemExit('lghs-agent must run unprivileged')
     if not TOKEN.exists() or not CONF.exists():raise SystemExit('agent endpoint/token not provisioned')
-    threads=[threading.Thread(target=reporter,daemon=True),threading.Thread(target=longpoll,daemon=True)]
-    [t.start() for t in threads]
+    threads=[threading.Thread(target=reporter,daemon=True),threading.Thread(target=longpoll,daemon=True)];[t.start() for t in threads]
     try:
         while True:time.sleep(60)
-    except KeyboardInterrupt:STOP.set()
+    except KeyboardInterrupt:STOP.set();WAKE.set()
 if __name__=='__main__':main()
