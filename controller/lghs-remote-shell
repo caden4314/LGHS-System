@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+import os
+import shlex
+import subprocess
+import sys
+
+SUDO = ["sudo", "-n"]
+
+
+def run(args, replace=False):
+    cmd = SUDO + args
+    if replace:
+        os.execvp(cmd[0], cmd)
+    return subprocess.call(cmd)
+
+
+def usage():
+    print("""LGHS remote management commands:
+  console                     Open Fleet Control
+  status                      Show fleet status
+  update-controller           Update the Control Pi from its configured channel
+  update DEVICE               Queue an LGHS update over HTTPS
+  os-update DEVICE            Queue a Raspberry Pi OS update over HTTPS
+  check DEVICE                Run the LGHS health check over explicit admin SSH
+  enforce DEVICE              Re-apply LGHS policy over explicit admin SSH
+  reboot DEVICE               Reboot one Student Pi over explicit admin SSH
+  logs DEVICE [GROUP]         Show remote logs (all/update/agent/policy)
+  ssh DEVICE                  Open explicit interactive recovery SSH to one Pi
+  help                        Show this help
+
+With no command, Fleet Control opens automatically.
+""")
+
+
+def valid_device(value):
+    return bool(value) and len(value) <= 64 and all(ch.isalnum() or ch in "-_" for ch in value)
+
+
+def main():
+    original = os.environ.get("SSH_ORIGINAL_COMMAND", "").strip()
+    if not original:
+        return run(["/usr/local/sbin/lghs-console"], replace=True)
+    try:
+        argv = shlex.split(original)
+    except ValueError:
+        print("Invalid LGHS remote command", file=sys.stderr)
+        return 2
+    if not argv:
+        return run(["/usr/local/sbin/lghs-console"], replace=True)
+
+    action = argv[0].lower()
+    if action in ("help", "-h", "--help") and len(argv) == 1:
+        usage()
+        return 0
+    if action == "console" and len(argv) == 1:
+        return run(["/usr/local/sbin/lghs-console"], replace=True)
+    if action == "status" and len(argv) == 1:
+        return run(["/usr/local/sbin/lghsctl", "status"])
+    if action == "update-controller" and len(argv) == 1:
+        return run(["/usr/local/sbin/lghs-update"])
+
+    if action in ("update", "os-update") and len(argv) == 2 and valid_device(argv[1]):
+        command = "lghs-update" if action == "update" else "os-update"
+        return run(["/usr/local/sbin/lghs-fleet-command", "enqueue", argv[1].upper(), command])
+
+    if action in ("check", "enforce", "reboot", "ssh") and len(argv) == 2 and valid_device(argv[1]):
+        return run(["/usr/local/sbin/lghsctl", action, argv[1].upper()], replace=(action == "ssh"))
+
+    if action == "logs" and len(argv) in (2, 3) and valid_device(argv[1]):
+        group = argv[2] if len(argv) == 3 else "all"
+        if group not in {"all", "update", "agent", "policy"}:
+            print("Invalid log group", file=sys.stderr)
+            return 2
+        return run(["/usr/local/sbin/lghsctl", "logs", argv[1].upper(), group])
+
+    print("Command is not permitted by the LGHS remote management shell.", file=sys.stderr)
+    usage()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
