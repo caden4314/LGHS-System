@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -22,6 +23,7 @@ STATE_DIR = Path("/var/lib/lghs/bootstrap")
 PROVISIONED = STATE_DIR / "wifi-provisioned.json"
 TOKEN_PATHS = (Path("/etc/lghs/secrets/fleet-api-token"), Path("/var/lib/lghs-agent/fleet-api-token"))
 CONF_PATHS = (Path("/etc/lghs/fleet-api.conf"), Path("/var/lib/lghs-agent/fleet-api.conf"))
+MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\b")
 
 
 def run(cmd, timeout=None):
@@ -55,18 +57,39 @@ def configure_adapter():
 
 
 def discover_controller():
+    # BlueZ's bluetoothctl discovery/cache path is not reliable for classic
+    # BR/EDR inquiry on all Raspberry Pi/BlueZ combinations. Use the kernel
+    # management interface directly; the controller's RFCOMM service is
+    # classic Bluetooth and advertises its LGHS alias in the inquiry name.
     try:
-        run(["bluetoothctl", "--timeout", str(SCAN_SECONDS), "scan", "on"], timeout=SCAN_SECONDS + 3)
-    except subprocess.TimeoutExpired:
-        pass
-    devices = run(["bluetoothctl", "devices"])
-    if devices.returncode != 0:
+        inquiry = run(
+            ["timeout", str(SCAN_SECONDS), "btmgmt", "find", "-b"],
+            timeout=SCAN_SECONDS + 3,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
-    for line in devices.stdout.splitlines():
-        # BlueZ emits: Device AA:BB:CC:DD:EE:FF LGHS-PROVISION-LGCSCONT
-        parts = line.strip().split(maxsplit=2)
-        if len(parts) == 3 and parts[0] == "Device" and parts[2].startswith(ALIAS_PREFIX):
-            return parts[1], parts[2]
+
+    current_mac = None
+    for raw in inquiry.stdout.splitlines():
+        line = raw.strip()
+        if "dev_found:" in line:
+            match = MAC_RE.search(line)
+            current_mac = match.group(1).upper() if match else None
+            continue
+        if current_mac and line.startswith("name "):
+            name = line[5:].strip()
+            if name.startswith(ALIAS_PREFIX):
+                return current_mac, name
+            current_mac = None
+
+    # Some BlueZ versions may still populate bluetoothctl's cache during the
+    # management inquiry, so keep this as a compatibility fallback only.
+    devices = run(["bluetoothctl", "devices"])
+    if devices.returncode == 0:
+        for line in devices.stdout.splitlines():
+            parts = line.strip().split(maxsplit=2)
+            if len(parts) == 3 and parts[0] == "Device" and parts[2].startswith(ALIAS_PREFIX):
+                return parts[1].upper(), parts[2]
     return None
 
 
