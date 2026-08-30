@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Tiny root executor for typed LGHS 0.5 agent commands."""
+import grp,json,os,socket,subprocess,time
+from pathlib import Path
+SOCK=Path('/run/lghs-command-executor/socket'); NETQUEUE='/usr/local/sbin/lghs-netqueue'; SEEN=Path('/var/lib/lghs/executor-seen.json')
+ACTIONS={'lghs-update':[NETQUEUE,'enqueue','local-update'],'os-update':[NETQUEUE,'enqueue','os-update']}
+STATUS={'lghs-update':Path('/var/lib/lghs/update/lghs-status.json'),'os-update':Path('/var/lib/lghs/update/os-status.json')}
+def load_json(p,d):
+    try:return json.loads(p.read_text(encoding='utf-8'))
+    except Exception:return d
+def save_seen(x):
+    SEEN.parent.mkdir(parents=True,exist_ok=True); t=SEEN.with_suffix('.tmp'); t.write_text(json.dumps(x,separators=(',',':'))+'\n',encoding='utf-8'); os.chmod(t,0o600); os.replace(t,SEEN)
+def reply(c,obj):c.sendall((json.dumps(obj,separators=(',',':'))+'\n').encode())
+def handle(c):
+    data=b''
+    while b'\n' not in data and len(data)<65536:
+        chunk=c.recv(4096)
+        if not chunk:break
+        data+=chunk
+    try:req=json.loads(data.split(b'\n',1)[0])
+    except Exception:reply(c,{'ok':False,'error':'invalid-json'});return
+    if req.get('op')=='status': reply(c,{'ok':True,'updates':{k:load_json(v,{}) for k,v in STATUS.items()},'reboot_required':Path('/run/reboot-required').exists()}); return
+    cid=str(req.get('id') or ''); action=str(req.get('action') or '')
+    if not cid or len(cid)>128:reply(c,{'ok':False,'error':'invalid-command-id'});return
+    if action not in ACTIONS:reply(c,{'ok':False,'error':'unsupported-action'});return
+    seen=load_json(SEEN,{})
+    if cid in seen:reply(c,{'ok':True,'message':'Command already accepted locally','accepted_at':seen[cid]});return
+    try:p=subprocess.run(ACTIONS[action],text=True,capture_output=True,timeout=20)
+    except Exception as exc:reply(c,{'ok':False,'error':str(exc)});return
+    if p.returncode!=0:reply(c,{'ok':False,'error':(p.stderr or p.stdout or 'queue failed').strip()[-500:]});return
+    accepted=time.time();seen[cid]=accepted
+    if len(seen)>512:
+        for k,_ in sorted(seen.items(),key=lambda kv:kv[1])[:-256]:seen.pop(k,None)
+    save_seen(seen);reply(c,{'ok':True,'message':'Queued locally','accepted_at':accepted})
+def main():
+    if os.geteuid()!=0:raise SystemExit('executor must run as root')
+    SOCK.parent.mkdir(parents=True,exist_ok=True)
+    try:SOCK.unlink()
+    except FileNotFoundError:pass
+    s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.bind(str(SOCK));os.chown(SOCK,0,grp.getgrnam('lghs-agent').gr_gid);os.chmod(SOCK,0o660);s.listen(16)
+    while True:
+        c,_=s.accept()
+        try:handle(c)
+        finally:c.close()
+if __name__=='__main__':main()

@@ -1,23 +1,137 @@
-#!/usr/bin/env bash
-set -euo pipefail
-[[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
-install -d -m 0755 /etc/avahi/services /etc/lghs
-DEVICE_ID="$(sed -n 's/^DEVICE_ID=//p' /etc/lghs/device.conf 2>/dev/null | head -n1)"
-[[ -n "$DEVICE_ID" ]] || DEVICE_ID="$(hostname)"
-VERSION="$(cat /etc/lghs/version 2>/dev/null || echo unknown)"
-cat >/etc/avahi/services/lghs.service <<EOF
-<?xml version="1.0" standalone='no'?>
-<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-<service-group>
-  <name replace-wildcards="yes">LGHS ${DEVICE_ID}</name>
-  <service>
-    <type>_lghs._tcp</type>
-    <port>22</port>
-    <txt-record>role=student</txt-record>
-    <txt-record>device_id=${DEVICE_ID}</txt-record>
-    <txt-record>version=${VERSION}</txt-record>
-  </service>
-</service-group>
-EOF
-systemctl try-restart avahi-daemon.service >/dev/null 2>&1 || true
-logger -t LGHS-AGENT "Advertised ${DEVICE_ID}, version ${VERSION}"
+#!/usr/bin/env python3
+"""LGHS 0.5 unprivileged managed-device agent."""
+import json,os,socket,threading,time,urllib.request
+from pathlib import Path
+
+CONF=Path('/etc/lghs/fleet-api.conf'); TOKEN=Path('/var/lib/lghs-agent/fleet-api-token'); STATE=Path('/var/lib/lghs-agent/state.json'); BOOT=Path('/proc/sys/kernel/random/boot_id'); VERSION=Path('/etc/lghs/version'); EXECUTOR='/run/lghs-command-executor/socket'
+REPORT_INTERVAL=float(os.environ.get('LGHS_AGENT_REPORT_SECONDS','5')); LONG_POLL=float(os.environ.get('LGHS_AGENT_LONG_POLL_SECONDS','25')); TIMEOUT=35
+LOCK=threading.RLock(); STOP=threading.Event(); ACTIVE={'checking','queued','downloading','preparing','installing','validating','cleaning','finishing','rolling_back','busy','rebooting'}
+
+def load_json(path,default):
+    try:return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:return default
+
+def atomic(path,value):
+    path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_suffix('.tmp'); tmp.write_text(json.dumps(value,separators=(',',':'))+'\n',encoding='utf-8'); os.chmod(tmp,0o600); os.replace(tmp,path)
+
+def parse_conf():
+    out={}
+    try:
+        for line in CONF.read_text(encoding='utf-8').splitlines():
+            if '=' in line and not line.lstrip().startswith('#'):
+                k,v=line.split('=',1); out[k.strip()]=v.strip()
+    except Exception:pass
+    return out
+
+def token():return TOKEN.read_text(encoding='utf-8').strip()
+def device():return socket.gethostname().upper()
+def boot_id():
+    try:return BOOT.read_text().strip()
+    except Exception:return 'unknown'
+def version():
+    try:return VERSION.read_text().strip()
+    except Exception:return 'unknown'
+
+def initial_state():
+    s=load_json(STATE,{})
+    if s.get('boot_id')!=boot_id():s={'boot_id':boot_id(),'sequence':0,'commands':[]}
+    s.setdefault('commands',[]);s.setdefault('sequence',0);return s
+STATE_DATA=initial_state()
+def save():atomic(STATE,STATE_DATA)
+def next_sequence():
+    with LOCK:STATE_DATA['sequence']=int(STATE_DATA.get('sequence',0))+1;save();return STATE_DATA['sequence']
+
+def rpc(obj):
+    raw=(json.dumps(obj,separators=(',',':'))+'\n').encode(); s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(10); s.connect(EXECUTOR); s.sendall(raw); data=b''
+    while b'\n' not in data:
+        chunk=s.recv(4096)
+        if not chunk:break
+        data+=chunk
+    s.close(); return json.loads(data.split(b'\n',1)[0])
+
+def cpu_sample():
+    def r():
+        nums=list(map(int,Path('/proc/stat').read_text().splitlines()[0].split()[1:])); return sum(nums),nums[3]+nums[4]
+    a=r();time.sleep(.05);b=r();dt=b[0]-a[0];return round(100*(dt-(b[1]-a[1]))/dt,1) if dt>0 else 0.0
+
+def metrics():
+    mem={}
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        if ':' in line:
+            k,v=line.split(':',1);mem[k]=int(v.strip().split()[0])*1024
+    st=os.statvfs('/');total=st.f_blocks*st.f_frsize;free=st.f_bavail*st.f_frsize
+    try:temp=round(int(Path('/sys/class/thermal/thermal_zone0/temp').read_text())/1000,1)
+    except Exception:temp=None
+    return {'cpu_pct':cpu_sample(),'mem_pct':round(100*(mem.get('MemTotal',1)-mem.get('MemAvailable',0))/max(mem.get('MemTotal',1),1),1),'disk_pct':round(100*(total-free)/max(total,1),1),'temp_c':temp,'load1':os.getloadavg()[0]}
+
+def executor_status():
+    try:return rpc({'op':'status'})
+    except Exception:return {'ok':False,'updates':{},'reboot_required':False}
+
+def update_progress(rows,status_blob):
+    now=time.time();statuses=status_blob.get('updates',{}) if isinstance(status_blob,dict) else {}
+    for row in rows:
+        status=statuses.get(row.get('action'),{}); started=float(status.get('started_at') or 0);accepted=float(row.get('accepted_at') or 0)
+        if not started or started+1<accepted:continue
+        u=str(status.get('state') or '').lower()
+        if u in ACTIVE:st='running'
+        elif u=='failed':st='failed'
+        elif u in {'complete','reboot_required'}:st='succeeded'
+        else:continue
+        row['state']=st;row.setdefault(st+'_at',float(status.get('updated_at') or now));row['updated_at']=float(status.get('updated_at') or now);row['stage']=status.get('stage','');row['message']=status.get('message','');row['progress']=status.get('progress');row['update_state']=u
+    return rows
+
+def command_states(status_blob):
+    with LOCK:STATE_DATA['commands']=update_progress(STATE_DATA.get('commands',[]),status_blob)[-64:];save();return [dict(x) for x in STATE_DATA['commands'][-32:]]
+
+def envelope():
+    status=executor_status();payload={'metrics':metrics(),'health':{'reboot_required':bool(status.get('reboot_required'))},'command_states':command_states(status),'version':version(),'uptime_seconds':time.clock_gettime(time.CLOCK_BOOTTIME)}
+    return {'protocol':1,'agent_version':version(),'device_id':device(),'boot_id':boot_id(),'sequence':next_sequence(),'sent_at':time.time(),'payload':payload}
+
+def request(url,method='GET',body=None):
+    data=None if body is None else json.dumps(body,separators=(',',':')).encode();req=urllib.request.Request(url,data=data,method=method,headers={'Authorization':'Bearer '+token(),'Content-Type':'application/json','User-Agent':'LGHS-Agent/0.5'})
+    with urllib.request.urlopen(req,timeout=TIMEOUT) as r:return json.loads(r.read().decode() or '{}')
+
+def accept(commands):
+    if not isinstance(commands,list):return
+    with LOCK:by={str(x.get('id')):x for x in STATE_DATA.get('commands',[])}
+    for cmd in commands:
+        if not isinstance(cmd,dict) or not cmd.get('id') or not cmd.get('action'):continue
+        cid=str(cmd['id'])
+        with LOCK:
+            row=by.get(cid)
+            if row and row.get('state')!='received':continue
+            if row is None:
+                row={'id':cid,'action':cmd['action'],'state':'received','received_at':time.time(),'updated_at':time.time(),'stage':'Received','message':'Command received over HTTPS','progress':0};STATE_DATA['commands'].append(row);by[cid]=row;save()
+        try:result=rpc({'id':cid,'action':cmd['action'],'payload':cmd.get('payload') or {}})
+        except Exception as exc:result={'ok':False,'error':str(exc)}
+        with LOCK:
+            if result.get('ok'):
+                row['state']='accepted';row['accepted_at']=float(result.get('accepted_at') or time.time());row['updated_at']=row['accepted_at'];row['stage']='Accepted by executor';row['message']=result.get('message','Queued locally')
+            else:row['stage']='Local acceptance retry pending';row['message']=str(result.get('error','executor unavailable'))[-500:];row['updated_at']=time.time()
+            save()
+
+def reporter():
+    delay=1
+    while not STOP.is_set():
+        started=time.monotonic()
+        try:
+            base=parse_conf().get('URL','').rstrip('/');result=request(f'{base}/v1/report/{device()}','POST',envelope());accept(result.get('commands',[]));delay=REPORT_INTERVAL
+        except Exception:delay=min(max(REPORT_INTERVAL,delay*1.7),60)
+        STOP.wait(max(.25,delay-(time.monotonic()-started)))
+
+def longpoll():
+    while not STOP.is_set():
+        try:
+            base=parse_conf().get('URL','').rstrip('/');result=request(f'{base}/v1/commands/{device()}?wait={min(LONG_POLL,30)}');accept(result.get('commands',[]))
+        except Exception:STOP.wait(2)
+
+def main():
+    if os.geteuid()==0:raise SystemExit('lghs-agent must run unprivileged')
+    if not TOKEN.exists():raise SystemExit('agent token not provisioned')
+    threads=[threading.Thread(target=reporter,daemon=True),threading.Thread(target=longpoll,daemon=True)]
+    [t.start() for t in threads]
+    try:
+        while True:time.sleep(60)
+    except KeyboardInterrupt:STOP.set()
+if __name__=='__main__':main()
