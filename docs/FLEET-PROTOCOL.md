@@ -122,3 +122,7 @@ During staged 0.4 -> 0.5 migration the controller accepts legacy telemetry and n
 - `reboot_required` -> `succeeded` with reboot detail retained separately
 
 The old telemetry service remains installed but disabled on a 0.5 student so rollback can restore the 0.4 path.
+
+## Live staging checkpoint
+
+The first staged 0.5 controller/student pair successfully reported protocol v1 telemetry into SQLite with a real boot ID and increasing sequence number. The live report also carried structured health, Raspberry Pi power/throttling state, Wi-Fi signal, and sudo-request history with no active warnings. This checkpoint intentionally documents the transport state before the first live long-poll command-latency test.
