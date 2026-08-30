@@ -15,17 +15,30 @@ from lghs_bt_protocol import (PROTOCOL_VERSION, decrypt_payload, derive_key,
                               send_frame, transcript, verify_proof)
 
 CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
+BT_INDEX = os.environ.get("LGHS_BT_INDEX", "hci0")
 TOKENS = Path(os.environ.get("LGHS_FLEET_API_TOKENS", "/etc/lghs/fleet-api-tokens.json"))
 ROLE = Path("/etc/lghs/role")
 ALIAS_PREFIX = "LGHS-PROVISION-"
 SOCKET_TIMEOUT = 20
+COMMAND_TIMEOUT = 6
 SOL_BLUETOOTH = getattr(socket, "SOL_BLUETOOTH", 274)
 BT_SECURITY = getattr(socket, "BT_SECURITY", 4)
 BT_SECURITY_LOW = 1
 
 
-def run(cmd):
-    return subprocess.run(cmd, text=True, capture_output=True)
+def run(cmd, timeout=None):
+    try:
+        return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "command timed out")
+
+
+def require_command(cmd, description, timeout=COMMAND_TIMEOUT):
+    result = run(cmd, timeout=timeout)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"{description} failed: {detail or f'rc={result.returncode}'}")
+    return result
 
 
 def set_app_authenticated_security(sock):
@@ -93,32 +106,30 @@ def active_wifi_profile():
 
 
 def configure_adapter():
-    run(["rfkill", "unblock", "bluetooth"])
-    run(["bluetoothctl", "power", "on"])
-    # Raspberry Pi / BlueZ defaults to DisplayYesNo. RFCOMM then waits for an
-    # interactive SSP confirmation even though first-boot provisioning has no
-    # operator. NoInputNoOutput selects Just Works at the link layer; LGHS
-    # still mutually authenticates and encrypts the provisioning payload.
-    run(["btmgmt", "io-cap", "3"])
-    run(["btmgmt", "pairable", "on"])
-    run(["bluetoothctl", "system-alias", ALIAS_PREFIX + controller_id()])
-    run(["bluetoothctl", "discoverable-timeout", "0"])
-    run(["bluetoothctl", "discoverable", "on"])
+    require_command(["rfkill", "unblock", "bluetooth"], "Bluetooth rfkill unblock")
+    require_command(["bluetoothctl", "power", "on"], "Bluetooth power-on")
+    # btmgmt without an explicit index can block on this Raspberry Pi / BlueZ
+    # combination. Always target hci0 (or LGHS_BT_INDEX) and bound the command.
+    require_command(["btmgmt", "-i", BT_INDEX, "io-cap", "3"], "Bluetooth IO capability setup")
+    require_command(["btmgmt", "-i", BT_INDEX, "pairable", "on"], "Bluetooth pairable setup")
+    require_command(["bluetoothctl", "system-alias", ALIAS_PREFIX + controller_id()], "Bluetooth alias setup")
+    require_command(["bluetoothctl", "discoverable-timeout", "0"], "Bluetooth discoverable timeout setup")
+    require_command(["bluetoothctl", "discoverable", "on"], "Bluetooth discoverable setup")
 
 
 def ensure_sdp_record():
     # BlueZ does not publish an SDP record merely because a raw RFCOMM socket
     # is bound. The installer enables bluetoothd --compat so sdptool can make
     # channel 17 discoverable. Avoid duplicate records on service restarts.
-    browse = run(["sdptool", "browse", "local"])
+    browse = run(["sdptool", "browse", "local"], timeout=COMMAND_TIMEOUT)
     marker = f"Channel: {CHANNEL}"
     if browse.returncode == 0 and marker in browse.stdout:
         return
-    added = run(["sdptool", "add", f"--channel={CHANNEL}", "SP"])
+    added = run(["sdptool", "add", f"--channel={CHANNEL}", "SP"], timeout=COMMAND_TIMEOUT)
     if added.returncode != 0:
         detail = (added.stderr or added.stdout).strip()
         raise RuntimeError(f"could not register RFCOMM SDP channel {CHANNEL}: {detail or 'sdptool failed'}")
-    verify = run(["sdptool", "browse", "local"])
+    verify = run(["sdptool", "browse", "local"], timeout=COMMAND_TIMEOUT)
     if verify.returncode != 0 or marker not in verify.stdout:
         raise RuntimeError(f"RFCOMM SDP channel {CHANNEL} was not published")
     print(f"LGHS Bluetooth SDP service published on RFCOMM channel {CHANNEL}", flush=True)
