@@ -18,7 +18,9 @@ jobs:
             controller/lghs/__init__.py \
             controller/lghs/protocol.py \
             controller/lghs/database.py \
+            controller/lghs/audit.py \
             controller/lghs-db-migrate \
+            controller/lghs-fleet-state \
             controller/lghs-console \
             controller/lghs-console-responsive \
             controller/lghs-console-day2 \
@@ -37,13 +39,17 @@ jobs:
             student/lghs-audit-export \
             student/sudo \
             tests/test_command_plane.py \
-            tests/test_fleet_database.py
+            tests/test_fleet_database.py \
+            tests/test_audit_ingest.py
 
       - name: Command-plane regression tests
         run: python3 -m unittest -v tests/test_command_plane.py
 
       - name: Fleet database and protocol tests
         run: python3 -m unittest -v tests/test_fleet_database.py
+
+      - name: HTTPS audit ingestion tests
+        run: python3 -m unittest -v tests/test_audit_ingest.py
 
       - name: Shell syntax
         run: |
@@ -58,6 +64,7 @@ jobs:
             updater/lghs-install-success-notify \
             controller/lghsctl-wrapper \
             systemd/90-lghs-netqueue \
+            student/lghs-discovery-advertise \
             student/lghs-enforce \
             student/lghs-check \
             student/lghs-report \
@@ -90,6 +97,8 @@ jobs:
           grep -q "database':'sqlite-wal" controller/lghs-fleet-api
           grep -q '/v1/commands/' controller/lghs-fleet-api
           grep -q 'commands_for_delivery' controller/lghs-fleet-api
+          grep -q 'record_batches' controller/lghs-fleet-api
+          grep -q 'audit_ack' controller/lghs-fleet-api
           grep -q 'FleetDB' controller/lghs-fleet-command
           grep -q 'migrate_legacy' controller/lghs-db-migrate
 
@@ -101,23 +110,40 @@ jobs:
           grep -q '^User=root$' systemd/lghs-command-executor.service
           grep -q '^NoNewPrivileges=yes$' systemd/lghs-command-executor.service
           grep -q "ACTIONS={'lghs-update'" student/lghs-command-executor
+          grep -q "AUDIT={'sudo'" student/lghs-command-executor
+          grep -q "AUDIT_KINDS=('sudo'" student/lghs-agent
+          grep -q 'audit_batches' student/lghs-agent
           if grep -qE 'shell=True|/bin/(ba)?sh|eval\(' student/lghs-command-executor; then
             echo 'Privileged executor contains an arbitrary shell path.' >&2
             exit 1
           fi
-          grep -q 'systemctl disable --now lghs-telemetry-push.service' updater/lghs-0.5-install
-          grep -q 'lghs-command-executor.service lghs-agent.service' updater/lghs-0.5-install
+          grep -q 'systemctl disable --now lghs-telemetry-push.service' install.sh
+          grep -q 'lghs-command-executor.service lghs-agent.service' install.sh
+          grep -q 'purpose=bootstrap-recovery' student/lghs-discovery-advertise
 
       - name: SQLite foundation invariants
         run: |
-          grep -q "journal_mode=WAL" controller/lghs/database.py
+          grep -q 'journal_mode=WAL' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS commands' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS command_events' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS warnings' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS deployments' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS audit_events' controller/lghs/database.py
           grep -q 'PROTOCOL_VERSION = 1' controller/lghs/protocol.py
           grep -q 'evaluate_health' controller/lghs/database.py
           grep -q 'min_redelivery' controller/lghs/database.py
+
+      - name: Canonical installer invariants
+        run: |
+          grep -q 'groupadd --system lghs-agent' install.sh
+          grep -q 'useradd --system --gid lghs-agent' install.sh
+          grep -q 'controller/lghs/database.py' install.sh
+          grep -q 'controller/lghs/audit.py' install.sh
+          grep -q 'lghs-db-migrate' install.sh
+          grep -q 'student/lghs-command-executor' install.sh
+          grep -q 'lghs-discovery-advertise.service' install.sh
+          grep -q '/var/lib/lghs-agent/fleet-api-token' install.sh
+          grep -q '/var/lib/lghs-agent/fleet-api.conf' install.sh
 
       - name: Update integration invariants
         run: |
@@ -125,6 +151,7 @@ jobs:
           grep -q 'validate_student_05' updater/lghs-update
           grep -q '/var/lib/lghs/fleet.db' updater/lghs-update
           grep -q 'lghs-agent/fleet-api.conf' updater/lghs-0.5-install
+          grep -q 'LGHS_AUDIT_SSH_RECOVERY' controller/lghs-audit-sync
 
       - name: Release invariants
         run: |
