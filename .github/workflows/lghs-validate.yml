@@ -145,9 +145,11 @@ jobs:
           grep -q 'fleet-api-tokens.json' controller/lghs-bt-provision
           grep -q 'verify_proof(token, "student"' controller/lghs-bt-provision
           grep -q 'verify_proof(token, "controller"' student/lghs-bt-bootstrap
-          grep -q '\["btmgmt", "find", "-b"\]' student/lghs-bt-bootstrap
-          grep -q '\["btmgmt", "io-cap", "3"\]' student/lghs-bt-bootstrap
-          grep -q '\["btmgmt", "io-cap", "3"\]' controller/lghs-bt-provision
+          grep -q '\["btmgmt", "-i", BT_INDEX, "find", "-b"\]' student/lghs-bt-bootstrap
+          grep -q '\["btmgmt", "-i", BT_INDEX, "io-cap", "3"\]' student/lghs-bt-bootstrap
+          grep -q '\["btmgmt", "-i", BT_INDEX, "io-cap", "3"\]' controller/lghs-bt-provision
+          grep -q 'COMMAND_TIMEOUT = 6' student/lghs-bt-bootstrap
+          grep -q 'COMMAND_TIMEOUT = 6' controller/lghs-bt-provision
           grep -q 'bluetoothd --compat' install.sh
           grep -q 'ConditionPathExists=/etc/lghs/bluetooth-bootstrap-enabled' systemd/lghs-bt-bootstrap.service
           grep -q 'ConditionPathExists=!/var/lib/lghs/bootstrap/wifi-provisioned.json' systemd/lghs-bt-bootstrap.service
@@ -195,6 +197,7 @@ jobs:
           grep -q 'lghs-agent/fleet-api.conf' updater/lghs-0.5-install
           grep -q 'lghs-bt-provision.service' updater/lghs-0.5-install
           grep -q 'lghs-bt-bootstrap.service' updater/lghs-0.5-install
+          grep -q 'systemctl reset-failed lghs-bt-provision.service' updater/lghs-0.5-install
           grep -q 'LGHS_AUDIT_SSH_RECOVERY' controller/lghs-audit-sync
 
       - name: Release invariants
