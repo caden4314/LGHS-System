@@ -1,0 +1,26 @@
+[Unit]
+Description=LGHS Bluetooth Wi-Fi Bootstrap Client
+After=bluetooth.service NetworkManager.service
+Wants=bluetooth.service NetworkManager.service
+ConditionPathExists=/etc/lghs/bluetooth-bootstrap-enabled
+ConditionPathExists=!/var/lib/lghs/bootstrap/wifi-provisioned.json
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/lghs-bt-bootstrap
+Restart=on-failure
+RestartSec=15
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadOnlyPaths=/etc/lghs
+ReadWritePaths=/var/lib/lghs /var/lib/lghs-agent /etc/NetworkManager/system-connections /run
+
+[Install]
+WantedBy=multi-user.target
