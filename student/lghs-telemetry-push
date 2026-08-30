@@ -13,7 +13,8 @@ TOKEN = Path("/etc/lghs/secrets/fleet-api-token")
 SUDO_REQUEST_DIR = Path("/var/lib/lghs/sudo-requests")
 LGHS_STATUS = Path("/var/lib/lghs/update/lghs-status.json")
 OS_STATUS = Path("/var/lib/lghs/update/os-status.json")
-COMMAND_STATE = Path("/var/lib/lghs/telemetry-command-state.json")
+COMMAND_STATE = Path("/var/lib/lghs/telemetry/command-state.json")
+LEGACY_COMMAND_STATE = Path("/var/lib/lghs/telemetry-command-state.json")
 NETQUEUE = "/usr/local/sbin/lghs-netqueue"
 INTERVAL = float(os.environ.get("LGHS_TELEMETRY_SECONDS", "3"))
 TIMEOUT = float(os.environ.get("LGHS_TELEMETRY_TIMEOUT", "8"))
@@ -21,8 +22,10 @@ ALLOWED_COMMANDS = {
     "lghs-update": [NETQUEUE, "enqueue", "local-update"],
     "os-update": [NETQUEUE, "enqueue", "os-update"],
 }
-ACTIVE_UPDATE_STATES = {"checking", "queued", "downloading", "preparing", "installing", "validating", "cleaning", "finishing", "rolling_back", "busy", "rebooting"}
-TERMINAL_UPDATE_STATES = {"complete", "failed", "reboot_required"}
+ACTIVE_UPDATE_STATES = {
+    "checking", "queued", "downloading", "preparing", "installing",
+    "validating", "cleaning", "finishing", "rolling_back", "busy", "rebooting",
+}
 
 
 def parse_conf():
@@ -60,18 +63,22 @@ def load_json(path):
 
 
 def atomic_json(path, value):
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(value, separators=(",", ":")) + "\n", encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except Exception:
-        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
 
 
 def command_rows():
     data = load_json(COMMAND_STATE)
+    if not data and LEGACY_COMMAND_STATE.exists():
+        # One-way migration from the pre-0.4.1 location. The old file remains
+        # readable for rollback compatibility but all new writes go into the
+        # systemd-managed telemetry StateDirectory.
+        data = load_json(LEGACY_COMMAND_STATE)
+        if data:
+            atomic_json(COMMAND_STATE, data)
     rows = data.get("commands", []) if isinstance(data, dict) else []
     return [dict(x) for x in rows if isinstance(x, dict) and x.get("id")][-64:]
 
@@ -98,18 +105,22 @@ def update_command_progress(rows, lghs_status, os_status):
         started_at = float(status.get("started_at") or 0) if isinstance(status, dict) else 0
         if not status or not started_at or started_at + 1 < accepted_at:
             continue
-        s = str(status.get("state") or "").lower()
+        update_state = str(status.get("state") or "").lower()
         updated_at = float(status.get("updated_at") or now)
-        if s in ACTIVE_UPDATE_STATES:
+        if update_state in ACTIVE_UPDATE_STATES:
             set_command_state(row, "running", updated_at)
-        elif s in TERMINAL_UPDATE_STATES:
-            set_command_state(row, s, updated_at)
+        elif update_state == "failed":
+            set_command_state(row, "failed", updated_at)
+        elif update_state in {"complete", "reboot_required"}:
+            # Execution success is separate from whether the OS subsequently
+            # requires a reboot. Preserve that detail in update_state.
+            set_command_state(row, "succeeded", updated_at)
         else:
             continue
         row["stage"] = str(status.get("stage") or "")
         row["message"] = str(status.get("message") or "")
         row["progress"] = status.get("progress")
-        row["update_state"] = s
+        row["update_state"] = update_state
         row["update_started_at"] = started_at
     return rows
 
@@ -162,12 +173,39 @@ def snapshot():
     return data
 
 
+def enqueue_received(row):
+    action = str(row.get("action") or "")
+    if action not in ALLOWED_COMMANDS:
+        set_command_state(row, "rejected")
+        row["stage"] = "Rejected by device"
+        row["message"] = "Unsupported command action"
+        return False
+    try:
+        p = run(ALLOWED_COMMANDS[action])
+    except Exception as exc:
+        row["stage"] = "Local queue retry pending"
+        row["message"] = str(exc)
+        row["updated_at"] = time.time()
+        return False
+    if p.returncode != 0:
+        detail = (p.stderr or p.stdout or "queue command failed").strip()[-500:]
+        row["stage"] = "Local queue retry pending"
+        row["message"] = detail
+        row["updated_at"] = time.time()
+        return False
+    accepted = time.time()
+    set_command_state(row, "accepted", accepted)
+    row["accepted_at"] = accepted
+    row["stage"] = "Accepted by device"
+    row["message"] = "Queued locally on Pi"
+    return True
+
+
 def accept_commands(commands):
     if not isinstance(commands, list):
         return
     rows = command_rows()
     by_id = {str(x.get("id")): x for x in rows}
-    changed = False
     for command in commands[:16]:
         if not isinstance(command, dict):
             continue
@@ -175,46 +213,34 @@ def accept_commands(commands):
         action = str(command.get("action") or "")
         if not command_id or action not in ALLOWED_COMMANDS:
             continue
-        if command_id in by_id:
-            continue
-        now = time.time()
-        row = {
-            "id": command_id,
-            "action": action,
-            "state": "received",
-            "received_at": now,
-            "updated_at": now,
-            "stage": "Received by device",
-            "message": "Command arrived over HTTPS telemetry",
-            "progress": 0,
-        }
-        rows.append(row)
-        by_id[command_id] = row
-        changed = True
-        # Persist the receive acknowledgement before touching the local queue so
-        # an interrupted enqueue never looks like the command was never seen.
-        save_command_rows(rows)
-        try:
-            p = run(ALLOWED_COMMANDS[action])
-        except Exception as exc:
-            set_command_state(row, "failed")
-            row["stage"] = "Local queue failed"
-            row["message"] = str(exc)
+        row = by_id.get(command_id)
+        if row is None:
+            now = time.time()
+            row = {
+                "id": command_id,
+                "action": action,
+                "state": "received",
+                "received_at": now,
+                "updated_at": now,
+                "stage": "Received by device",
+                "message": "Command arrived over HTTPS telemetry",
+                "progress": 0,
+            }
+            rows.append(row)
+            by_id[command_id] = row
+            # Persist RECEIVED first. If the service or Pi dies after this write,
+            # the controller will redeliver and the next pass retries enqueue.
             save_command_rows(rows)
-            continue
-        if p.returncode == 0:
-            accepted = time.time()
-            set_command_state(row, "accepted", accepted)
-            row["accepted_at"] = accepted
-            row["stage"] = "Accepted by device"
-            row["message"] = "Queued locally on Pi"
         else:
-            detail = (p.stderr or p.stdout or "queue command failed").strip()[-500:]
-            set_command_state(row, "failed")
-            row["stage"] = "Local queue failed"
-            row["message"] = detail
-        save_command_rows(rows)
-    if changed:
+            state = str(row.get("state") or "").lower()
+            if state != "received":
+                continue
+            row["action"] = action
+            row["stage"] = "Retrying local acceptance"
+            row["message"] = "Command redelivered after incomplete local acceptance"
+            row["updated_at"] = time.time()
+            save_command_rows(rows)
+        enqueue_received(row)
         save_command_rows(rows)
 
 
@@ -231,7 +257,7 @@ def send_once():
     body = json.dumps(payload, separators=(",", ":")).encode()
     req = urllib.request.Request(
         f"{base}/v1/report/{device}", data=body, method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "LGHS-Telemetry/5"},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "LGHS-Telemetry/6"},
     )
     with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
         if response.status not in (200, 202, 204):
