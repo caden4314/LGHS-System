@@ -38,8 +38,10 @@ def atomic_write(path, data):
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     finally:
-        try: os.unlink(tmp)
-        except FileNotFoundError: pass
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def audit(event, **fields):
@@ -147,7 +149,7 @@ def status(rid):
 
 def wait_status(rid, timeout):
     user, uid, path, data = load_owned(rid)
-    timeout = max(0.0, min(float(timeout), 30.0))
+    timeout = max(0.0, min(float(timeout), float(TTL)))
     deadline = time.monotonic() + timeout
     while True:
         data = refresh_status(rid, user, path, data)
@@ -206,7 +208,8 @@ def main():
     action = sys.argv[1]
     if action == 'request':
         args = sys.argv[2:]
-        if args and args[0] == '--': args = args[1:]
+        if args and args[0] == '--':
+            args = args[1:]
         request(args)
     elif action == 'status' and len(sys.argv) == 3:
         status(sys.argv[2])
