@@ -16,6 +16,8 @@ if (( ${#MISSING_PKGS[@]} )); then
 fi
 install -d -m 0755 /usr/local/lib/lghs-bt
 install -m 0644 "$ROOT/bluetooth/lghs_bt_protocol.py" /usr/local/lib/lghs-bt/lghs_bt_protocol.py
+install -m 0755 "$ROOT/bluetooth/lghs-bt-prepare" /usr/local/sbin/lghs-bt-prepare
+install -m 0644 "$ROOT/systemd/lghs-bt-prepare.service" /etc/systemd/system/lghs-bt-prepare.service
 systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
 
 if [[ "$ROLE" == controller ]]; then
@@ -35,8 +37,9 @@ if [[ "$ROLE" == controller ]]; then
   chmod 0640 /var/lib/lghs/db-migration-last.json
   systemctl daemon-reload
   systemctl enable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
-  systemctl enable lghs-bt-provision.service
-  systemctl reset-failed lghs-bt-provision.service >/dev/null 2>&1 || true
+  systemctl enable lghs-bt-prepare.service lghs-bt-provision.service
+  systemctl reset-failed lghs-bt-prepare.service lghs-bt-provision.service >/dev/null 2>&1 || true
+  systemctl restart lghs-bt-prepare.service
   systemctl restart lghs-bt-provision.service
   systemctl try-restart lghs-fleet-api.service || true
   echo 'LGHS 0.5 controller SQLite/HTTPS + Bluetooth bootstrap foundation installed.'
@@ -77,9 +80,10 @@ fi
 systemctl daemon-reload
 systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
 systemctl enable --now lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service
-systemctl enable lghs-bt-bootstrap.service
+systemctl enable lghs-bt-prepare.service lghs-bt-bootstrap.service
+systemctl reset-failed lghs-bt-prepare.service lghs-bt-bootstrap.service >/dev/null 2>&1 || true
+systemctl restart lghs-bt-prepare.service
 if [[ -f /etc/lghs/bluetooth-bootstrap-enabled && ! -f /var/lib/lghs/bootstrap/wifi-provisioned.json ]]; then
-  systemctl reset-failed lghs-bt-bootstrap.service >/dev/null 2>&1 || true
   systemctl start lghs-bt-bootstrap.service || true
 fi
 sleep 1
