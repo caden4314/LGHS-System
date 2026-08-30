@@ -37,9 +37,6 @@ def notify(title,body,urgency="normal"):
     ]
     message=f"{title}: {body}"
     try:
-        # Raspberry Pi OS Trixie/labwc uses wf-panel-pi for its native desktop
-        # notifications and does not necessarily provide the standard
-        # org.freedesktop.Notifications daemon expected by notify-send.
         if shutil.which("wfpanelctl"):
             action="critical" if urgency=="critical" else "notify"
             p=subprocess.run(
@@ -90,14 +87,14 @@ def num(v):
 def issues(d):
     host=d.get("hostname") or d.get("host") or d.get("addr","?");out=[]
     if not d.get("online"):
-        return [("critical","ssh",f"{host} is not responding over fleet SSH")]
+        return [("critical","telemetry",f"{host} telemetry is offline")]
     temp=num(d.get("temp_c"));disk=num(d.get("disk_pct"))
     if temp is not None and temp>=TEMP_CRIT:out.append(("critical","temperature",f"temperature {temp:.1f}C"))
     elif temp is not None and temp>=TEMP_WARN:out.append(("warning","temperature",f"temperature {temp:.1f}C"))
     if disk is not None and disk>=DISK_CRIT:out.append(("critical","disk",f"disk usage {disk:.0f}%"))
     elif disk is not None and disk>=DISK_WARN:out.append(("warning","disk",f"disk usage {disk:.0f}%"))
     expected=["update_timer","reconcile_timer"]
-    if d.get("role")=="student":expected += ["agent","policy","ssh","networkmanager","avahi"]
+    if d.get("role")=="student":expected += ["agent","policy","ssh","networkmanager"]
     for k in expected:
         v=d.get(k)
         if v and v!="active":out.append(("critical" if k in ("ssh","policy") else "warning",f"service:{k}",f"{k} is {v}"))
@@ -131,8 +128,8 @@ def main():
                     "issues":curissues,
                 }
                 if s.get("initialized") and prev and prev.get("online")!=online:
-                    if online:emit(s,f"online:{addr}","normal","LGHS Pi online",f"{host} ({addr}) is back online.",host,"Pi online")
-                    else:emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) is offline or SSH is unreachable.",host,"Pi offline")
+                    if online:emit(s,f"online:{addr}","normal","LGHS Pi online",f"{host} ({addr}) telemetry is back online.",host,"Telemetry online")
+                    else:emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) stopped reporting telemetry.",host,"Telemetry offline")
                 for key,(sev,msg) in curissues.items():
                     if key not in oldissues:
                         emit(s,f"issue:{addr}:{key}",sev,"LGHS CRITICAL" if sev=="critical" else "LGHS warning",f"{host}: {msg}",host,"Fleet health")
@@ -142,15 +139,14 @@ def main():
                         emit(s,f"sudo:{rk}","warning","LGHS sudo request",f"{host}: {req.get('command','sudo request')}",host,"Sudo requested")
                     if rid:seen.add(rk)
 
-            # Avahi only returns devices that are presently advertising. Preserve
-            # previously seen members that vanish from mDNS so an unplugged or
-            # crashed Pi becomes OFFLINE instead of disappearing from the fleet.
+            # Registry/cache membership is authoritative for day-to-day fleet
+            # presence. Avahi is only a provisioning/recovery signal.
             for addr,prev in previous.items():
                 if addr in current or not isinstance(prev,dict):
                     continue
                 host=prev.get("host") or addr
                 last_seen=float(prev.get("last_seen",0) or 0)
-                msg=f"{host} is not responding over fleet SSH"
+                msg=f"{host} telemetry is offline"
                 if last_seen:
                     msg += f"; last seen {int(max(0,now-last_seen))}s ago"
                 current[addr]={
@@ -159,10 +155,10 @@ def main():
                     "role":prev.get("role","student"),
                     "online":False,
                     "last_seen":last_seen,
-                    "issues":{"ssh":["critical",msg]},
+                    "issues":{"telemetry":["critical",msg]},
                 }
                 if s.get("initialized") and prev.get("online"):
-                    emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) went offline or stopped advertising.",host,"Pi offline")
+                    emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) stopped reporting telemetry.",host,"Telemetry offline")
 
             s["sudo_seen"]=list(seen)[-500:];s["devices"]=current
             for name,path in (("LGHS update",UPDATE_LOG),("Raspberry Pi OS update",OS_UPDATE_LOG)):
