@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import os
 import re
@@ -122,7 +123,7 @@ def fleet_health_ok():
         return False
 
 
-def apply_wifi(wifi):
+def validate_wifi(wifi):
     ssid = str(wifi.get("ssid") or "")
     key_mgmt = str(wifi.get("key_mgmt") or "open").lower()
     psk = str(wifi.get("psk") or "")
@@ -133,6 +134,11 @@ def apply_wifi(wifi):
         raise ValueError("unsupported Wi-Fi security mode")
     if key_mgmt != "open" and not psk:
         raise ValueError("secured Wi-Fi profile has no PSK")
+    return ssid, key_mgmt, psk, hidden
+
+
+def apply_wifi(wifi):
+    ssid, key_mgmt, psk, hidden = validate_wifi(wifi)
 
     name = "LGHS-Bootstrap-" + "".join(c if c.isalnum() or c in "._-" else "_" for c in ssid)[:40]
     run(["nmcli", "connection", "delete", name])
@@ -156,7 +162,7 @@ def apply_wifi(wifi):
     return name
 
 
-def provision(address):
+def provision(address, dry_run=False):
     token = fleet_token()
     did = device_id()
     sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
@@ -189,7 +195,21 @@ def provision(address):
         payload = decrypt_payload(key, tx, response)
         if payload.get("type") != "wifi_profile" or not isinstance(payload.get("wifi"), dict):
             raise ValueError("invalid Wi-Fi provisioning payload")
-        connection = apply_wifi(payload["wifi"])
+
+        wifi = payload["wifi"]
+        ssid, key_mgmt, _psk, hidden = validate_wifi(wifi)
+        if dry_run:
+            send_frame(sock, {"v": PROTOCOL_VERSION, "type": "result", "status": "dry-run-ok"})
+            print("Authenticated Bluetooth bootstrap handshake succeeded.")
+            print(f"Controller: {cid}")
+            print(f"Device: {did}")
+            print(f"SSID: {ssid}")
+            print(f"Security: {key_mgmt}")
+            print(f"Hidden: {'yes' if hidden else 'no'}")
+            print("Wi-Fi profile was NOT modified.")
+            return True
+
+        connection = apply_wifi(wifi)
         ok = fleet_health_ok()
         send_frame(sock, {"v": PROTOCOL_VERSION, "type": "result", "status": "fleet-online" if ok else "wifi-online"})
         if not ok:
@@ -212,18 +232,47 @@ def provision(address):
         sock.close()
 
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="LGHS encrypted Bluetooth Wi-Fi bootstrap client")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="discover, authenticate, derive/decrypt the provisioning payload, and validate it without changing Wi-Fi",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     if os.geteuid() != 0:
         raise SystemExit("Run as root")
-    if not ENABLED.exists():
-        print("LGHS Bluetooth bootstrap is not enabled on this device.")
-        return 0
-    if PROVISIONED.exists():
-        print("LGHS Bluetooth bootstrap already completed.")
-        return 0
     if not hasattr(socket, "AF_BLUETOOTH"):
         raise SystemExit("Python lacks AF_BLUETOOTH support")
+
+    if not args.dry_run:
+        if not ENABLED.exists():
+            print("LGHS Bluetooth bootstrap is not enabled on this device.")
+            return 0
+        if PROVISIONED.exists():
+            print("LGHS Bluetooth bootstrap already completed.")
+            return 0
+
     configure_adapter()
+
+    if args.dry_run:
+        print("LGHS Bluetooth bootstrap dry-run: no NetworkManager changes will be made.", flush=True)
+        found = discover_controller()
+        if not found:
+            print("No LGHS provisioning controller found.", file=sys.stderr)
+            return 1
+        address, name = found
+        print(f"Found {name} at {address}; testing authenticated encrypted handshake", flush=True)
+        try:
+            return 0 if provision(address, dry_run=True) else 1
+        except Exception as exc:
+            print(f"Bluetooth bootstrap dry-run failed: {exc}", file=sys.stderr, flush=True)
+            return 1
+
     print(f"LGHS Bluetooth bootstrap scanning every {SCAN_INTERVAL:g} seconds", flush=True)
     while not PROVISIONED.exists():
         found = discover_controller()
