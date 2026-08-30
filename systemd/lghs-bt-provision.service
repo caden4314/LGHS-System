@@ -2,6 +2,7 @@
 Description=LGHS Bluetooth Wi-Fi Provisioning Server
 After=bluetooth.service NetworkManager.service
 Wants=bluetooth.service NetworkManager.service
+PartOf=bluetooth.service
 ConditionPathExists=/etc/lghs/role
 
 [Service]
