@@ -4,11 +4,9 @@ import os
 import shlex
 import subprocess
 import sys
-import time
 
 REAL_SUDO = '/usr/bin/sudo'
 STUDENT = 'lg_cs_cont'
-POLL_SECONDS = 0.35
 
 
 def run(cmd, env=None):
@@ -34,8 +32,11 @@ def submit_request(argv):
     return p.stdout.strip().splitlines()[-1]
 
 
-def request_status(rid):
-    p = broker('status', rid)
+def request_status(rid, wait_seconds=0):
+    if wait_seconds:
+        p = broker('wait', rid, [str(wait_seconds)])
+    else:
+        p = broker('status', rid)
     if p.returncode != 0:
         return None
     try:
@@ -95,7 +96,9 @@ def managed_sudo(argv):
 
     try:
         while True:
-            state = request_status(rid)
+            # One broker process blocks on the root-owned request file instead
+            # of spawning sudo/PAM status checks several times per second.
+            state = request_status(rid, 2 if local is not None else 15)
             local_rc = local.poll() if local is not None else None
 
             if state == 'approved':
@@ -136,8 +139,6 @@ def managed_sudo(argv):
                 print('\nLocal Root-password entry ended; the Fleet request is still waiting for approval.')
                 local = None
                 audit_event(rid, 'waiting_for_fleet')
-
-            time.sleep(POLL_SECONDS)
 
     except KeyboardInterrupt:
         stop_child(local)
