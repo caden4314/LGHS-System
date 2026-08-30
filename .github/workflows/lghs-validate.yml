@@ -12,6 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Bluetooth crypto dependency
+        run: sudo apt-get update && sudo apt-get install -y python3-cryptography
+
       - name: Python syntax
         run: |
           python3 -m py_compile \
@@ -30,9 +33,12 @@ jobs:
             controller/lghs-fleet-notify \
             controller/lghsctl \
             controller/lghs-audit-sync \
+            controller/lghs-bt-provision \
+            bluetooth/lghs_bt_protocol.py \
             updater/lghs-netqueue \
             student/lghs-agent \
             student/lghs-command-executor \
+            student/lghs-bt-bootstrap \
             student/lghs-telemetry-push \
             student/lghs-sudo-broker \
             student/lghs-approved-exec \
@@ -43,7 +49,8 @@ jobs:
             tests/test_fleet_database.py \
             tests/test_audit_ingest.py \
             tests/test_sudo_state.py \
-            tests/test_fleet_api_integration.py
+            tests/test_fleet_api_integration.py \
+            tests/test_bt_bootstrap.py
 
       - name: Runtime-independent unit and integration tests
         run: |
@@ -52,7 +59,8 @@ jobs:
             tests/test_fleet_database.py \
             tests/test_audit_ingest.py \
             tests/test_sudo_state.py \
-            tests/test_fleet_api_integration.py
+            tests/test_fleet_api_integration.py \
+            tests/test_bt_bootstrap.py
 
       - name: Shell syntax
         run: |
@@ -129,6 +137,24 @@ jobs:
           grep -q 'lghs-command-executor.service lghs-agent.service' install.sh
           grep -q 'purpose=bootstrap-recovery' student/lghs-discovery-advertise
 
+      - name: Bluetooth bootstrap security invariants
+        run: |
+          grep -q 'X25519PrivateKey' bluetooth/lghs_bt_protocol.py
+          grep -q 'AESGCM' bluetooth/lghs_bt_protocol.py
+          grep -q 'HKDF' bluetooth/lghs_bt_protocol.py
+          grep -q 'fleet-api-tokens.json' controller/lghs-bt-provision
+          grep -q 'verify_proof(token, "student"' controller/lghs-bt-provision
+          grep -q 'verify_proof(token, "controller"' student/lghs-bt-bootstrap
+          grep -q 'LGHS_BT_SCAN_INTERVAL.*"15"' student/lghs-bt-bootstrap
+          grep -q 'ConditionPathExists=/etc/lghs/bluetooth-bootstrap-enabled' systemd/lghs-bt-bootstrap.service
+          grep -q 'ConditionPathExists=!/var/lib/lghs/bootstrap/wifi-provisioned.json' systemd/lghs-bt-bootstrap.service
+          grep -q '^ProtectSystem=strict$' systemd/lghs-bt-provision.service
+          grep -q '^ProtectSystem=strict$' systemd/lghs-bt-bootstrap.service
+          if grep -R -nE 'LGHS_WIFI_PASSWORD=|DEFAULT_PSK=' bluetooth controller/lghs-bt-provision student/lghs-bt-bootstrap; then
+            echo 'Static Bluetooth provisioning Wi-Fi secret found.' >&2
+            exit 1
+          fi
+
       - name: SQLite foundation invariants
         run: |
           grep -q 'journal_mode=WAL' controller/lghs/database.py
@@ -153,6 +179,9 @@ jobs:
           grep -q 'lghs-discovery-advertise.service' install.sh
           grep -q '/var/lib/lghs-agent/fleet-api-token' install.sh
           grep -q '/var/lib/lghs-agent/fleet-api.conf' install.sh
+          grep -q 'lghs-bt-provision.service' install.sh
+          grep -q 'lghs-bt-bootstrap.service' install.sh
+          grep -q 'python3-cryptography' install.sh
           grep -q 'controller/lghs/sudo_state.py' updater/lghs-0.5-install
 
       - name: Update integration invariants
@@ -161,12 +190,14 @@ jobs:
           grep -q 'validate_student_05' updater/lghs-update
           grep -q '/var/lib/lghs/fleet.db' updater/lghs-update
           grep -q 'lghs-agent/fleet-api.conf' updater/lghs-0.5-install
+          grep -q 'lghs-bt-provision.service' updater/lghs-0.5-install
+          grep -q 'lghs-bt-bootstrap.service' updater/lghs-0.5-install
           grep -q 'LGHS_AUDIT_SSH_RECOVERY' controller/lghs-audit-sync
 
       - name: Release invariants
         run: |
           grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION
-          grep -q '^0\.5\.0$' VERSION
+          grep -q '^0\.5\.1$' VERSION
           grep -q 'controller/lghs-console-responsive.*lghs-console-responsive-core' install.sh
           grep -q 'controller/lghs-console-day2.*lghs-console' install.sh
           grep -q 'controller/lghs-fleet-command.*lghs-fleet-command' install.sh
