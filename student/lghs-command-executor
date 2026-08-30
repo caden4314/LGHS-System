@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """Tiny root executor for typed LGHS 0.5 agent commands."""
-import grp,json,os,socket,subprocess,time
+import grp,json,os,shutil,socket,subprocess,time
 from pathlib import Path
-SOCK=Path('/run/lghs-command-executor/socket'); NETQUEUE='/usr/local/sbin/lghs-netqueue'; SEEN=Path('/var/lib/lghs/executor-seen.json')
+SOCK=Path('/run/lghs-command-executor/socket');NETQUEUE='/usr/local/sbin/lghs-netqueue';SEEN=Path('/var/lib/lghs/executor-seen.json')
 ACTIONS={'lghs-update':[NETQUEUE,'enqueue','local-update'],'os-update':[NETQUEUE,'enqueue','os-update']}
 STATUS={'lghs-update':Path('/var/lib/lghs/update/lghs-status.json'),'os-update':Path('/var/lib/lghs/update/os-status.json')}
 def load_json(p,d):
     try:return json.loads(p.read_text(encoding='utf-8'))
     except Exception:return d
 def save_seen(x):
-    SEEN.parent.mkdir(parents=True,exist_ok=True); t=SEEN.with_suffix('.tmp'); t.write_text(json.dumps(x,separators=(',',':'))+'\n',encoding='utf-8'); os.chmod(t,0o600); os.replace(t,SEEN)
+    SEEN.parent.mkdir(parents=True,exist_ok=True);t=SEEN.with_suffix('.tmp');t.write_text(json.dumps(x,separators=(',',':'))+'\n',encoding='utf-8');os.chmod(t,0o600);os.replace(t,SEEN)
+def pi_health():
+    out={'reboot_required':Path('/run/reboot-required').exists()}
+    if shutil.which('vcgencmd'):
+        try:
+            p=subprocess.run(['vcgencmd','get_throttled'],text=True,capture_output=True,timeout=3);raw=(p.stdout or '').strip().split('=',1)[-1];flags=int(raw,16)
+            out.update({'throttled_raw':raw,'undervoltage_now':bool(flags&1),'frequency_capped_now':bool(flags&2),'throttled_now':bool(flags&4),'soft_temp_limit_now':bool(flags&8),'undervoltage_occurred':bool(flags&(1<<16)),'frequency_capped_occurred':bool(flags&(1<<17)),'throttled_occurred':bool(flags&(1<<18)),'soft_temp_limit_occurred':bool(flags&(1<<19))})
+        except Exception:pass
+    return out
 def reply(c,obj):c.sendall((json.dumps(obj,separators=(',',':'))+'\n').encode())
 def handle(c):
     data=b''
@@ -19,8 +27,8 @@ def handle(c):
         data+=chunk
     try:req=json.loads(data.split(b'\n',1)[0])
     except Exception:reply(c,{'ok':False,'error':'invalid-json'});return
-    if req.get('op')=='status': reply(c,{'ok':True,'updates':{k:load_json(v,{}) for k,v in STATUS.items()},'reboot_required':Path('/run/reboot-required').exists()}); return
-    cid=str(req.get('id') or ''); action=str(req.get('action') or '')
+    if req.get('op')=='status':reply(c,{'ok':True,'updates':{k:load_json(v,{}) for k,v in STATUS.items()},'health':pi_health()});return
+    cid=str(req.get('id') or '');action=str(req.get('action') or '')
     if not cid or len(cid)>128:reply(c,{'ok':False,'error':'invalid-command-id'});return
     if action not in ACTIONS:reply(c,{'ok':False,'error':'unsupported-action'});return
     seen=load_json(SEEN,{})
