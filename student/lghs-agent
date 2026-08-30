@@ -3,7 +3,7 @@
 import json,os,socket,threading,time,urllib.request
 from pathlib import Path
 
-CONF=Path('/etc/lghs/fleet-api.conf'); TOKEN=Path('/var/lib/lghs-agent/fleet-api-token'); STATE=Path('/var/lib/lghs-agent/state.json'); BOOT=Path('/proc/sys/kernel/random/boot_id'); VERSION=Path('/etc/lghs/version'); EXECUTOR='/run/lghs-command-executor/socket'
+STATE_ROOT=Path('/var/lib/lghs-agent'); CONF=STATE_ROOT/'fleet-api.conf'; TOKEN=STATE_ROOT/'fleet-api-token'; STATE=STATE_ROOT/'state.json'; VERSION=STATE_ROOT/'version'; BOOT=Path('/proc/sys/kernel/random/boot_id'); EXECUTOR='/run/lghs-command-executor/socket'
 REPORT_INTERVAL=float(os.environ.get('LGHS_AGENT_REPORT_SECONDS','5')); LONG_POLL=float(os.environ.get('LGHS_AGENT_LONG_POLL_SECONDS','25')); TIMEOUT=35
 LOCK=threading.RLock(); STOP=threading.Event(); ACTIVE={'checking','queued','downloading','preparing','installing','validating','cleaning','finishing','rolling_back','busy','rebooting'}
 
@@ -128,7 +128,7 @@ def longpoll():
 
 def main():
     if os.geteuid()==0:raise SystemExit('lghs-agent must run unprivileged')
-    if not TOKEN.exists():raise SystemExit('agent token not provisioned')
+    if not TOKEN.exists() or not CONF.exists():raise SystemExit('agent endpoint/token not provisioned')
     threads=[threading.Thread(target=reporter,daemon=True),threading.Thread(target=longpoll,daemon=True)]
     [t.start() for t in threads]
     try:
