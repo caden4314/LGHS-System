@@ -1,0 +1,7 @@
+# LGHS remote administrator account. SSH access is forced through
+# /usr/local/sbin/lghs-remote-shell, which allowlists commands and arguments.
+Defaults:lghs_remote !requiretty
+lghs_remote ALL=(root) NOPASSWD: /usr/local/sbin/lghs-console
+lghs_remote ALL=(root) NOPASSWD: /usr/local/sbin/lghs-update
+lghs_remote ALL=(root) NOPASSWD: /usr/local/sbin/lghs-fleet-command *
+lghs_remote ALL=(root) NOPASSWD: /usr/local/sbin/lghsctl *
