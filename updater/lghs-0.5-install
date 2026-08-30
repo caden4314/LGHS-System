@@ -10,14 +10,18 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0644 "$ROOT/controller/lghs/__init__.py" /usr/local/lib/lghs-python/lghs/__init__.py
   install -m 0644 "$ROOT/controller/lghs/protocol.py" /usr/local/lib/lghs-python/lghs/protocol.py
   install -m 0644 "$ROOT/controller/lghs/database.py" /usr/local/lib/lghs-python/lghs/database.py
+  install -m 0644 "$ROOT/controller/lghs/audit.py" /usr/local/lib/lghs-python/lghs/audit.py
   install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
   install -m 0755 "$ROOT/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
   /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
   chmod 0640 /var/lib/lghs/db-migration-last.json
+  # 0.5 receives normal audit batches over HTTPS. Keep lghs-audit-sync installed
+  # as an explicit recovery/backfill tool, but stop its recurring SSH fan-out.
+  systemctl disable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
   systemctl try-restart lghs-fleet-api.service || true
-  echo 'LGHS 0.5 controller SQLite foundation installed.'
+  echo 'LGHS 0.5 controller SQLite/HTTPS foundation installed.'
   exit 0
 fi
 
