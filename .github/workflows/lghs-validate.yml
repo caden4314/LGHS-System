@@ -75,6 +75,13 @@ jobs:
           grep -q '^ReadWritePaths=/var/lib/lghs/netqueue /var/log/lghs-netqueue.log$' systemd/lghs-telemetry-push.service
           grep -q '/var/lib/lghs/telemetry/command-state.json' student/lghs-telemetry-push
 
+      - name: Fleet API sandbox invariants
+        run: |
+          grep -q '^ProtectSystem=strict$' systemd/lghs-fleet-api.service
+          grep -q '^ReadWritePaths=/var/lib/lghs /etc/lghs /run/lock$' systemd/lghs-fleet-api.service
+          grep -q '/run/lock/lghs-fleet-commands.lock' controller/lghs-fleet-api
+          grep -q '/run/lock/lghs-fleet-commands.lock' controller/lghs-fleet-command
+
       - name: Release invariants
         run: |
           grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION
