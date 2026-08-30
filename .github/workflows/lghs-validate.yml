@@ -145,7 +145,10 @@ jobs:
           grep -q 'fleet-api-tokens.json' controller/lghs-bt-provision
           grep -q 'verify_proof(token, "student"' controller/lghs-bt-provision
           grep -q 'verify_proof(token, "controller"' student/lghs-bt-bootstrap
-          grep -q 'LGHS_BT_SCAN_INTERVAL.*"15"' student/lghs-bt-bootstrap
+          grep -q '\["btmgmt", "find", "-b"\]' student/lghs-bt-bootstrap
+          grep -q '\["btmgmt", "io-cap", "3"\]' student/lghs-bt-bootstrap
+          grep -q '\["btmgmt", "io-cap", "3"\]' controller/lghs-bt-provision
+          grep -q 'bluetoothd --compat' install.sh
           grep -q 'ConditionPathExists=/etc/lghs/bluetooth-bootstrap-enabled' systemd/lghs-bt-bootstrap.service
           grep -q 'ConditionPathExists=!/var/lib/lghs/bootstrap/wifi-provisioned.json' systemd/lghs-bt-bootstrap.service
           grep -q '^ProtectSystem=strict$' systemd/lghs-bt-provision.service
