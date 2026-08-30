@@ -19,6 +19,7 @@ jobs:
             controller/lghs/protocol.py \
             controller/lghs/database.py \
             controller/lghs/audit.py \
+            controller/lghs/sudo_state.py \
             controller/lghs-db-migrate \
             controller/lghs-fleet-state \
             controller/lghs-console \
@@ -40,16 +41,16 @@ jobs:
             student/sudo \
             tests/test_command_plane.py \
             tests/test_fleet_database.py \
-            tests/test_audit_ingest.py
+            tests/test_audit_ingest.py \
+            tests/test_sudo_state.py
 
-      - name: Command-plane regression tests
-        run: python3 -m unittest -v tests/test_command_plane.py
-
-      - name: Fleet database and protocol tests
-        run: python3 -m unittest -v tests/test_fleet_database.py
-
-      - name: HTTPS audit ingestion tests
-        run: python3 -m unittest -v tests/test_audit_ingest.py
+      - name: Runtime-independent unit tests
+        run: |
+          python3 -m unittest -v \
+            tests/test_command_plane.py \
+            tests/test_fleet_database.py \
+            tests/test_audit_ingest.py \
+            tests/test_sudo_state.py
 
       - name: Shell syntax
         run: |
@@ -99,6 +100,8 @@ jobs:
           grep -q 'commands_for_delivery' controller/lghs-fleet-api
           grep -q 'record_batches' controller/lghs-fleet-api
           grep -q 'audit_ack' controller/lghs-fleet-api
+          grep -q 'record_snapshot' controller/lghs-fleet-api
+          grep -q "sudo_transport':'https-events" controller/lghs-fleet-api
           grep -q 'FleetDB' controller/lghs-fleet-command
           grep -q 'migrate_legacy' controller/lghs-db-migrate
 
@@ -109,9 +112,12 @@ jobs:
           grep -q '^ProtectSystem=strict$' systemd/lghs-agent.service
           grep -q '^User=root$' systemd/lghs-command-executor.service
           grep -q '^NoNewPrivileges=yes$' systemd/lghs-command-executor.service
-          grep -q "ACTIONS={'lghs-update'" student/lghs-command-executor
-          grep -q "AUDIT={'sudo'" student/lghs-command-executor
-          grep -q "AUDIT_KINDS=('sudo'" student/lghs-agent
+          grep -q "'lghs-update': \[NETQUEUE" student/lghs-command-executor
+          grep -q "'os-update': \[NETQUEUE" student/lghs-command-executor
+          grep -q 'def sudo_snapshot' student/lghs-command-executor
+          grep -q "op == 'sudo'" student/lghs-command-executor
+          grep -q 'def sudo_event_watcher' student/lghs-agent
+          grep -q "'sudo_requests': status.get" student/lghs-agent
           grep -q 'audit_batches' student/lghs-agent
           if grep -qE 'shell=True|/bin/(ba)?sh|eval\(' student/lghs-command-executor; then
             echo 'Privileged executor contains an arbitrary shell path.' >&2
@@ -129,6 +135,7 @@ jobs:
           grep -q 'CREATE TABLE IF NOT EXISTS warnings' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS deployments' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS audit_events' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS sudo_requests' controller/lghs/database.py
           grep -q 'PROTOCOL_VERSION = 1' controller/lghs/protocol.py
           grep -q 'evaluate_health' controller/lghs/database.py
           grep -q 'min_redelivery' controller/lghs/database.py
@@ -144,6 +151,7 @@ jobs:
           grep -q 'lghs-discovery-advertise.service' install.sh
           grep -q '/var/lib/lghs-agent/fleet-api-token' install.sh
           grep -q '/var/lib/lghs-agent/fleet-api.conf' install.sh
+          grep -q 'controller/lghs/sudo_state.py' updater/lghs-0.5-install
 
       - name: Update integration invariants
         run: |
