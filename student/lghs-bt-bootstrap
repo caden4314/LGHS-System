@@ -17,8 +17,10 @@ from lghs_bt_protocol import (PROTOCOL_VERSION, decrypt_payload, derive_key,
                               transcript, verify_proof)
 
 CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
+BT_INDEX = os.environ.get("LGHS_BT_INDEX", "hci0")
 DISCOVERY_TIMEOUT = float(os.environ.get("LGHS_BT_DISCOVERY_TIMEOUT", "12"))
 RETRY_BACKOFF = float(os.environ.get("LGHS_BT_RETRY_BACKOFF", "5"))
+COMMAND_TIMEOUT = 6
 ALIAS_PREFIX = "LGHS-PROVISION-"
 ENABLED = Path("/etc/lghs/bluetooth-bootstrap-enabled")
 STATE_DIR = Path("/var/lib/lghs/bootstrap")
@@ -32,7 +34,18 @@ BT_SECURITY_LOW = 1
 
 
 def run(cmd, timeout=None):
-    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    try:
+        return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "command timed out")
+
+
+def require_command(cmd, description, timeout=COMMAND_TIMEOUT):
+    result = run(cmd, timeout=timeout)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"{description} failed: {detail or f'rc={result.returncode}'}")
+    return result
 
 
 def set_app_authenticated_security(sock):
@@ -64,17 +77,16 @@ def fleet_token():
 
 
 def configure_adapter():
-    run(["rfkill", "unblock", "bluetooth"])
-    run(["bluetoothctl", "power", "on"])
-    # The default DisplayYesNo capability waits for an interactive SSP prompt
-    # on first connection. Fresh student images have no operator, so use Just
-    # Works at the link layer and retain LGHS mutual auth/encryption above it.
-    run(["btmgmt", "io-cap", "3"])
-    run(["btmgmt", "pairable", "on"])
+    require_command(["rfkill", "unblock", "bluetooth"], "Bluetooth rfkill unblock")
+    require_command(["bluetoothctl", "power", "on"], "Bluetooth power-on")
+    # Explicitly select the controller: unindexed btmgmt commands can block on
+    # this Pi/BlueZ combination and stall first-boot provisioning indefinitely.
+    require_command(["btmgmt", "-i", BT_INDEX, "io-cap", "3"], "Bluetooth IO capability setup")
+    require_command(["btmgmt", "-i", BT_INDEX, "pairable", "on"], "Bluetooth pairable setup")
 
 
 def _cached_controller():
-    devices = run(["bluetoothctl", "devices"])
+    devices = run(["bluetoothctl", "devices"], timeout=COMMAND_TIMEOUT)
     if devices.returncode == 0:
         for line in devices.stdout.splitlines():
             parts = line.strip().split(maxsplit=2)
@@ -93,7 +105,7 @@ def discover_controller(timeout=None):
     """
     try:
         proc = subprocess.Popen(
-            ["btmgmt", "find", "-b"],
+            ["btmgmt", "-i", BT_INDEX, "find", "-b"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
