@@ -15,10 +15,8 @@ from lghs_bt_protocol import (PROTOCOL_VERSION, decrypt_payload, derive_key,
                               send_frame, transcript, verify_proof)
 
 CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
-BT_INDEX = os.environ.get("LGHS_BT_INDEX", "hci0")
 TOKENS = Path(os.environ.get("LGHS_FLEET_API_TOKENS", "/etc/lghs/fleet-api-tokens.json"))
 ROLE = Path("/etc/lghs/role")
-ALIAS_PREFIX = "LGHS-PROVISION-"
 SOCKET_TIMEOUT = 20
 COMMAND_TIMEOUT = 6
 SOL_BLUETOOTH = getattr(socket, "SOL_BLUETOOTH", 274)
@@ -31,14 +29,6 @@ def run(cmd, timeout=None):
         return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "command timed out")
-
-
-def require_command(cmd, description, timeout=COMMAND_TIMEOUT):
-    result = run(cmd, timeout=timeout)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"{description} failed: {detail or f'rc={result.returncode}'}")
-    return result
 
 
 def set_app_authenticated_security(sock):
@@ -103,18 +93,6 @@ def active_wifi_profile():
         "hidden": hidden,
         "autoconnect": True,
     }
-
-
-def configure_adapter():
-    require_command(["rfkill", "unblock", "bluetooth"], "Bluetooth rfkill unblock")
-    require_command(["bluetoothctl", "power", "on"], "Bluetooth power-on")
-    # btmgmt without an explicit index can block on this Raspberry Pi / BlueZ
-    # combination. Always target hci0 (or LGHS_BT_INDEX) and bound the command.
-    require_command(["btmgmt", "-i", BT_INDEX, "io-cap", "3"], "Bluetooth IO capability setup")
-    require_command(["btmgmt", "-i", BT_INDEX, "pairable", "on"], "Bluetooth pairable setup")
-    require_command(["bluetoothctl", "system-alias", ALIAS_PREFIX + controller_id()], "Bluetooth alias setup")
-    require_command(["bluetoothctl", "discoverable-timeout", "0"], "Bluetooth discoverable timeout setup")
-    require_command(["bluetoothctl", "discoverable", "on"], "Bluetooth discoverable setup")
 
 
 def ensure_sdp_record():
@@ -197,7 +175,9 @@ def main():
         raise SystemExit("Run as root")
     if ROLE.read_text(encoding="utf-8").strip() != "controller":
         raise SystemExit("Bluetooth provisioning server is controller-only")
-    configure_adapter()
+    # Adapter power, IO capability, pairability, alias and discoverability are
+    # prepared by lghs-bt-prepare.service outside this hardened long-running
+    # service. Some BlueZ management commands can block inside this sandbox.
     if not hasattr(socket, "AF_BLUETOOTH"):
         raise SystemExit("Python lacks AF_BLUETOOTH support")
     server = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
