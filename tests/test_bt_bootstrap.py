@@ -56,11 +56,15 @@ class BluetoothSourceInvariants(unittest.TestCase):
     def test_zero_touch_link_layer_keeps_application_authentication(self):
         student = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
         controller = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
+        prepare = (ROOT / "bluetooth" / "lghs-bt-prepare").read_text(encoding="utf-8")
+        prepare_unit = (ROOT / "systemd" / "lghs-bt-prepare.service").read_text(encoding="utf-8")
+
+        self.assertIn('btmgmt -i "$BT_INDEX" io-cap 3', prepare)
+        self.assertIn('btmgmt -i "$BT_INDEX" pairable on', prepare)
+        self.assertIn("script -q -e -c", prepare)
+        self.assertIn("Before=lghs-bt-provision.service lghs-bt-bootstrap.service", prepare_unit)
+
         for src in (student, controller):
-            self.assertIn('["btmgmt", "-i", BT_INDEX, "io-cap", "3"]', src)
-            self.assertIn('["btmgmt", "-i", BT_INDEX, "pairable", "on"]', src)
-            self.assertIn("COMMAND_TIMEOUT = 6", src)
-            self.assertIn("subprocess.TimeoutExpired", src)
             self.assertIn("set_app_authenticated_security", src)
         self.assertIn('verify_proof(token, "student"', controller)
         self.assertIn('verify_proof(token, "controller"', student)
