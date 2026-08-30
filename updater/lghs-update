@@ -170,18 +170,37 @@ validate_student_05() {
     [[ -s /var/lib/lghs-agent/fleet-api-token ]]
 }
 
+cleanup_legacy_student_services() {
+    [[ "$ROLE" == "student" ]] || return 0
+    systemctl disable --now lghs-command-executor.service >/dev/null 2>&1 || true
+    systemctl disable --now lghs-discovery-advertise.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/multi-user.target.wants/lghs-command-executor.service
+    rm -f /etc/systemd/system/multi-user.target.wants/lghs-discovery-advertise.service
+    systemctl daemon-reload
+    systemctl enable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
+}
+
 apply_install() {
     write_status "installing" "Applying LGHS configuration" 55 "Running install.sh for $ROLE"
     /bin/bash ./install.sh "$ROLE"
     if [[ -x ./updater/lghs-0.5-install ]]; then
         write_status "installing" "Installing 0.5 state/agent layer" 68 "Applying staged 0.5 architecture"
         ./updater/lghs-0.5-install "$ROLE"
+    elif [[ "$ROLE" == "student" ]]; then
+        write_status "installing" "Removing 0.5-only services" 68 "Restoring legacy telemetry for downgrade"
+        cleanup_legacy_student_services
     fi
     write_status "installing" "Reloading services" 75 "Refreshing systemd units"
     systemctl daemon-reload
     write_status "validating" "Validating installation" 88 "Running post-update checks"
     if [[ "$ROLE" == "student" ]]; then
-        if [[ -x ./updater/lghs-0.5-install ]]; then validate_student_05; else /usr/local/sbin/lghs-check; fi
+        if [[ -x ./updater/lghs-0.5-install ]]; then
+            validate_student_05
+        else
+            /usr/local/sbin/lghs-check
+            systemctl is-active --quiet lghs-telemetry-push.service
+            [[ "$(systemctl is-active lghs-command-executor.service 2>/dev/null || true)" != "active" ]]
+        fi
     else
         validate_controller
     fi
@@ -227,8 +246,7 @@ if [[ "$PREVIOUS_COMMIT" != "unknown" ]]; then
             if [[ -x ./updater/lghs-0.5-install ]]; then
                 ./updater/lghs-0.5-install "$ROLE" || true
             elif [[ "$ROLE" == "student" ]]; then
-                systemctl disable --now lghs-command-executor.service >/dev/null 2>&1 || true
-                systemctl enable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
+                cleanup_legacy_student_services
             fi
             systemctl daemon-reload
             printf '%s\n' "$PREVIOUS_COMMIT" > "$STATE_DIR/current-commit"
