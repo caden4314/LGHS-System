@@ -36,6 +36,7 @@ ACTIVE_UPDATE_STATES = {
     'checking', 'queued', 'downloading', 'preparing', 'installing',
     'validating', 'cleaning', 'finishing', 'rolling_back', 'busy', 'rebooting',
 }
+TERMINAL_COMMAND_STATES = {'succeeded', 'failed', 'timed_out', 'rejected', 'canceled'}
 AUDIT_KINDS = ('sudo', 'audit', 'update', 'os-update')
 
 
@@ -249,6 +250,8 @@ def update_progress(rows: list[dict[str, Any]], status_blob: dict[str, Any]) -> 
     statuses = status_blob.get('updates', {}) if isinstance(status_blob, dict) else {}
     changed = False
     for row in rows:
+        if str(row.get('state') or '').lower() in TERMINAL_COMMAND_STATES:
+            continue
         status = statuses.get(row.get('action'), {})
         started = float(status.get('started_at') or 0)
         accepted = float(row.get('accepted_at') or 0)
