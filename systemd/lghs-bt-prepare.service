@@ -1,0 +1,16 @@
+[Unit]
+Description=LGHS Bluetooth Adapter Preparation
+After=bluetooth.service
+Requires=bluetooth.service
+Before=lghs-bt-provision.service lghs-bt-bootstrap.service
+ConditionPathExists=/etc/lghs/role
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lghs-bt-prepare
+RemainAfterExit=yes
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
