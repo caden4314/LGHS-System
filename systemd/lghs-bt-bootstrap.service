@@ -2,6 +2,7 @@
 Description=LGHS Bluetooth Wi-Fi Bootstrap Client
 After=bluetooth.service NetworkManager.service
 Wants=bluetooth.service NetworkManager.service
+PartOf=bluetooth.service
 ConditionPathExists=/etc/lghs/bluetooth-bootstrap-enabled
 ConditionPathExists=!/var/lib/lghs/bootstrap/wifi-provisioned.json
 
@@ -9,7 +10,7 @@ ConditionPathExists=!/var/lib/lghs/bootstrap/wifi-provisioned.json
 Type=simple
 ExecStart=/usr/local/sbin/lghs-bt-bootstrap
 Restart=on-failure
-RestartSec=15
+RestartSec=5
 User=root
 Group=root
 NoNewPrivileges=yes
