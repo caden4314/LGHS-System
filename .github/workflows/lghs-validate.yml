@@ -23,6 +23,8 @@ jobs:
             controller/lghs-fleet-notify \
             controller/lghsctl \
             controller/lghs-audit-sync \
+            controller/lghs-remote-admin \
+            controller/lghs-remote-shell \
             updater/lghs-netqueue \
             student/lghs-telemetry-push \
             student/lghs-sudo-broker \
@@ -42,6 +44,7 @@ jobs:
             updater/lghs-access-enforce \
             updater/lghs-install-success-notify \
             controller/lghsctl-wrapper \
+            controller/install-remote-admin \
             systemd/90-lghs-netqueue \
             student/lghs-enforce \
             student/lghs-check \
@@ -62,6 +65,7 @@ jobs:
         run: |
           sudo visudo -cf policies/sudoers/89-lghs-audit
           sudo visudo -cf policies/sudoers/90-lghs-student
+          sudo visudo -cf policies/sudoers/98-lghs-remote
           sudo visudo -cf policies/sudoers/99-lghs-admin
 
       - name: Release invariants
@@ -84,6 +88,10 @@ jobs:
           test -f systemd/lghs-reconcile.timer
           test -f systemd/lghs-netqueue.timer
           test -f systemd/lghs-install-success-notify.service
+          test -f docs/REMOTE-ADMIN.md
+          grep -q 'command="/usr/local/sbin/lghs-remote-shell"' controller/lghs-remote-admin
+          grep -q 'AuthenticationMethods publickey' controller/install-remote-admin
+          grep -q 'ProxyCommand cloudflared.exe access ssh --hostname %h' tools/windows-remote-admin/Install-LGHS-Remote.ps1
 
       - name: Fleet transport security invariants
         run: |
