@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import select
 import socket
 import struct
 import subprocess
@@ -16,8 +17,8 @@ from lghs_bt_protocol import (PROTOCOL_VERSION, decrypt_payload, derive_key,
                               transcript, verify_proof)
 
 CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
-SCAN_INTERVAL = float(os.environ.get("LGHS_BT_SCAN_INTERVAL", "15"))
-SCAN_SECONDS = int(os.environ.get("LGHS_BT_SCAN_SECONDS", "6"))
+DISCOVERY_TIMEOUT = float(os.environ.get("LGHS_BT_DISCOVERY_TIMEOUT", "12"))
+RETRY_BACKOFF = float(os.environ.get("LGHS_BT_RETRY_BACKOFF", "5"))
 ALIAS_PREFIX = "LGHS-PROVISION-"
 ENABLED = Path("/etc/lghs/bluetooth-bootstrap-enabled")
 STATE_DIR = Path("/var/lib/lghs/bootstrap")
@@ -36,9 +37,8 @@ def run(cmd, timeout=None):
 
 def set_app_authenticated_security(sock):
     # The LGHS protocol authenticates both endpoints with the per-device Fleet
-    # token and encrypts the payload with X25519/HKDF + AES-GCM. Keep the
-    # RFCOMM transport itself pairing-free so first-boot provisioning remains
-    # zero-touch instead of waiting on an interactive BlueZ pairing agent.
+    # token and encrypts the payload with X25519/HKDF + AES-GCM. BlueZ pairing
+    # is zero-touch and only establishes the underlying RFCOMM transport.
     sock.setsockopt(SOL_BLUETOOTH, BT_SECURITY, struct.pack("BB", BT_SECURITY_LOW, 0))
 
 
@@ -66,30 +66,14 @@ def fleet_token():
 def configure_adapter():
     run(["rfkill", "unblock", "bluetooth"])
     run(["bluetoothctl", "power", "on"])
+    # The default DisplayYesNo capability waits for an interactive SSP prompt
+    # on first connection. Fresh student images have no operator, so use Just
+    # Works at the link layer and retain LGHS mutual auth/encryption above it.
+    run(["btmgmt", "io-cap", "3"])
+    run(["btmgmt", "pairable", "on"])
 
 
-def discover_controller():
-    try:
-        inquiry = run(
-            ["timeout", str(SCAN_SECONDS), "btmgmt", "find", "-b"],
-            timeout=SCAN_SECONDS + 3,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-
-    current_mac = None
-    for raw in inquiry.stdout.splitlines():
-        line = raw.strip()
-        if "dev_found:" in line:
-            match = MAC_RE.search(line)
-            current_mac = match.group(1).upper() if match else None
-            continue
-        if current_mac and line.startswith("name "):
-            name = line[5:].strip()
-            if name.startswith(ALIAS_PREFIX):
-                return current_mac, name
-            current_mac = None
-
+def _cached_controller():
     devices = run(["bluetoothctl", "devices"])
     if devices.returncode == 0:
         for line in devices.stdout.splitlines():
@@ -97,6 +81,74 @@ def discover_controller():
             if len(parts) == 3 and parts[0] == "Device" and parts[2].startswith(ALIAS_PREFIX):
                 return parts[1].upper(), parts[2]
     return None
+
+
+def discover_controller(timeout=None):
+    """Wait for a matching BR/EDR discovery event instead of polling.
+
+    btmgmt stays in discovery mode and emits device/name events as they arrive.
+    The process is stopped immediately after a provisioning controller appears.
+    A timeout is used only by --dry-run so the diagnostic command can return;
+    the normal bootstrap service waits continuously for an event.
+    """
+    try:
+        proc = subprocess.Popen(
+            ["btmgmt", "find", "-b"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        return _cached_controller()
+
+    started = time.monotonic()
+    current_mac = None
+    try:
+        while True:
+            if timeout is not None:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    break
+                wait = min(1.0, remaining)
+            else:
+                wait = 1.0
+
+            if proc.stdout is None:
+                break
+            ready, _, _ = select.select([proc.stdout], [], [], wait)
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                continue
+
+            raw = proc.stdout.readline()
+            if not raw:
+                if proc.poll() is not None:
+                    break
+                continue
+            line = raw.strip()
+            if "dev_found:" in line:
+                match = MAC_RE.search(line)
+                current_mac = match.group(1).upper() if match else None
+                continue
+            if current_mac and line.startswith("name "):
+                name = line[5:].strip()
+                if name.startswith(ALIAS_PREFIX):
+                    return current_mac, name
+                current_mac = None
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+    return _cached_controller()
 
 
 def read_conf():
@@ -258,7 +310,7 @@ def main():
     configure_adapter()
     if dry_run:
         print("LGHS Bluetooth bootstrap dry-run: no NetworkManager changes will be made.", flush=True)
-        found = discover_controller()
+        found = discover_controller(timeout=DISCOVERY_TIMEOUT)
         if not found:
             print("Bluetooth bootstrap dry-run failed: no LGHS controller found", file=sys.stderr)
             return 1
@@ -270,19 +322,22 @@ def main():
             print(f"Bluetooth bootstrap dry-run failed: {exc}", file=sys.stderr, flush=True)
             return 1
 
-    print(f"LGHS Bluetooth bootstrap scanning every {SCAN_INTERVAL:g} seconds", flush=True)
+    print("LGHS Bluetooth bootstrap waiting for controller discovery events", flush=True)
     while not PROVISIONED.exists():
         found = discover_controller()
-        if found:
-            address, name = found
-            try:
-                print(f"Found {name}; attempting authenticated provisioning", flush=True)
-                if exchange(address):
-                    print("LGHS Bluetooth Wi-Fi bootstrap completed.", flush=True)
-                    return 0
-            except Exception as exc:
-                print(f"Bluetooth bootstrap attempt failed: {exc}", file=sys.stderr, flush=True)
-        time.sleep(SCAN_INTERVAL)
+        if not found:
+            print(f"Bluetooth discovery stopped; retrying in {RETRY_BACKOFF:g} seconds", file=sys.stderr, flush=True)
+            time.sleep(RETRY_BACKOFF)
+            continue
+        address, name = found
+        try:
+            print(f"Found {name}; attempting authenticated provisioning", flush=True)
+            if exchange(address):
+                print("LGHS Bluetooth Wi-Fi bootstrap completed.", flush=True)
+                return 0
+        except Exception as exc:
+            print(f"Bluetooth bootstrap attempt failed: {exc}", file=sys.stderr, flush=True)
+            time.sleep(RETRY_BACKOFF)
     return 0
 
 
