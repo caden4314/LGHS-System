@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 [[ "$ROLE" == controller || "$ROLE" == student ]] || { echo 'Usage: lghs-0.5-install <controller|student>' >&2; exit 2; }
 
-BT_PKGS=(bluez rfkill python3-cryptography network-manager)
+BT_PKGS=(bluez rfkill python3-cryptography network-manager util-linux)
 MISSING_PKGS=()
 for pkg in "${BT_PKGS[@]}"; do
   dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING_PKGS+=("$pkg")
