@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROLE="${1:-$(cat /etc/lghs/role 2>/dev/null || true)}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
+[[ "$ROLE" == controller || "$ROLE" == student ]] || { echo 'Usage: lghs-0.5-install <controller|student>' >&2; exit 2; }
+
+if [[ "$ROLE" == controller ]]; then
+  install -d -m 0755 /usr/local/lib/lghs-python/lghs
+  install -m 0644 "$ROOT/controller/lghs/__init__.py" /usr/local/lib/lghs-python/lghs/__init__.py
+  install -m 0644 "$ROOT/controller/lghs/protocol.py" /usr/local/lib/lghs-python/lghs/protocol.py
+  install -m 0644 "$ROOT/controller/lghs/database.py" /usr/local/lib/lghs-python/lghs/database.py
+  install -m 0644 "$ROOT/controller/lghs/audit.py" /usr/local/lib/lghs-python/lghs/audit.py
+  install -m 0644 "$ROOT/controller/lghs/sudo_state.py" /usr/local/lib/lghs-python/lghs/sudo_state.py
+  install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
+  install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
+  install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
+  install -m 0755 "$ROOT/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
+  /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
+  chmod 0640 /var/lib/lghs/db-migration-last.json
+  # Keep the historical timer enabled for updater compatibility. On 0.5 the
+  # sync command exits before SSH; explicit backfill requires
+  # LGHS_AUDIT_SSH_RECOVERY=1.
+  systemctl enable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
+  systemctl try-restart lghs-fleet-api.service || true
+  echo 'LGHS 0.5 controller SQLite/HTTPS foundation installed.'
+  exit 0
+fi
+
+getent group lghs-agent >/dev/null 2>&1 || groupadd --system lghs-agent
+if ! id lghs-agent >/dev/null 2>&1; then
+  useradd --system --gid lghs-agent --home-dir /var/lib/lghs-agent --shell /usr/sbin/nologin lghs-agent
+fi
+install -d -o lghs-agent -g lghs-agent -m 0700 /var/lib/lghs-agent
+install -m 0755 "$ROOT/student/lghs-agent" /usr/local/sbin/lghs-agent
+install -m 0750 "$ROOT/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
+install -m 0755 "$ROOT/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
+install -m 0644 "$ROOT/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
+install -m 0644 "$ROOT/systemd/lghs-command-executor.service" /etc/systemd/system/lghs-command-executor.service
+install -m 0644 "$ROOT/systemd/lghs-discovery-advertise.service" /etc/systemd/system/lghs-discovery-advertise.service
+if [[ -s /etc/lghs/secrets/fleet-api-token ]]; then
+  install -o lghs-agent -g lghs-agent -m 0400 /etc/lghs/secrets/fleet-api-token /var/lib/lghs-agent/fleet-api-token
+fi
+if [[ -s /etc/lghs/fleet-api.conf ]]; then
+  install -o lghs-agent -g lghs-agent -m 0400 /etc/lghs/fleet-api.conf /var/lib/lghs-agent/fleet-api.conf
+fi
+printf '%s\n' "$(cat "$ROOT/VERSION")" > /var/lib/lghs-agent/version
+chown lghs-agent:lghs-agent /var/lib/lghs-agent/version
+chmod 0400 /var/lib/lghs-agent/version
+systemctl daemon-reload
+systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
+systemctl enable --now lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service
+sleep 1
+systemctl is-active --quiet lghs-command-executor.service
+systemctl is-active --quiet lghs-agent.service
+systemctl is-active --quiet lghs-discovery-advertise.service
+echo 'LGHS 0.5 unprivileged student agent installed.'

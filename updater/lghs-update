@@ -121,6 +121,9 @@ if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
         write_status "validating" "Reconciling current install" 85 "LGHS is already current"
         /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true
     fi
+    if [[ -x ./updater/lghs-0.5-install ]]; then
+        ./updater/lghs-0.5-install "$ROLE"
+    fi
     write_status "complete" "LGHS is current" 100 "Already at ${TARGET_COMMIT:0:12}"
     echo "LGHS is already current at ${TARGET_COMMIT:0:12}."
     exit 0
@@ -133,33 +136,71 @@ write_status "preparing" "Preparing new revision" 35 "${PREVIOUS_COMMIT:0:12} ->
 echo "LGHS updater: ${PREVIOUS_COMMIT:0:12} -> ${TARGET_COMMIT:0:12}"
 git reset --hard "$TARGET_COMMIT"
 printf '%s\n' "$TARGET_COMMIT" > .lghs-source-commit
-chmod 0755 install.sh updater/lghs-update 2>/dev/null || true
+chmod 0755 install.sh updater/lghs-update updater/lghs-0.5-install 2>/dev/null || true
 
 validate_controller() {
     [[ "$(cat /etc/lghs/role)" == "controller" ]]
     /usr/local/sbin/lghsctl --help >/dev/null
     python3 -m py_compile \
         /usr/local/sbin/lghs-console \
+        /usr/local/sbin/lghs-fleet-api \
+        /usr/local/sbin/lghs-fleet-command \
         /usr/local/sbin/lghs-fleet-notify \
         /usr/local/sbin/lghs-audit-sync \
         /usr/local/libexec/lghs-console-base \
-        /usr/local/libexec/lghsctl-real
+        /usr/local/libexec/lghsctl-real \
+        /usr/local/lib/lghs-python/lghs/database.py \
+        /usr/local/lib/lghs-python/lghs/protocol.py
     systemctl is-active --quiet lghs-update.timer
     systemctl is-active --quiet lghs-reconcile.timer
     systemctl is-active --quiet lghs-audit-sync.timer
     systemctl is-active --quiet lghs-fleet-notify.service
+    systemctl is-active --quiet lghs-fleet-api.service
+    [[ -s /var/lib/lghs/fleet.db ]]
     [[ -s /etc/lghs/secrets/controller_ed25519 ]]
     [[ "$(stat -c %a /etc/lghs/secrets/controller_ed25519 2>/dev/null)" == "600" ]]
+}
+
+validate_student_05() {
+    /usr/local/sbin/lghs-check
+    systemctl is-active --quiet lghs-command-executor.service
+    systemctl is-active --quiet lghs-agent.service
+    [[ "$(systemctl is-active lghs-telemetry-push.service 2>/dev/null || true)" != "active" ]]
+    [[ -S /run/lghs-command-executor/socket ]]
+    [[ -s /var/lib/lghs-agent/fleet-api-token ]]
+}
+
+cleanup_legacy_student_services() {
+    [[ "$ROLE" == "student" ]] || return 0
+    systemctl disable --now lghs-command-executor.service >/dev/null 2>&1 || true
+    systemctl disable --now lghs-discovery-advertise.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/multi-user.target.wants/lghs-command-executor.service
+    rm -f /etc/systemd/system/multi-user.target.wants/lghs-discovery-advertise.service
+    systemctl daemon-reload
+    systemctl enable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
 }
 
 apply_install() {
     write_status "installing" "Applying LGHS configuration" 55 "Running install.sh for $ROLE"
     /bin/bash ./install.sh "$ROLE"
+    if [[ -x ./updater/lghs-0.5-install ]]; then
+        write_status "installing" "Installing 0.5 state/agent layer" 68 "Applying staged 0.5 architecture"
+        ./updater/lghs-0.5-install "$ROLE"
+    elif [[ "$ROLE" == "student" ]]; then
+        write_status "installing" "Removing 0.5-only services" 68 "Restoring legacy telemetry for downgrade"
+        cleanup_legacy_student_services
+    fi
     write_status "installing" "Reloading services" 75 "Refreshing systemd units"
     systemctl daemon-reload
     write_status "validating" "Validating installation" 88 "Running post-update checks"
     if [[ "$ROLE" == "student" ]]; then
-        /usr/local/sbin/lghs-check
+        if [[ -x ./updater/lghs-0.5-install ]]; then
+            validate_student_05
+        else
+            /usr/local/sbin/lghs-check
+            systemctl is-active --quiet lghs-telemetry-push.service
+            [[ "$(systemctl is-active lghs-command-executor.service 2>/dev/null || true)" != "active" ]]
+        fi
     else
         validate_controller
     fi
@@ -202,6 +243,11 @@ if [[ "$PREVIOUS_COMMIT" != "unknown" ]]; then
         chmod 0755 install.sh updater/lghs-update 2>/dev/null || true
         write_status "rolling_back" "Re-applying previous configuration" 84 "Running previous install.sh"
         if /bin/bash ./install.sh "$ROLE"; then
+            if [[ -x ./updater/lghs-0.5-install ]]; then
+                ./updater/lghs-0.5-install "$ROLE" || true
+            elif [[ "$ROLE" == "student" ]]; then
+                cleanup_legacy_student_services
+            fi
             systemctl daemon-reload
             printf '%s\n' "$PREVIOUS_COMMIT" > "$STATE_DIR/current-commit"
             printf '%s\n' "$PREVIOUS_COMMIT" > /etc/lghs/source-commit

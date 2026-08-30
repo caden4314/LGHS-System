@@ -14,6 +14,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Shellcheck
         run: |
-          shellcheck install.sh student/lghs-enforce student/lghs-check student/lghs-agent updater/lghs-update
+          shellcheck install.sh student/lghs-enforce student/lghs-check updater/lghs-update updater/lghs-0.5-install
       - name: Python syntax
-        run: python3 -m py_compile controller/lghsctl
+        run: |
+          python3 -m py_compile \
+            controller/lghsctl \
+            controller/lghs-fleet-api \
+            controller/lghs-fleet-command \
+            student/lghs-agent \
+            student/lghs-command-executor

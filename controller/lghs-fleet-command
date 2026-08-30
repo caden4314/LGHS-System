@@ -1,141 +1,39 @@
 #!/usr/bin/env python3
-"""Queue allowlisted fleet maintenance commands for HTTPS delivery.
-
-This tool never connects to a student Pi. It writes a controller-local command
-queue consumed by lghs-fleet-api; the student receives work in the response to
-its normal outbound HTTPS telemetry POST.
-"""
-import argparse
-import fcntl
-import json
-import os
-import tempfile
-import time
-import uuid
-from contextlib import contextmanager
+"""Canonical LGHS 0.5 controller command writer backed by SQLite."""
+import argparse,json,os,sys,time
 from pathlib import Path
+sys.path.insert(0,'/usr/local/lib/lghs-python')
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from lghs.database import FleetDB
+from lghs.protocol import ALLOWED_COMMANDS,normalize_device_id
 
-COMMANDS = Path("/var/lib/lghs/fleet-commands.json")
-COMMAND_LOCK = Path("/run/lock/lghs-fleet-commands.lock")
-REGISTRY = Path("/etc/lghs/fleet.json")
-ALLOWED = {"lghs-update", "os-update"}
-OPEN_STATES = {"queued", "delivered", "received", "accepted", "running"}
-
-
-def load_json(path, default):
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else default
-    except Exception:
-        return default
-
-
-def atomic_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-
-
-@contextmanager
-def command_file_lock():
-    COMMAND_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with COMMAND_LOCK.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
+REGISTRY=Path('/etc/lghs/fleet.json'); DB=FleetDB()
 
 def known_devices():
-    data = load_json(REGISTRY, {})
-    devices = data.get("devices", {}) if isinstance(data, dict) else {}
-    return {str(x).upper() for x in devices} if isinstance(devices, dict) else set()
+    try:data=json.loads(REGISTRY.read_text(encoding='utf-8'))
+    except Exception:return set()
+    d=data.get('devices',{}) if isinstance(data,dict) else {}; return {str(x).upper() for x in d} if isinstance(d,dict) else set()
 
-
-def enqueue(device, action):
-    device = device.upper()
-    if action not in ALLOWED:
-        raise SystemExit("Unsupported command")
-    known = known_devices()
-    if known and device not in known:
-        raise SystemExit(f"Unknown fleet device: {device}")
-    with command_file_lock():
-        data = load_json(COMMANDS, {"version": 2, "devices": {}})
-        data["version"] = 2
-        devices = data.setdefault("devices", {})
-        rows = devices.setdefault(device, [])
-        for row in rows:
-            if isinstance(row, dict) and row.get("action") == action and str(row.get("state", "queued")) in OPEN_STATES:
-                print(row.get("id"))
-                return
-        now = time.time()
-        row = {
-            "id": uuid.uuid4().hex,
-            "device": device,
-            "action": action,
-            "state": "queued",
-            "created_at": now,
-            "queued_at": now,
-            "updated_at": now,
-            "progress": 0,
-            "stage": "Waiting for device telemetry",
-            "message": "Queued on controller for HTTPS delivery",
-        }
-        rows.append(row)
-        devices[device] = rows[-64:]
-        data["updated_at"] = now
-        atomic_json(COMMANDS, data)
-    print(row["id"])
-
+def enqueue(device,action,payload=None,deadline=None):
+    d=normalize_device_id(device); known=known_devices()
+    if known and d not in known: raise SystemExit(f'Unknown fleet device: {d}')
+    DB.initialize(); cid=DB.create_command(d,action,payload=payload or {},deadline_at=deadline); DB.export_legacy_commands(); print(cid)
 
 def show(device=None):
-    with command_file_lock():
-        data = load_json(COMMANDS, {"version": 2, "devices": {}})
-    if device:
-        rows = data.get("devices", {}).get(device.upper(), [])
-        print(json.dumps(rows, indent=2, sort_keys=True))
-    else:
-        print(json.dumps(data, indent=2, sort_keys=True))
-
+    DB.initialize(); rows=DB.list_commands(device,64); print(json.dumps(rows,indent=2,sort_keys=True))
 
 def main():
-    if os.geteuid() != 0:
-        raise SystemExit("Run as root")
-    parser = argparse.ArgumentParser(description="Queue an HTTPS fleet update command")
-    sub = parser.add_subparsers(dest="cmd")
-    q = sub.add_parser("enqueue")
-    q.add_argument("device")
-    q.add_argument("action", choices=sorted(ALLOWED))
-    s = sub.add_parser("status")
-    s.add_argument("device", nargs="?")
-    # Backward-compatible two-argument form: lghs-fleet-command DEVICE ACTION
-    parser.add_argument("legacy", nargs="*")
-    args = parser.parse_args()
-    if args.cmd == "enqueue":
-        enqueue(args.device, args.action)
-        return
-    if args.cmd == "status":
-        show(args.device)
-        return
-    if len(args.legacy) == 2:
-        enqueue(args.legacy[0], args.legacy[1])
-        return
-    parser.print_help()
-    raise SystemExit(2)
-
-
-if __name__ == "__main__":
-    main()
+    if os.geteuid()!=0: raise SystemExit('Run as root')
+    p=argparse.ArgumentParser(description='LGHS SQLite-backed fleet command manager'); s=p.add_subparsers(dest='cmd')
+    q=s.add_parser('enqueue'); q.add_argument('device'); q.add_argument('action',choices=sorted(ALLOWED_COMMANDS)); q.add_argument('--payload-json',default='{}'); q.add_argument('--timeout',type=float,default=86400)
+    st=s.add_parser('status'); st.add_argument('device',nargs='?')
+    c=s.add_parser('cancel'); c.add_argument('command_id')
+    args=p.parse_args()
+    if args.cmd=='enqueue':
+        try: payload=json.loads(args.payload_json)
+        except Exception: raise SystemExit('Invalid --payload-json')
+        enqueue(args.device,args.action,payload,time.time()+max(1,args.timeout)); return
+    if args.cmd=='status': show(args.device); return
+    if args.cmd=='cancel': DB.initialize(); DB.transition_command(args.command_id,'canceled',stage='Canceled by administrator',message='Command canceled before completion'); DB.export_legacy_commands(); print(args.command_id); return
+    p.print_help(); raise SystemExit(2)
+if __name__=='__main__':main()

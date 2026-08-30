@@ -8,7 +8,7 @@ import time
 
 REAL_SUDO = '/usr/bin/sudo'
 STUDENT = 'lg_cs_cont'
-POLL_SECONDS = 0.35
+BROKER_WAIT_SECONDS = 600
 
 
 def run(cmd, env=None):
@@ -22,6 +22,28 @@ def broker(action, rid=None, extra=None):
     if extra:
         cmd += list(extra)
     return run(cmd, env=dict(os.environ))
+
+
+def broker_waiter(rid):
+    return subprocess.Popen(
+        [REAL_SUDO, '-n', '/usr/local/sbin/lghs-sudo-broker', 'wait', rid, str(BROKER_WAIT_SECONDS)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(os.environ),
+    )
+
+
+def waiter_state(waiter):
+    if waiter.poll() is None:
+        return None
+    stdout, _ = waiter.communicate()
+    if waiter.returncode != 0:
+        return 'unknown'
+    try:
+        return json.loads(stdout).get('status')
+    except Exception:
+        return 'unknown'
 
 
 def submit_request(argv):
@@ -74,8 +96,6 @@ def managed_sudo(argv):
     print(f'LGHS sudo request {rid[:8]} submitted automatically.')
     print(f'Command: {shlex.join(argv)}')
 
-    # Non-interactive callers cannot safely answer a password prompt, so they
-    # still get an automatic Fleet request and simply wait for approval.
     interactive = sys.stdin.isatty() and sys.stderr.isatty()
     local = None
     if interactive:
@@ -91,11 +111,12 @@ def managed_sudo(argv):
         print('Waiting for teacher approval from the Fleet console...')
         audit_event(rid, 'waiting_for_fleet')
 
+    waiter = broker_waiter(rid)
     password_prompt_finished_logged = False
 
     try:
         while True:
-            state = request_status(rid)
+            state = waiter_state(waiter)
             local_rc = local.poll() if local is not None else None
 
             if state == 'approved':
@@ -118,9 +139,6 @@ def managed_sudo(argv):
                 print('\nLGHS sudo request cancelled.', file=sys.stderr)
                 return 130
 
-            # A successful Root-password entry atomically changes the request
-            # out of pending before executing. It therefore disappears from the
-            # Fleet approval queue immediately and the local helper owns the run.
             if state in ('local_authorized', 'executing'):
                 return local.wait() if local is not None else 126
 
@@ -129,7 +147,12 @@ def managed_sudo(argv):
                     return local.wait() if local_rc is None else local_rc
                 return 0
 
-            if local is not None and local_rc is not None and state == 'pending':
+            if state == 'unknown':
+                stop_child(local)
+                print('\nLGHS sudo approval watcher failed.', file=sys.stderr)
+                return 125
+
+            if local is not None and local_rc is not None:
                 if not password_prompt_finished_logged:
                     audit_event(rid, 'password_prompt_ended')
                     password_prompt_finished_logged = True
@@ -137,17 +160,19 @@ def managed_sudo(argv):
                 local = None
                 audit_event(rid, 'waiting_for_fleet')
 
-            time.sleep(POLL_SECONDS)
+            time.sleep(0.10)
 
     except KeyboardInterrupt:
         stop_child(local)
+        stop_child(waiter)
         state = request_status(rid)
         if state == 'pending':
             audit_event(rid, 'requester_cancelled_wait')
             cancel_request(rid)
         print('\nLGHS sudo cancelled.')
         return 130
-
+    finally:
+        stop_child(waiter)
 
 
 def main():
@@ -160,8 +185,6 @@ def main():
         print('LGHS managed sudo: enter a command, for example: sudo apt install python3-numpy')
         return 1
 
-    # Keep option parsing deliberately narrow so an option cannot bypass the
-    # approval wrapper. Commands themselves and their arguments are preserved.
     if argv[0].startswith('-'):
         print('LGHS managed sudo requires a command as the first argument.', file=sys.stderr)
         return 2

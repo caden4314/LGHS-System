@@ -3,7 +3,6 @@ set -euo pipefail
 
 REBOOT=0
 [[ "${1:-}" == "--reboot" ]] && REBOOT=1
-
 ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
 DEVICE_ID="$(sed -n 's/^DEVICE_ID=//p' /etc/lghs/device.conf 2>/dev/null | head -n1)"
 [[ -n "$DEVICE_ID" ]] || DEVICE_ID="$(hostname)"
@@ -15,159 +14,122 @@ LOG=/var/log/lghs-os-update.log
 NETQUEUE=/usr/local/sbin/lghs-netqueue
 STARTED_AT="$(date +%s)"
 PACKAGES_TOTAL=0
+ERROR_CODE=""
 
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 [[ "$ROLE" == "student" || "$ROLE" == "controller" ]] || { echo 'Invalid LGHS role' >&2; exit 1; }
 install -d -m 0755 "$STATE_DIR"
 
 write_status() {
-    local state="$1" stage="$2" progress="$3" message="${4:-}" reboot_required="${5:-no}" package="${6:-}" package_percent="${7:-}"
-    python3 - "$STATUS_FILE" "$state" "$stage" "$progress" "$message" "$STARTED_AT" "$PACKAGES_TOTAL" "$reboot_required" "$package" "$package_percent" <<'PY'
+    local state="$1" stage="$2" progress="$3" message="${4:-}" reboot_required="${5:-no}" package="${6:-}" package_percent="${7:-}" error_code="${8:-$ERROR_CODE}"
+    python3 - "$STATUS_FILE" "$state" "$stage" "$progress" "$message" "$STARTED_AT" "$PACKAGES_TOTAL" "$reboot_required" "$package" "$package_percent" "$error_code" <<'PY'
 import json, os, sys, time
 from pathlib import Path
-path = Path(sys.argv[1])
-state, stage, progress, message = sys.argv[2:6]
-started_at = float(sys.argv[6])
+path = Path(sys.argv[1]); state, stage, progress, message = sys.argv[2:6]; started_at = float(sys.argv[6])
 try: total = int(sys.argv[7])
 except Exception: total = 0
-reboot_required, package, package_percent = sys.argv[8:11]
+reboot_required, package, package_percent, error_code = sys.argv[8:12]
 try: progress_value = int(float(progress))
 except Exception: progress_value = None
 try: package_progress = float(package_percent) if package_percent else None
 except Exception: package_progress = None
-payload = {
-    "kind": "os",
-    "state": state,
-    "stage": stage,
-    "progress": progress_value,
-    "message": message,
-    "started_at": started_at,
-    "updated_at": time.time(),
-    "packages_total": total,
-    "current_package": package,
-    "package_progress": package_progress,
-    "reboot_required": reboot_required,
-}
-path.parent.mkdir(parents=True, exist_ok=True)
-tmp = path.with_suffix(path.suffix + ".tmp")
-tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-os.chmod(tmp, 0o640)
-os.replace(tmp, path)
+payload = {"kind":"os","state":state,"stage":stage,"progress":progress_value,"message":message,"started_at":started_at,"updated_at":time.time(),"packages_total":total,"current_package":package,"package_progress":package_progress,"reboot_required":reboot_required,"error_code":error_code or None}
+path.parent.mkdir(parents=True, exist_ok=True); tmp = path.with_suffix(path.suffix + ".tmp"); tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8"); os.chmod(tmp, 0o640); os.replace(tmp, path)
 PY
+}
+
+fail_terminal() { ERROR_CODE="$1"; write_status "failed" "$2" 100 "$3" no "" "" "$1"; echo "LGHS OS updater: $1: $3" >&2; exit "${4:-1}"; }
+queue_for_network() {
+    local reason="$1"; ERROR_CODE=NETWORK_RETRY; echo "LGHS OS updater: $reason"; write_status "queued" "Waiting for network" 0 "$reason" no "" "" NETWORK_RETRY
+    if [[ "${LGHS_NETQUEUE_RUNNING:-0}" == "1" ]]; then return 75; fi
+    if [[ -x "$NETQUEUE" ]]; then
+        if [[ $REBOOT -eq 1 ]]; then "$NETQUEUE" enqueue os-update --reboot >/dev/null; else "$NETQUEUE" enqueue os-update >/dev/null; fi
+        echo 'LGHS OS updater: network work queued persistently.'; return 0
+    fi
+    return 75
+}
+classify_apt_failure() {
+    local file="$1"
+    if grep -Eqi 'Could not resolve|Temporary failure resolving|Failed to fetch|Connection failed|Connection timed out|Network is unreachable|TLS.*failed' "$file"; then echo NETWORK_RETRY
+    elif grep -Eqi 'Could not get lock|Unable to acquire the dpkg frontend lock|is another process using it' "$file"; then echo APT_LOCKED
+    elif grep -Eqi 'No space left on device|not enough free space' "$file"; then echo DISK_FULL
+    elif grep -Eqi 'dpkg was interrupted|dpkg --configure -a|package is in a very bad inconsistent state' "$file"; then echo DPKG_BROKEN
+    elif grep -Eqi 'unmet dependencies|held broken packages|dependency problems prevent configuration' "$file"; then echo DEPENDENCY_FAILURE
+    else echo APT_FAILURE; fi
 }
 
 write_status "checking" "Starting Raspberry Pi OS update" 2 "Preparing package updater"
 exec 9>"$LOCK"
-if ! flock -n 9; then
-    write_status "busy" "OS update already running" 0 "Another OS update process owns the lock"
-    echo 'An LGHS OS update is already running.'
-    exit 0
-fi
+if ! flock -n 9; then ERROR_CODE=APT_LOCKED; write_status "busy" "OS update already running" 0 "Another OS update process owns the lock" no "" "" APT_LOCKED; echo 'An LGHS OS update is already running.'; exit 0; fi
 
-queue_for_network() {
-    local reason="$1"
-    echo "LGHS OS updater: $reason"
-    write_status "queued" "Waiting for network" 0 "$reason"
-    if [[ "${LGHS_NETQUEUE_RUNNING:-0}" == "1" ]]; then return 75; fi
-    if [[ -x "$NETQUEUE" ]]; then
-        if [[ $REBOOT -eq 1 ]]; then
-            "$NETQUEUE" enqueue os-update --reboot >/dev/null
-        else
-            "$NETQUEUE" enqueue os-update >/dev/null
-        fi
-        echo 'LGHS OS updater: network work queued persistently.'
-        return 0
-    fi
-    return 75
-}
+# Preflight: refuse package mutation when local package state or disk capacity is already unhealthy.
+write_status "checking" "Running OS update preflight" 5 "Checking package database and free space"
+ROOT_FREE="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+BOOT_PATH=/boot/firmware; [[ -d "$BOOT_PATH" ]] || BOOT_PATH=/boot
+BOOT_FREE="$(df -B1 --output=avail "$BOOT_PATH" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)"
+if [[ "$ROOT_FREE" =~ ^[0-9]+$ ]] && (( ROOT_FREE < 1073741824 )); then fail_terminal DISK_FULL "OS update preflight failed" "At least 1 GiB free on / is required before a managed OS update." 30; fi
+if [[ "$BOOT_FREE" =~ ^[0-9]+$ ]] && (( BOOT_FREE > 0 && BOOT_FREE < 134217728 )); then fail_terminal DISK_FULL "OS update preflight failed" "At least 128 MiB free on $BOOT_PATH is required before a managed OS update." 30; fi
+DPKG_AUDIT="$(dpkg --audit 2>&1 || true)"
+if [[ -n "$DPKG_AUDIT" ]]; then fail_terminal DPKG_BROKEN "OS update preflight failed" "dpkg reports unfinished or inconsistent package state; repair it before retrying." 31; fi
 
-before="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")"
-export DEBIAN_FRONTEND=noninteractive
+before="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")"; export DEBIAN_FRONTEND=noninteractive
+APT_ERR="$(mktemp /run/lghs-apt-error.XXXXXX)"; APT_PROGRESS_FILE="$(mktemp /run/lghs-apt-progress.XXXXXX)"
+cleanup() { rm -f "$APT_ERR" "$APT_PROGRESS_FILE"; }; trap cleanup EXIT
 
 write_status "checking" "Refreshing package indexes" 8 "Running apt-get update"
-if ! apt-get update -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 -o Acquire::Retries=0; then
-    if queue_for_network 'APT repositories are currently unreachable; deferring OS update.'; then exit 0; else exit 75; fi
+set +e
+apt-get update -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 -o Acquire::Retries=0 2> >(tee "$APT_ERR" >&2)
+UPDATE_RC=$?
+set -e
+if (( UPDATE_RC != 0 )); then
+    CODE="$(classify_apt_failure "$APT_ERR")"
+    if [[ "$CODE" == NETWORK_RETRY ]]; then if queue_for_network 'APT repositories are currently unreachable; deferring OS update.'; then exit 0; else exit 75; fi; fi
+    case "$CODE" in
+      APT_LOCKED) fail_terminal APT_LOCKED "Package manager busy" "Another package manager owns the APT/dpkg lock." 32;;
+      DISK_FULL) fail_terminal DISK_FULL "Package index update failed" "The filesystem ran out of space while refreshing package indexes." 33;;
+      DPKG_BROKEN) fail_terminal DPKG_BROKEN "Package database requires repair" "dpkg is interrupted or inconsistent." 34;;
+      DEPENDENCY_FAILURE) fail_terminal DEPENDENCY_FAILURE "Package dependency failure" "APT reported broken or unmet dependencies." 35;;
+      *) fail_terminal APT_FAILURE "Package index update failed" "apt-get update failed with exit $UPDATE_RC; inspect the OS update log." 36;;
+    esac
 fi
 
 write_status "preparing" "Calculating package plan" 18 "Counting packages to upgrade"
 PACKAGES_TOTAL="$(apt-get -s full-upgrade 2>/dev/null | awk '/^Inst /{n++} END{print n+0}')"
 write_status "preparing" "Package plan ready" 24 "$PACKAGES_TOTAL package(s) scheduled"
-
-started="$(date -u +%FT%TZ)"
-printf '%s %s OS update started: %s\n' "$started" "$DEVICE_ID" "$before" >> "$LOG"
-chmod 0640 "$LOG" || true
-chown root:adm "$LOG" 2>/dev/null || true
-
-# APT exposes machine-readable progress through Status-Fd. Map its 0-100 range
-# into the install portion of the overall update so Fleet Control can show real
-# package progress without scraping terminal formatting.
-APT_PROGRESS_FILE="$(mktemp /run/lghs-apt-progress.XXXXXX)"
-cleanup_progress() { rm -f "$APT_PROGRESS_FILE"; }
-trap cleanup_progress EXIT
+started="$(date -u +%FT%TZ)"; printf '%s %s OS update started: %s\n' "$started" "$DEVICE_ID" "$before" >> "$LOG"; chmod 0640 "$LOG" || true; chown root:adm "$LOG" 2>/dev/null || true
 
 progress_reader() {
     local line type package percent message overall last=-1
     while IFS= read -r line; do
-        IFS=':' read -r type package percent message <<<"$line"
-        [[ "$type" == "pmstatus" || "$type" == "dlstatus" ]] || continue
-        percent="${percent%%.*}"
-        [[ "$percent" =~ ^[0-9]+$ ]] || continue
-        overall=$((30 + (percent * 50 / 100)))
-        if (( overall != last )); then
-            last=$overall
-            write_status "installing" "Installing packages" "$overall" "${message:-$package}" no "$package" "$percent"
-        fi
+        IFS=':' read -r type package percent message <<<"$line"; [[ "$type" == "pmstatus" || "$type" == "dlstatus" ]] || continue; percent="${percent%%.*}"; [[ "$percent" =~ ^[0-9]+$ ]] || continue; overall=$((30 + (percent * 50 / 100)))
+        if (( overall != last )); then last=$overall; write_status "installing" "Installing packages" "$overall" "${message:-$package}" no "$package" "$percent"; fi
     done
 }
 
+: >"$APT_ERR"
 write_status "installing" "Installing packages" 30 "$PACKAGES_TOTAL package(s) in plan"
 set +e
-apt-get full-upgrade -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    -o Acquire::http::Timeout=8 \
-    -o Acquire::https::Timeout=8 \
-    -o Acquire::Retries=1 \
-    -o APT::Status-Fd=3 \
-    3> >(progress_reader)
+apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 -o Acquire::Retries=1 -o APT::Status-Fd=3 3> >(progress_reader) 2> >(tee "$APT_ERR" >&2)
 APT_RC=$?
 set -e
 if (( APT_RC != 0 )); then
-    if queue_for_network 'OS package download/upgrade was interrupted; retrying later.'; then exit 0; else exit 75; fi
+    CODE="$(classify_apt_failure "$APT_ERR")"
+    if [[ "$CODE" == NETWORK_RETRY ]]; then if queue_for_network 'OS package download/upgrade was interrupted; retrying later.'; then exit 0; else exit 75; fi; fi
+    case "$CODE" in
+      APT_LOCKED) fail_terminal APT_LOCKED "Package manager busy" "Another package manager acquired the APT/dpkg lock during the update." 42;;
+      DISK_FULL) fail_terminal DISK_FULL "OS update ran out of disk space" "Free disk space and repair any interrupted package state before retrying." 43;;
+      DPKG_BROKEN) fail_terminal DPKG_BROKEN "dpkg configuration failed" "Package configuration is incomplete and requires repair." 44;;
+      DEPENDENCY_FAILURE) fail_terminal DEPENDENCY_FAILURE "Package dependency failure" "APT could not satisfy package dependencies." 45;;
+      *) fail_terminal APT_FAILURE "OS package installation failed" "apt-get full-upgrade failed with exit $APT_RC; inspect the OS update log." 46;;
+    esac
 fi
 
-write_status "cleaning" "Cleaning package cache" 84 "Running apt-get clean"
-apt-get clean
-
+write_status "cleaning" "Cleaning package cache" 84 "Running apt-get clean"; apt-get clean
 write_status "installing" "Re-applying LGHS configuration" 90 "Restoring managed configuration after package upgrade"
-if [[ -x "$CHECKOUT/install.sh" ]]; then
-    /bin/bash "$CHECKOUT/install.sh" "$ROLE"
-elif [[ -x /usr/local/sbin/lghs-update ]]; then
-    /usr/local/sbin/lghs-update || true
-fi
+if [[ -x "$CHECKOUT/install.sh" ]]; then /bin/bash "$CHECKOUT/install.sh" "$ROLE"; elif [[ -x /usr/local/sbin/lghs-update ]]; then /usr/local/sbin/lghs-update || true; fi
+if [[ "$ROLE" == "student" && -x /usr/local/sbin/lghs-check ]]; then write_status "validating" "Validating LGHS after OS update" 96 "Running lghs-check"; /usr/local/sbin/lghs-check; fi
 
-if [[ "$ROLE" == "student" && -x /usr/local/sbin/lghs-check ]]; then
-    write_status "validating" "Validating LGHS after OS update" 96 "Running lghs-check"
-    /usr/local/sbin/lghs-check
-fi
-
-after="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")"
-finished="$(date -u +%FT%TZ)"
-printf '%s %s Raspberry Pi OS updated: %s -> %s\n' "$finished" "$DEVICE_ID" "$before" "$after" >> "$LOG"
-logger -t LGHS-OS-UPDATE "$DEVICE_ID Raspberry Pi OS update completed"
-sync
-
+after="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")"; finished="$(date -u +%FT%TZ)"; printf '%s %s Raspberry Pi OS updated: %s -> %s\n' "$finished" "$DEVICE_ID" "$before" "$after" >> "$LOG"; logger -t LGHS-OS-UPDATE "$DEVICE_ID Raspberry Pi OS update completed"; sync
 echo "Raspberry Pi OS update completed for $DEVICE_ID."
-if [[ -f /run/reboot-required ]]; then
-    write_status "reboot_required" "Update complete; reboot required" 100 "Raspberry Pi OS packages are installed" yes
-    echo 'reboot_required=yes'
-else
-    write_status "complete" "Raspberry Pi OS update complete" 100 "No reboot requirement detected" no
-    echo 'reboot_required=no'
-fi
-
-if [[ $REBOOT -eq 1 ]]; then
-    write_status "rebooting" "Rebooting Pi" 100 "Restart requested after OS update" yes
-    sync
-    systemctl reboot
-fi
+if [[ -f /run/reboot-required ]]; then write_status "reboot_required" "Update complete; reboot required" 100 "Raspberry Pi OS packages are installed" yes; echo 'reboot_required=yes'; else write_status "complete" "Raspberry Pi OS update complete" 100 "No reboot requirement detected" no; echo 'reboot_required=no'; fi
+if [[ $REBOOT -eq 1 ]]; then write_status "rebooting" "Rebooting Pi" 100 "Restart requested after OS update" yes; sync; systemctl reboot; fi

@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Tiny privileged executor for typed LGHS 0.5 agent operations."""
+from __future__ import annotations
+
+import grp
+import json
+import os
+import shutil
+import socket
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+SOCK = Path('/run/lghs-command-executor/socket')
+NETQUEUE = '/usr/local/sbin/lghs-netqueue'
+SEEN = Path('/var/lib/lghs/executor-seen.json')
+SUDO_DIR = Path('/var/lib/lghs/sudo-requests')
+ACTIONS = {
+    'lghs-update': [NETQUEUE, 'enqueue', 'local-update'],
+    'os-update': [NETQUEUE, 'enqueue', 'os-update'],
+}
+STATUS = {
+    'lghs-update': Path('/var/lib/lghs/update/lghs-status.json'),
+    'os-update': Path('/var/lib/lghs/update/os-status.json'),
+}
+AUDIT = {
+    'sudo': Path('/var/log/sudo.log'),
+    'audit': Path('/var/log/lghs-sudo-audit.jsonl'),
+    'update': Path('/var/log/lghs-update.log'),
+    'os-update': Path('/var/log/lghs-os-update.log'),
+}
+SERVICES = (
+    'NetworkManager.service', 'ssh.service', 'lghs-policy.service',
+    'lghs-update.timer', 'lghs-reconcile.timer', 'lghs-netqueue.timer',
+    'lghs-agent.service', 'lghs-command-executor.service',
+)
+SUDO_FIELDS = (
+    'id', 'device_id', 'requester', 'command', 'argv', 'cwd', 'requested_at',
+    'requested_epoch', 'expires_epoch', 'status', 'resolved_at',
+    'approved_by', 'denied_by', 'authorization',
+)
+
+
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return default
+
+
+def save_seen(value: dict[str, float]) -> None:
+    SEEN.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SEEN.with_suffix('.tmp')
+    tmp.write_text(json.dumps(value, separators=(',', ':')) + '\n', encoding='utf-8')
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SEEN)
+
+
+def service_states() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for unit in SERVICES:
+        try:
+            proc = subprocess.run(['systemctl', 'is-active', unit], text=True, capture_output=True, timeout=2)
+            out[unit] = (proc.stdout or '').strip() or 'unknown'
+        except Exception:
+            out[unit] = 'unknown'
+    return out
+
+
+def pi_health() -> dict[str, Any]:
+    out: dict[str, Any] = {'reboot_required': Path('/run/reboot-required').exists()}
+    if shutil.which('vcgencmd'):
+        try:
+            proc = subprocess.run(['vcgencmd', 'get_throttled'], text=True, capture_output=True, timeout=3)
+            raw = (proc.stdout or '').strip().split('=', 1)[-1]
+            flags = int(raw, 16)
+            out.update({
+                'throttled_raw': raw,
+                'undervoltage_now': bool(flags & 1),
+                'frequency_capped_now': bool(flags & 2),
+                'throttled_now': bool(flags & 4),
+                'soft_temp_limit_now': bool(flags & 8),
+                'undervoltage_occurred': bool(flags & (1 << 16)),
+                'frequency_capped_occurred': bool(flags & (1 << 17)),
+                'throttled_occurred': bool(flags & (1 << 18)),
+                'soft_temp_limit_occurred': bool(flags & (1 << 19)),
+            })
+        except Exception:
+            pass
+    return out
+
+
+def sudo_snapshot() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    now = time.time()
+    paths = sorted(SUDO_DIR.glob('*.json')) if SUDO_DIR.exists() else []
+    for path in paths[-128:]:
+        item = load_json(path, {})
+        if not isinstance(item, dict):
+            continue
+        row = {key: item.get(key) for key in SUDO_FIELDS if key in item}
+        row.setdefault('id', path.stem)
+        status = str(row.get('status') or 'unknown')
+        try:
+            expires = float(row.get('expires_epoch') or 0)
+        except Exception:
+            expires = 0
+        if status == 'pending' and expires and now > expires:
+            row['status'] = 'expired'
+        rows.append(row)
+    rows.sort(key=lambda item: float(item.get('requested_epoch') or 0))
+    return rows[-64:]
+
+
+def audit_chunk(req: dict[str, Any]) -> dict[str, Any]:
+    kind = str(req.get('kind') or '')
+    path = AUDIT.get(kind)
+    if path is None:
+        return {'ok': False, 'error': 'unknown-audit-kind'}
+    try:
+        offset = max(0, int(req.get('offset') or 0))
+        limit = max(1, min(int(req.get('limit') or 16384), 32768))
+    except Exception:
+        return {'ok': False, 'error': 'invalid-audit-range'}
+    if not path.exists():
+        return {'ok': True, 'kind': kind, 'inode': 0, 'offset': 0, 'next_offset': 0, 'text': ''}
+    stat = path.stat()
+    if offset > stat.st_size:
+        offset = 0
+    with path.open('rb') as handle:
+        handle.seek(offset)
+        raw = handle.read(limit)
+    return {
+        'ok': True,
+        'kind': kind,
+        'inode': int(stat.st_ino),
+        'offset': offset,
+        'next_offset': offset + len(raw),
+        'size': stat.st_size,
+        'text': raw.decode('utf-8', 'replace'),
+    }
+
+
+def reply(client: socket.socket, obj: dict[str, Any]) -> None:
+    client.sendall((json.dumps(obj, separators=(',', ':')) + '\n').encode())
+
+
+def handle(client: socket.socket) -> None:
+    data = b''
+    while b'\n' not in data and len(data) < 65536:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    try:
+        req = json.loads(data.split(b'\n', 1)[0])
+    except Exception:
+        reply(client, {'ok': False, 'error': 'invalid-json'})
+        return
+
+    op = req.get('op')
+    if op == 'status':
+        reply(client, {
+            'ok': True,
+            'updates': {key: load_json(path, {}) for key, path in STATUS.items()},
+            'health': pi_health(),
+            'services': service_states(),
+            'sudo_requests': sudo_snapshot(),
+        })
+        return
+    if op == 'sudo':
+        reply(client, {'ok': True, 'sudo_requests': sudo_snapshot()})
+        return
+    if op == 'audit':
+        reply(client, audit_chunk(req))
+        return
+
+    command_id = str(req.get('id') or '')
+    action = str(req.get('action') or '')
+    if not command_id or len(command_id) > 128:
+        reply(client, {'ok': False, 'error': 'invalid-command-id'})
+        return
+    if action not in ACTIONS:
+        reply(client, {'ok': False, 'error': 'unsupported-action'})
+        return
+
+    seen = load_json(SEEN, {})
+    if command_id in seen:
+        reply(client, {'ok': True, 'message': 'Command already accepted locally', 'accepted_at': seen[command_id]})
+        return
+    try:
+        proc = subprocess.run(ACTIONS[action], text=True, capture_output=True, timeout=20)
+    except Exception as exc:
+        reply(client, {'ok': False, 'error': str(exc)})
+        return
+    if proc.returncode != 0:
+        reply(client, {'ok': False, 'error': (proc.stderr or proc.stdout or 'queue failed').strip()[-500:]})
+        return
+
+    accepted = time.time()
+    seen[command_id] = accepted
+    if len(seen) > 512:
+        for key, _ in sorted(seen.items(), key=lambda item: item[1])[:-256]:
+            seen.pop(key, None)
+    save_seen(seen)
+    reply(client, {'ok': True, 'message': 'Queued locally', 'accepted_at': accepted})
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit('executor must run as root')
+    SOCK.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        SOCK.unlink()
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(SOCK))
+    os.chown(SOCK, 0, grp.getgrnam('lghs-agent').gr_gid)
+    os.chmod(SOCK, 0o660)
+    server.listen(16)
+    while True:
+        client, _ = server.accept()
+        try:
+            handle(client)
+        finally:
+            client.close()
+
+
+if __name__ == '__main__':
+    main()

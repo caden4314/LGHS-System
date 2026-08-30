@@ -1,0 +1,12 @@
+[Unit]
+Description=LGHS Bootstrap/Recovery Avahi Advertisement
+After=avahi-daemon.service
+ConditionPathExists=/etc/lghs/role
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lghs-discovery-advertise
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -38,8 +38,10 @@ def atomic_write(path, data):
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     finally:
-        try: os.unlink(tmp)
-        except FileNotFoundError: pass
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def audit(event, **fields):
@@ -119,8 +121,7 @@ def load_owned(rid):
     return user, uid, path, data
 
 
-def status(rid):
-    user, uid, path, data = load_owned(rid)
+def refresh_status(rid, user, path, data):
     if data.get('status') == 'pending' and time.time() > float(data.get('expires_epoch', 0)):
         lock_path = REQUEST_DIR / f'{rid}.lock'
         with lock_path.open('a+') as lock:
@@ -132,8 +133,34 @@ def status(rid):
                 atomic_write(path, data)
                 audit('expired', request_id=rid, device_id=data.get('device_id'), requester=user,
                       command=data.get('command'), argv=data.get('argv'))
-    print(json.dumps({'id': rid, 'status': data.get('status', 'unknown'),
-                      'command': data.get('command', ''), 'reason': data.get('reason', '')}))
+    return data
+
+
+def status_payload(rid, data):
+    return {'id': rid, 'status': data.get('status', 'unknown'),
+            'command': data.get('command', ''), 'reason': data.get('reason', '')}
+
+
+def status(rid):
+    user, uid, path, data = load_owned(rid)
+    data = refresh_status(rid, user, path, data)
+    print(json.dumps(status_payload(rid, data)))
+
+
+def wait_status(rid, timeout):
+    user, uid, path, data = load_owned(rid)
+    timeout = max(0.0, min(float(timeout), float(TTL)))
+    deadline = time.monotonic() + timeout
+    while True:
+        data = refresh_status(rid, user, path, data)
+        if data.get('status') != 'pending' or time.monotonic() >= deadline:
+            print(json.dumps(status_payload(rid, data)))
+            return
+        time.sleep(0.10)
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            raise SystemExit('Unknown LGHS sudo request.')
 
 
 def cancel(rid):
@@ -177,14 +204,17 @@ def read_device_id():
 
 def main():
     if len(sys.argv) < 2:
-        raise SystemExit('Usage: lghs-sudo-broker request -- command... | status ID | cancel ID | event ID NAME')
+        raise SystemExit('Usage: lghs-sudo-broker request -- command... | status ID | wait ID SECONDS | cancel ID | event ID NAME')
     action = sys.argv[1]
     if action == 'request':
         args = sys.argv[2:]
-        if args and args[0] == '--': args = args[1:]
+        if args and args[0] == '--':
+            args = args[1:]
         request(args)
     elif action == 'status' and len(sys.argv) == 3:
         status(sys.argv[2])
+    elif action == 'wait' and len(sys.argv) == 4:
+        wait_status(sys.argv[2], sys.argv[3])
     elif action == 'cancel' and len(sys.argv) == 3:
         cancel(sys.argv[2])
     elif action == 'event' and len(sys.argv) == 4:

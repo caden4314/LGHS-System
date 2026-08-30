@@ -1,23 +1,489 @@
-#!/usr/bin/env bash
-set -euo pipefail
-[[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
-install -d -m 0755 /etc/avahi/services /etc/lghs
-DEVICE_ID="$(sed -n 's/^DEVICE_ID=//p' /etc/lghs/device.conf 2>/dev/null | head -n1)"
-[[ -n "$DEVICE_ID" ]] || DEVICE_ID="$(hostname)"
-VERSION="$(cat /etc/lghs/version 2>/dev/null || echo unknown)"
-cat >/etc/avahi/services/lghs.service <<EOF
-<?xml version="1.0" standalone='no'?>
-<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-<service-group>
-  <name replace-wildcards="yes">LGHS ${DEVICE_ID}</name>
-  <service>
-    <type>_lghs._tcp</type>
-    <port>22</port>
-    <txt-record>role=student</txt-record>
-    <txt-record>device_id=${DEVICE_ID}</txt-record>
-    <txt-record>version=${VERSION}</txt-record>
-  </service>
-</service-group>
-EOF
-systemctl try-restart avahi-daemon.service >/dev/null 2>&1 || true
-logger -t LGHS-AGENT "Advertised ${DEVICE_ID}, version ${VERSION}"
+#!/usr/bin/env python3
+"""LGHS 0.5 unprivileged managed-device agent.
+
+The agent owns network-facing telemetry, long-poll command delivery, event
+publication, and persistent local cursors. Privileged reads/actions are routed
+through the typed local executor socket.
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import threading
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+STATE_ROOT = Path('/var/lib/lghs-agent')
+CONF = STATE_ROOT / 'fleet-api.conf'
+TOKEN = STATE_ROOT / 'fleet-api-token'
+STATE = STATE_ROOT / 'state.json'
+VERSION = STATE_ROOT / 'version'
+BOOT = Path('/proc/sys/kernel/random/boot_id')
+EXECUTOR = '/run/lghs-command-executor/socket'
+
+REPORT_INTERVAL = float(os.environ.get('LGHS_AGENT_REPORT_SECONDS', '5'))
+LONG_POLL = float(os.environ.get('LGHS_AGENT_LONG_POLL_SECONDS', '25'))
+EVENT_POLL = float(os.environ.get('LGHS_AGENT_EVENT_SECONDS', '1'))
+TIMEOUT = 35
+
+LOCK = threading.RLock()
+STOP = threading.Event()
+WAKE = threading.Event()
+ACTIVE_UPDATE_STATES = {
+    'checking', 'queued', 'downloading', 'preparing', 'installing',
+    'validating', 'cleaning', 'finishing', 'rolling_back', 'busy', 'rebooting',
+}
+TERMINAL_COMMAND_STATES = {'succeeded', 'failed', 'timed_out', 'rejected', 'canceled'}
+AUDIT_KINDS = ('sudo', 'audit', 'update', 'os-update')
+
+
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return default
+
+
+def atomic(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(value, separators=(',', ':')) + '\n', encoding='utf-8')
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def parse_conf() -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        for line in CONF.read_text(encoding='utf-8').splitlines():
+            if '=' in line and not line.lstrip().startswith('#'):
+                key, value = line.split('=', 1)
+                out[key.strip()] = value.strip()
+    except Exception:
+        pass
+    return out
+
+
+def token() -> str:
+    return TOKEN.read_text(encoding='utf-8').strip()
+
+
+def device() -> str:
+    return socket.gethostname().upper()
+
+
+def boot_id() -> str:
+    try:
+        return BOOT.read_text(encoding='utf-8').strip()
+    except Exception:
+        return 'unknown'
+
+
+def version() -> str:
+    try:
+        return VERSION.read_text(encoding='utf-8').strip()
+    except Exception:
+        return 'unknown'
+
+
+def initial_state() -> dict[str, Any]:
+    old = load_json(STATE, {})
+    old_audit = old.get('audit', {}) if isinstance(old, dict) else {}
+    if not isinstance(old, dict) or old.get('boot_id') != boot_id():
+        old = {'boot_id': boot_id(), 'sequence': 0, 'commands': [], 'audit': old_audit}
+    old.setdefault('commands', [])
+    old.setdefault('sequence', 0)
+    old.setdefault('audit', {})
+    return old
+
+
+STATE_DATA = initial_state()
+
+
+def save() -> None:
+    atomic(STATE, STATE_DATA)
+
+
+def next_sequence() -> int:
+    with LOCK:
+        STATE_DATA['sequence'] = int(STATE_DATA.get('sequence', 0)) + 1
+        save()
+        return int(STATE_DATA['sequence'])
+
+
+def rpc(obj: dict[str, Any]) -> dict[str, Any]:
+    raw = (json.dumps(obj, separators=(',', ':')) + '\n').encode()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(10)
+    try:
+        client.connect(EXECUTOR)
+        client.sendall(raw)
+        data = b''
+        while b'\n' not in data:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        client.close()
+    if not data:
+        raise RuntimeError('executor returned no response')
+    return json.loads(data.split(b'\n', 1)[0])
+
+
+def cpu_sample() -> float:
+    def read_stat() -> tuple[int, int]:
+        nums = list(map(int, Path('/proc/stat').read_text().splitlines()[0].split()[1:]))
+        return sum(nums), nums[3] + nums[4]
+
+    before = read_stat()
+    time.sleep(0.05)
+    after = read_stat()
+    total_delta = after[0] - before[0]
+    if total_delta <= 0:
+        return 0.0
+    idle_delta = after[1] - before[1]
+    return round(100 * (total_delta - idle_delta) / total_delta, 1)
+
+
+def wifi_signal() -> dict[str, Any]:
+    try:
+        for line in Path('/proc/net/wireless').read_text().splitlines()[2:]:
+            if ':' not in line:
+                continue
+            iface, rest = line.split(':', 1)
+            parts = rest.split()
+            return {
+                'interface': iface.strip(),
+                'quality': float(parts[1].rstrip('.')),
+                'signal_dbm': float(parts[2].rstrip('.')),
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def clock_synced() -> bool:
+    return Path('/run/systemd/timesync/synchronized').exists()
+
+
+def metrics() -> dict[str, Any]:
+    mem: dict[str, int] = {}
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        if ':' in line:
+            key, value = line.split(':', 1)
+            mem[key] = int(value.strip().split()[0]) * 1024
+
+    stat = os.statvfs('/')
+    total = stat.f_blocks * stat.f_frsize
+    free = stat.f_bavail * stat.f_frsize
+    inode_total = stat.f_files
+    inode_free = stat.f_favail
+    try:
+        temp = round(int(Path('/sys/class/thermal/thermal_zone0/temp').read_text()) / 1000, 1)
+    except Exception:
+        temp = None
+
+    return {
+        'cpu_pct': cpu_sample(),
+        'mem_pct': round(100 * (mem.get('MemTotal', 1) - mem.get('MemAvailable', 0)) / max(mem.get('MemTotal', 1), 1), 1),
+        'disk_pct': round(100 * (total - free) / max(total, 1), 1),
+        'inode_pct': round(100 * (inode_total - inode_free) / max(inode_total, 1), 1),
+        'temp_c': temp,
+        'load1': os.getloadavg()[0],
+        'wifi': wifi_signal(),
+    }
+
+
+def executor_status() -> dict[str, Any]:
+    try:
+        return rpc({'op': 'status'})
+    except Exception:
+        return {'ok': False, 'updates': {}, 'health': {}, 'services': {}, 'sudo_requests': []}
+
+
+def health_check(check_id: str, state: str, severity: str, observed: Any, expected: Any, remediation: str = '') -> dict[str, Any]:
+    return {
+        'id': check_id,
+        'state': state,
+        'severity': severity,
+        'observed': observed,
+        'expected': expected,
+        'remediation': remediation,
+    }
+
+
+def structured_health(status: dict[str, Any], sample: dict[str, Any]) -> dict[str, Any]:
+    raw = dict(status.get('health') or {})
+    services = dict(status.get('services') or {})
+    checks: list[dict[str, Any]] = []
+    critical = {
+        'NetworkManager.service', 'ssh.service', 'lghs-policy.service',
+        'lghs-agent.service', 'lghs-command-executor.service',
+    }
+    for unit, observed in sorted(services.items()):
+        checks.append(health_check(
+            'service.' + unit.removesuffix('.service').removesuffix('.timer'),
+            'pass' if observed == 'active' else 'fail',
+            'critical' if unit in critical else 'warning',
+            observed, 'active', 'restart:' + unit,
+        ))
+
+    temp = sample.get('temp_c')
+    disk = sample.get('disk_pct')
+    inode = sample.get('inode_pct')
+    checks.append(health_check('hardware.temperature', 'pass' if not isinstance(temp, (int, float)) or temp < 75 else 'fail', 'critical' if isinstance(temp, (int, float)) and temp >= 85 else 'warning', temp, '<75 C', 'inspect:cooling'))
+    checks.append(health_check('storage.root', 'pass' if not isinstance(disk, (int, float)) or disk < 90 else 'fail', 'critical' if isinstance(disk, (int, float)) and disk >= 97 else 'warning', disk, '<90%', 'cleanup:disk'))
+    checks.append(health_check('storage.inodes', 'pass' if not isinstance(inode, (int, float)) or inode < 90 else 'fail', 'warning', inode, '<90%', 'cleanup:inodes'))
+    checks.append(health_check('clock.synchronized', 'pass' if clock_synced() else 'fail', 'warning', clock_synced(), True, 'restart:time-sync'))
+    checks.append(health_check('power.undervoltage', 'pass' if not (raw.get('undervoltage_now') or raw.get('undervoltage_occurred')) else 'fail', 'critical' if raw.get('undervoltage_now') else 'warning', raw.get('throttled_raw', '0x0'), 'no undervoltage', 'inspect:power'))
+    checks.append(health_check('hardware.throttling', 'pass' if not (raw.get('throttled_now') or raw.get('throttled_occurred')) else 'fail', 'critical' if raw.get('throttled_now') else 'warning', raw.get('throttled_raw', '0x0'), 'no throttling', 'inspect:power-thermal'))
+    checks.append(health_check('system.reboot-required', 'fail' if raw.get('reboot_required') else 'pass', 'warning', bool(raw.get('reboot_required')), False, 'schedule:reboot'))
+    return {'health_version': 1, 'checks': checks}
+
+
+def update_progress(rows: list[dict[str, Any]], status_blob: dict[str, Any]) -> list[dict[str, Any]]:
+    now = time.time()
+    statuses = status_blob.get('updates', {}) if isinstance(status_blob, dict) else {}
+    changed = False
+    for row in rows:
+        if str(row.get('state') or '').lower() in TERMINAL_COMMAND_STATES:
+            continue
+        status = statuses.get(row.get('action'), {})
+        started = float(status.get('started_at') or 0)
+        accepted = float(row.get('accepted_at') or 0)
+        if not started or started + 1 < accepted:
+            continue
+        update_state = str(status.get('state') or '').lower()
+        if update_state in ACTIVE_UPDATE_STATES:
+            state = 'running'
+        elif update_state == 'failed':
+            state = 'failed'
+        elif update_state in {'complete', 'reboot_required'}:
+            state = 'succeeded'
+        else:
+            continue
+        before = (row.get('state'), row.get('stage'), row.get('progress'), row.get('message'))
+        row['state'] = state
+        row.setdefault(state + '_at', float(status.get('updated_at') or now))
+        row['updated_at'] = float(status.get('updated_at') or now)
+        row['stage'] = status.get('stage', '')
+        row['message'] = status.get('message', '')
+        row['progress'] = status.get('progress')
+        row['update_state'] = update_state
+        changed |= before != (row.get('state'), row.get('stage'), row.get('progress'), row.get('message'))
+    if changed:
+        WAKE.set()
+    return rows
+
+
+def command_states(status_blob: dict[str, Any]) -> list[dict[str, Any]]:
+    with LOCK:
+        STATE_DATA['commands'] = update_progress(STATE_DATA.get('commands', []), status_blob)[-64:]
+        save()
+        return [dict(item) for item in STATE_DATA['commands'][-32:]]
+
+
+def audit_batches() -> list[dict[str, Any]]:
+    batches: list[dict[str, Any]] = []
+    with LOCK:
+        audit_state = dict(STATE_DATA.get('audit', {}))
+    for kind in AUDIT_KINDS:
+        current = audit_state.get(kind, {}) if isinstance(audit_state.get(kind, {}), dict) else {}
+        offset = int(current.get('offset') or 0)
+        inode = int(current.get('inode') or 0)
+        try:
+            chunk = rpc({'op': 'audit', 'kind': kind, 'offset': offset, 'limit': 12288})
+        except Exception:
+            continue
+        if not chunk.get('ok'):
+            continue
+        remote_inode = int(chunk.get('inode') or 0)
+        if inode and remote_inode and inode != remote_inode and offset:
+            try:
+                chunk = rpc({'op': 'audit', 'kind': kind, 'offset': 0, 'limit': 12288})
+            except Exception:
+                continue
+        if chunk.get('text'):
+            batches.append({
+                'kind': kind,
+                'inode': int(chunk.get('inode') or 0),
+                'offset': int(chunk.get('offset') or 0),
+                'next_offset': int(chunk.get('next_offset') or 0),
+                'text': chunk.get('text', ''),
+            })
+    return batches
+
+
+def apply_audit_ack(acks: Any) -> None:
+    if not isinstance(acks, dict):
+        return
+    with LOCK:
+        state = STATE_DATA.setdefault('audit', {})
+        for kind, ack in acks.items():
+            if kind not in AUDIT_KINDS or not isinstance(ack, dict):
+                continue
+            state[kind] = {
+                'inode': int(ack.get('inode') or 0),
+                'offset': int(ack.get('next_offset') or 0),
+            }
+        save()
+
+
+def envelope() -> dict[str, Any]:
+    status = executor_status()
+    sample = metrics()
+    health = dict(status.get('health') or {})
+    health['clock_synchronized'] = clock_synced()
+    payload = {
+        'metrics': sample,
+        'health': health,
+        'health_report': structured_health(status, sample),
+        'command_states': command_states(status),
+        'sudo_requests': status.get('sudo_requests', []),
+        'audit_batches': audit_batches(),
+        'version': version(),
+        'uptime_seconds': time.clock_gettime(time.CLOCK_BOOTTIME),
+    }
+    return {
+        'protocol': 1,
+        'agent_version': version(),
+        'device_id': device(),
+        'boot_id': boot_id(),
+        'sequence': next_sequence(),
+        'sent_at': time.time(),
+        'payload': payload,
+    }
+
+
+def request(url: str, method: str = 'GET', body: dict[str, Any] | None = None) -> dict[str, Any]:
+    data = None if body is None else json.dumps(body, separators=(',', ':')).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            'Authorization': 'Bearer ' + token(),
+            'Content-Type': 'application/json',
+            'User-Agent': 'LGHS-Agent/0.5',
+        },
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+        return json.loads(response.read().decode() or '{}')
+
+
+def accept(commands: Any) -> None:
+    if not isinstance(commands, list):
+        return
+    with LOCK:
+        by_id = {str(item.get('id')): item for item in STATE_DATA.get('commands', [])}
+    for command in commands:
+        if not isinstance(command, dict) or not command.get('id') or not command.get('action'):
+            continue
+        command_id = str(command['id'])
+        with LOCK:
+            row = by_id.get(command_id)
+            if row and row.get('state') != 'received':
+                continue
+            if row is None:
+                row = {
+                    'id': command_id,
+                    'action': command['action'],
+                    'state': 'received',
+                    'received_at': time.time(),
+                    'updated_at': time.time(),
+                    'stage': 'Received',
+                    'message': 'Command received over HTTPS',
+                    'progress': 0,
+                }
+                STATE_DATA['commands'].append(row)
+                by_id[command_id] = row
+                save()
+                WAKE.set()
+        try:
+            result = rpc({'id': command_id, 'action': command['action'], 'payload': command.get('payload') or {}})
+        except Exception as exc:
+            result = {'ok': False, 'error': str(exc)}
+        with LOCK:
+            if result.get('ok'):
+                row['state'] = 'accepted'
+                row['accepted_at'] = float(result.get('accepted_at') or time.time())
+                row['updated_at'] = row['accepted_at']
+                row['stage'] = 'Accepted by executor'
+                row['message'] = result.get('message', 'Queued locally')
+            else:
+                row['stage'] = 'Local acceptance retry pending'
+                row['message'] = str(result.get('error', 'executor unavailable'))[-500:]
+                row['updated_at'] = time.time()
+            save()
+            WAKE.set()
+
+
+def reporter() -> None:
+    delay = 1.0
+    while not STOP.is_set():
+        started = time.monotonic()
+        try:
+            base = parse_conf().get('URL', '').rstrip('/')
+            result = request(f'{base}/v1/report/{device()}', 'POST', envelope())
+            apply_audit_ack(result.get('audit_ack', {}))
+            accept(result.get('commands', []))
+            delay = REPORT_INTERVAL
+        except Exception:
+            delay = min(max(REPORT_INTERVAL, delay * 1.7), 60.0)
+        remaining = max(0.25, delay - (time.monotonic() - started))
+        WAKE.wait(remaining)
+        WAKE.clear()
+
+
+def longpoll() -> None:
+    while not STOP.is_set():
+        try:
+            base = parse_conf().get('URL', '').rstrip('/')
+            result = request(f'{base}/v1/commands/{device()}?wait={min(LONG_POLL, 30)}')
+            accept(result.get('commands', []))
+        except Exception:
+            STOP.wait(2)
+
+
+def sudo_event_watcher() -> None:
+    """Wake telemetry immediately when the privileged sudo snapshot changes."""
+    previous = ''
+    while not STOP.is_set():
+        try:
+            result = rpc({'op': 'sudo'})
+            rows = result.get('sudo_requests', []) if isinstance(result, dict) else []
+            current = json.dumps(rows, sort_keys=True, separators=(',', ':'))
+            if previous and current != previous:
+                WAKE.set()
+            previous = current
+        except Exception:
+            pass
+        STOP.wait(max(0.25, EVENT_POLL))
+
+
+def main() -> None:
+    if os.geteuid() == 0:
+        raise SystemExit('lghs-agent must run unprivileged')
+    if not TOKEN.exists() or not CONF.exists():
+        raise SystemExit('agent endpoint/token not provisioned')
+    threads = [
+        threading.Thread(target=reporter, daemon=True, name='lghs-reporter'),
+        threading.Thread(target=longpoll, daemon=True, name='lghs-longpoll'),
+        threading.Thread(target=sudo_event_watcher, daemon=True, name='lghs-sudo-events'),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        STOP.set()
+        WAKE.set()
+
+
+if __name__ == '__main__':
+    main()

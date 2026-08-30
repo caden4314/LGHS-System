@@ -1,12 +1,29 @@
 [Unit]
-Description=LGHS Student Discovery Agent
-After=avahi-daemon.service
-ConditionPathExists=/etc/lghs/role
+Description=LGHS Managed Device Agent
+After=network.target lghs-command-executor.service
+Wants=lghs-command-executor.service
+ConditionPathExists=/etc/lghs/fleet-api.conf
 
 [Service]
-Type=oneshot
+Type=simple
+User=lghs-agent
+Group=lghs-agent
 ExecStart=/usr/local/sbin/lghs-agent
-RemainAfterExit=yes
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+StateDirectory=lghs-agent
+StateDirectoryMode=0700
+ReadOnlyPaths=/etc/lghs /usr/local/sbin /var/lib/lghs/update /var/lib/lghs/sudo-requests
 
 [Install]
 WantedBy=multi-user.target
