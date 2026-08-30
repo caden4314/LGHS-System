@@ -35,9 +35,10 @@ if [[ "$ROLE" == controller ]]; then
   chmod 0640 /var/lib/lghs/db-migration-last.json
   systemctl daemon-reload
   systemctl enable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
-  systemctl enable --now lghs-bt-provision.service
+  systemctl enable lghs-bt-provision.service
+  systemctl reset-failed lghs-bt-provision.service >/dev/null 2>&1 || true
+  systemctl restart lghs-bt-provision.service
   systemctl try-restart lghs-fleet-api.service || true
-  systemctl try-restart lghs-bt-provision.service || true
   echo 'LGHS 0.5 controller SQLite/HTTPS + Bluetooth bootstrap foundation installed.'
   exit 0
 fi
@@ -78,6 +79,7 @@ systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
 systemctl enable --now lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service
 systemctl enable lghs-bt-bootstrap.service
 if [[ -f /etc/lghs/bluetooth-bootstrap-enabled && ! -f /var/lib/lghs/bootstrap/wifi-provisioned.json ]]; then
+  systemctl reset-failed lghs-bt-bootstrap.service >/dev/null 2>&1 || true
   systemctl start lghs-bt-bootstrap.service || true
 fi
 sleep 1
