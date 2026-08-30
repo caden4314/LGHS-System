@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROLE="$(cat /etc/lghs/role 2>/dev/null || true)"
+BT_INDEX="${LGHS_BT_INDEX:-hci0}"
+TIMEOUT_SECS="${LGHS_BT_COMMAND_TIMEOUT:-6}"
+
+[[ "$ROLE" == controller || "$ROLE" == student ]] || {
+  echo "LGHS Bluetooth prepare: invalid role '$ROLE'" >&2
+  exit 2
+}
+
+retry() {
+  local description="$1"
+  shift
+  local attempt
+  for attempt in 1 2 3 4; do
+    if timeout "$TIMEOUT_SECS" "$@"; then
+      return 0
+    fi
+    if [[ "$attempt" -lt 4 ]]; then
+      sleep 1
+    fi
+  done
+  echo "LGHS Bluetooth prepare: $description failed after 4 attempts" >&2
+  return 1
+}
+
+rfkill unblock bluetooth
+retry "power-on" bluetoothctl power on
+sleep 1
+retry "NoInputNoOutput IO capability" btmgmt -i "$BT_INDEX" io-cap 3
+retry "pairable mode" btmgmt -i "$BT_INDEX" pairable on
+
+if [[ "$ROLE" == controller ]]; then
+  HOST="$(hostname | tr '[:lower:]' '[:upper:]')"
+  retry "controller alias" bluetoothctl system-alias "LGHS-PROVISION-$HOST"
+  retry "discoverable timeout" bluetoothctl discoverable-timeout 0
+  retry "discoverable mode" bluetoothctl discoverable on
+fi
+
+echo "LGHS Bluetooth adapter prepared on $BT_INDEX for $ROLE"
