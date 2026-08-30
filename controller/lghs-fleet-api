@@ -36,9 +36,28 @@ def legacy_cache(device,payload):
     devices=cache.setdefault('devices',{});p=dict(payload);p.pop('audit_batches',None);p['device_id']=device;p['received_at']=time.time();p['fleet_commands']=[legacy_command_view(x) for x in DB.list_commands(device,16)];p['warnings']=DB.list_warnings(device,False,32);devices[device]=p;cache['updated_at']=time.time();tmp=CACHE.with_suffix('.tmp');tmp.write_text(json.dumps(cache,separators=(',',':'))+'\n',encoding='utf-8');os.chmod(tmp,0o640);os.replace(tmp,CACHE)
 def auth_device(handler,device):
     auth=handler.headers.get('Authorization','');supplied=auth[7:].strip() if auth.startswith('Bearer ') else '';return authorized(device,supplied)
+def reconcile_command_milestones(device,rows):
+    """Preserve fast RECEIVED/ACCEPTED/RUNNING timestamps even when one report spans several states."""
+    for item in rows if isinstance(rows,list) else []:
+        if not isinstance(item,dict):continue
+        cid=str(item.get('id') or '')
+        if not cid:continue
+        current=DB.get_command(cid)
+        if not current or current.get('device_id')!=device:continue
+        for state,field in (('received','received_at'),('accepted','accepted_at'),('running','running_at')):
+            stamp=item.get(field)
+            if stamp is None:continue
+            current=DB.get_command(cid)
+            column='started_at' if state=='running' else field
+            if current and current.get(column) is not None:continue
+            try:
+                DB.transition_command(cid,state,stage=f'{state.title()} by device',message='Milestone reported by managed agent',now=float(stamp),detail={'backfilled':True})
+            except (TypeError,ValueError):
+                pass
+    DB.reconcile_reported_commands(device,rows)
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='LGHSFleetAPI/12'
+    server_version='LGHSFleetAPI/13'
     def log_message(self,*a):return
     def reply(self,code,payload):
         body=json.dumps(payload,separators=(',',':')).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
@@ -80,7 +99,7 @@ class Handler(BaseHTTPRequestHandler):
                 claimed=str(raw.get('device_id') or raw.get('hostname') or device).upper()
                 if claimed!=device:raise ProtocolError('device-mismatch')
                 payload=dict(raw);command_states=payload.get('command_states',[]);DB.record_telemetry(device,payload,received_at=now,sent_at=payload.get('sent_at'),agent_version='0.4-compat',protocol=0);record_snapshot(DB,device,payload.get('sudo_requests',[]))
-            DB.reconcile_reported_commands(device,command_states);DB.evaluate_health(device,payload);evaluate_report(DB,device,payload);commands=DB.commands_for_delivery(device);export_legacy_commands();legacy_cache(device,payload)
+            reconcile_command_milestones(device,command_states);DB.evaluate_health(device,payload);evaluate_report(DB,device,payload);commands=DB.commands_for_delivery(device);export_legacy_commands();legacy_cache(device,payload)
         except ValueError as exc:self.reply(409,{'ok':False,'error':str(exc)});return
         except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
         result=response(commands,received_at=now);result['audit_ack']=audit_ack;self.reply(202,result)
