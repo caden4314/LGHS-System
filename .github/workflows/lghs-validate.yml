@@ -15,6 +15,9 @@ jobs:
       - name: Python syntax
         run: |
           python3 -m py_compile \
+            controller/lghs/__init__.py \
+            controller/lghs/protocol.py \
+            controller/lghs/database.py \
             controller/lghs-console \
             controller/lghs-console-responsive \
             controller/lghs-console-day2 \
@@ -30,10 +33,14 @@ jobs:
             student/lghs-sudo-admin \
             student/lghs-audit-export \
             student/sudo \
-            tests/test_command_plane.py
+            tests/test_command_plane.py \
+            tests/test_fleet_database.py
 
       - name: Command-plane regression tests
         run: python3 -m unittest -v tests/test_command_plane.py
+
+      - name: Fleet database and protocol tests
+        run: python3 -m unittest -v tests/test_fleet_database.py
 
       - name: Shell syntax
         run: |
@@ -81,6 +88,14 @@ jobs:
           grep -q '^ReadWritePaths=/var/lib/lghs /etc/lghs /run/lock$' systemd/lghs-fleet-api.service
           grep -q '/run/lock/lghs-fleet-commands.lock' controller/lghs-fleet-api
           grep -q '/run/lock/lghs-fleet-commands.lock' controller/lghs-fleet-command
+
+      - name: SQLite foundation invariants
+        run: |
+          grep -q 'PRAGMA journal_mode=WAL' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS commands' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS command_events' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS deployments' controller/lghs/database.py
+          grep -q 'PROTOCOL_VERSION = 1' controller/lghs/protocol.py
 
       - name: Release invariants
         run: |
