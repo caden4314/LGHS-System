@@ -32,6 +32,12 @@ install -m 0644 "$ROOT/systemd/lghs-command-executor.service" /etc/systemd/syste
 if [[ -s /etc/lghs/secrets/fleet-api-token ]]; then
   install -o lghs-agent -g lghs-agent -m 0400 /etc/lghs/secrets/fleet-api-token /var/lib/lghs-agent/fleet-api-token
 fi
+if [[ -s /etc/lghs/fleet-api.conf ]]; then
+  install -o lghs-agent -g lghs-agent -m 0400 /etc/lghs/fleet-api.conf /var/lib/lghs-agent/fleet-api.conf
+fi
+printf '%s\n' "$(cat "$ROOT/VERSION")" > /var/lib/lghs-agent/version
+chown lghs-agent:lghs-agent /var/lib/lghs-agent/version
+chmod 0400 /var/lib/lghs-agent/version
 systemctl daemon-reload
 systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
 systemctl enable --now lghs-command-executor.service lghs-agent.service
