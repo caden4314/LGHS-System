@@ -17,9 +17,10 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0755 "$ROOT/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
   /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
   chmod 0640 /var/lib/lghs/db-migration-last.json
-  # 0.5 receives normal audit batches over HTTPS. Keep lghs-audit-sync installed
-  # as an explicit recovery/backfill tool, but stop its recurring SSH fan-out.
-  systemctl disable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
+  # Keep the historical timer enabled for updater compatibility. On 0.5 the
+  # sync command exits before SSH; explicit backfill requires
+  # LGHS_AUDIT_SSH_RECOVERY=1.
+  systemctl enable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
   systemctl try-restart lghs-fleet-api.service || true
   echo 'LGHS 0.5 controller SQLite/HTTPS foundation installed.'
   exit 0
