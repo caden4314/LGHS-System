@@ -2,7 +2,6 @@
 """LGHS 0.5 unprivileged managed-device agent."""
 import json,os,socket,threading,time,urllib.request
 from pathlib import Path
-
 STATE_ROOT=Path('/var/lib/lghs-agent');CONF=STATE_ROOT/'fleet-api.conf';TOKEN=STATE_ROOT/'fleet-api-token';STATE=STATE_ROOT/'state.json';VERSION=STATE_ROOT/'version';BOOT=Path('/proc/sys/kernel/random/boot_id');EXECUTOR='/run/lghs-command-executor/socket'
 REPORT_INTERVAL=float(os.environ.get('LGHS_AGENT_REPORT_SECONDS','5'));LONG_POLL=float(os.environ.get('LGHS_AGENT_LONG_POLL_SECONDS','25'));TIMEOUT=35
 LOCK=threading.RLock();STOP=threading.Event();WAKE=threading.Event();ACTIVE={'checking','queued','downloading','preparing','installing','validating','cleaning','finishing','rolling_back','busy','rebooting'};AUDIT_KINDS=('sudo','audit','update','os-update')
@@ -10,10 +9,8 @@ LOCK=threading.RLock();STOP=threading.Event();WAKE=threading.Event();ACTIVE={'ch
 def load_json(path,default):
     try:return json.loads(path.read_text(encoding='utf-8'))
     except Exception:return default
-
 def atomic(path,value):
     path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value,separators=(',',':'))+'\n',encoding='utf-8');os.chmod(tmp,0o600);os.replace(tmp,path)
-
 def parse_conf():
     out={}
     try:
@@ -22,7 +19,6 @@ def parse_conf():
                 k,v=line.split('=',1);out[k.strip()]=v.strip()
     except Exception:pass
     return out
-
 def token():return TOKEN.read_text(encoding='utf-8').strip()
 def device():return socket.gethostname().upper()
 def boot_id():
@@ -31,7 +27,6 @@ def boot_id():
 def version():
     try:return VERSION.read_text().strip()
     except Exception:return 'unknown'
-
 def initial_state():
     s=load_json(STATE,{})
     if s.get('boot_id')!=boot_id():s={'boot_id':boot_id(),'sequence':0,'commands':[],'audit':s.get('audit',{}) if isinstance(s,dict) else {}}
@@ -40,7 +35,6 @@ STATE_DATA=initial_state()
 def save():atomic(STATE,STATE_DATA)
 def next_sequence():
     with LOCK:STATE_DATA['sequence']=int(STATE_DATA.get('sequence',0))+1;save();return STATE_DATA['sequence']
-
 def rpc(obj):
     raw=(json.dumps(obj,separators=(',',':'))+'\n').encode();s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(10);s.connect(EXECUTOR);s.sendall(raw);data=b''
     while b'\n' not in data:
@@ -48,12 +42,10 @@ def rpc(obj):
         if not chunk:break
         data+=chunk
     s.close();return json.loads(data.split(b'\n',1)[0])
-
 def cpu_sample():
     def r():
         nums=list(map(int,Path('/proc/stat').read_text().splitlines()[0].split()[1:]));return sum(nums),nums[3]+nums[4]
     a=r();time.sleep(.05);b=r();dt=b[0]-a[0];return round(100*(dt-(b[1]-a[1]))/dt,1) if dt>0 else 0.0
-
 def wifi_signal():
     try:
         for line in Path('/proc/net/wireless').read_text().splitlines()[2:]:
@@ -73,7 +65,23 @@ def metrics():
     return {'cpu_pct':cpu_sample(),'mem_pct':round(100*(mem.get('MemTotal',1)-mem.get('MemAvailable',0))/max(mem.get('MemTotal',1),1),1),'disk_pct':round(100*(total-free)/max(total,1),1),'inode_pct':round(100*(inode_total-inode_free)/max(inode_total,1),1),'temp_c':temp,'load1':os.getloadavg()[0],'wifi':wifi_signal()}
 def executor_status():
     try:return rpc({'op':'status'})
-    except Exception:return {'ok':False,'updates':{},'health':{}}
+    except Exception:return {'ok':False,'updates':{},'health':{},'services':{}}
+def check(cid,state,severity,observed,expected,remediation=''):
+    return {'id':cid,'state':state,'severity':severity,'observed':observed,'expected':expected,'remediation':remediation}
+def structured_health(status,m):
+    raw=dict(status.get('health') or {});services=dict(status.get('services') or {});checks=[]
+    critical={'NetworkManager.service','ssh.service','lghs-policy.service','lghs-agent.service','lghs-command-executor.service'}
+    for unit,observed in sorted(services.items()):
+        checks.append(check('service.'+unit.removesuffix('.service').removesuffix('.timer'), 'pass' if observed=='active' else 'fail', 'critical' if unit in critical else 'warning', observed, 'active', 'restart:'+unit))
+    temp=m.get('temp_c');disk=m.get('disk_pct');inode=m.get('inode_pct')
+    checks.append(check('hardware.temperature','pass' if not isinstance(temp,(int,float)) or temp<75 else 'fail','critical' if isinstance(temp,(int,float)) and temp>=85 else 'warning',temp,'<75 C','inspect:cooling'))
+    checks.append(check('storage.root','pass' if not isinstance(disk,(int,float)) or disk<90 else 'fail','critical' if isinstance(disk,(int,float)) and disk>=97 else 'warning',disk,'<90%','cleanup:disk'))
+    checks.append(check('storage.inodes','pass' if not isinstance(inode,(int,float)) or inode<90 else 'fail','warning',inode,'<90%','cleanup:inodes'))
+    checks.append(check('clock.synchronized','pass' if clock_synced() else 'fail','warning',clock_synced(),True,'restart:time-sync'))
+    checks.append(check('power.undervoltage','pass' if not (raw.get('undervoltage_now') or raw.get('undervoltage_occurred')) else 'fail','critical' if raw.get('undervoltage_now') else 'warning',raw.get('throttled_raw','0x0'),'no undervoltage','inspect:power'))
+    checks.append(check('hardware.throttling','pass' if not (raw.get('throttled_now') or raw.get('throttled_occurred')) else 'fail','critical' if raw.get('throttled_now') else 'warning',raw.get('throttled_raw','0x0'),'no throttling','inspect:power-thermal'))
+    checks.append(check('system.reboot-required','fail' if raw.get('reboot_required') else 'pass','warning',bool(raw.get('reboot_required')),False,'schedule:reboot'))
+    return {'health_version':1,'checks':checks}
 def update_progress(rows,status_blob):
     now=time.time();statuses=status_blob.get('updates',{}) if isinstance(status_blob,dict) else {};changed=False
     for row in rows:
@@ -101,8 +109,7 @@ def audit_batches():
         if inode and remote_inode and inode!=remote_inode and offset:
             try:chunk=rpc({'op':'audit','kind':kind,'offset':0,'limit':12288})
             except Exception:continue
-        if chunk.get('text'):
-            batches.append({'kind':kind,'inode':int(chunk.get('inode') or 0),'offset':int(chunk.get('offset') or 0),'next_offset':int(chunk.get('next_offset') or 0),'text':chunk.get('text','')})
+        if chunk.get('text'):batches.append({'kind':kind,'inode':int(chunk.get('inode') or 0),'offset':int(chunk.get('offset') or 0),'next_offset':int(chunk.get('next_offset') or 0),'text':chunk.get('text','')})
     return batches
 def apply_audit_ack(acks):
     if not isinstance(acks,dict):return
@@ -113,7 +120,7 @@ def apply_audit_ack(acks):
             state[kind]={'inode':int(ack.get('inode') or 0),'offset':int(ack.get('next_offset') or 0)}
         save()
 def envelope():
-    status=executor_status();health=dict(status.get('health') or {});health['clock_synchronized']=clock_synced();payload={'metrics':metrics(),'health':health,'command_states':command_states(status),'audit_batches':audit_batches(),'version':version(),'uptime_seconds':time.clock_gettime(time.CLOCK_BOOTTIME)}
+    status=executor_status();m=metrics();health=dict(status.get('health') or {});health['clock_synchronized']=clock_synced();payload={'metrics':m,'health':health,'health_report':structured_health(status,m),'command_states':command_states(status),'audit_batches':audit_batches(),'version':version(),'uptime_seconds':time.clock_gettime(time.CLOCK_BOOTTIME)}
     return {'protocol':1,'agent_version':version(),'device_id':device(),'boot_id':boot_id(),'sequence':next_sequence(),'sent_at':time.time(),'payload':payload}
 def request(url,method='GET',body=None):
     data=None if body is None else json.dumps(body,separators=(',',':')).encode();req=urllib.request.Request(url,data=data,method=method,headers={'Authorization':'Bearer '+token(),'Content-Type':'application/json','User-Agent':'LGHS-Agent/0.5'})
