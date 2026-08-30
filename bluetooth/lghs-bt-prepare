@@ -9,6 +9,14 @@ TIMEOUT_SECS="${LGHS_BT_COMMAND_TIMEOUT:-6}"
   echo "LGHS Bluetooth prepare: invalid role '$ROLE'" >&2
   exit 2
 }
+[[ "$BT_INDEX" =~ ^hci[0-9]+$ ]] || {
+  echo "LGHS Bluetooth prepare: invalid Bluetooth index '$BT_INDEX'" >&2
+  exit 2
+}
+command -v script >/dev/null 2>&1 || {
+  echo "LGHS Bluetooth prepare: util-linux 'script' command is required" >&2
+  exit 3
+}
 
 retry() {
   local description="$1"
@@ -26,11 +34,26 @@ retry() {
   return 1
 }
 
+# Raspberry Pi OS / BlueZ 5.82 btmgmt waits forever when stdin is /dev/null,
+# which is the normal stdin for a systemd service. Give only btmgmt a private
+# pseudo-terminal so its one-shot management commands complete noninteractively.
+retry_btmgmt() {
+  local description="$1"
+  shift
+  local cmd=(/usr/bin/btmgmt -i "$BT_INDEX" "$@")
+  local quoted=""
+  local arg
+  for arg in "${cmd[@]}"; do
+    printf -v quoted '%s%q ' "$quoted" "$arg"
+  done
+  retry "$description" /usr/bin/script -q -e -c "$quoted" /dev/null
+}
+
 rfkill unblock bluetooth
 retry "power-on" bluetoothctl power on
 sleep 1
-retry "NoInputNoOutput IO capability" btmgmt -i "$BT_INDEX" io-cap 3
-retry "pairable mode" btmgmt -i "$BT_INDEX" pairable on
+retry_btmgmt "NoInputNoOutput IO capability" io-cap 3
+retry_btmgmt "pairable mode" pairable on
 
 if [[ "$ROLE" == controller ]]; then
   HOST="$(hostname | tr '[:lower:]' '[:upper:]')"
