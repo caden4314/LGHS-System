@@ -11,20 +11,13 @@ RC=$?
 [[ "${LGHS_NETQUEUE_RUNNING:-0}" == "1" ]] && exit "$RC"
 [[ -x "$QUEUE" ]] || exit "$RC"
 
+# Update and OS-update are controller-local HTTPS queue operations now. Do not
+# feed failures back into the older fleet-over-SSH network queue. Retain the
+# offline queue fallback only for explicit repair actions that still use SSH.
 CMD="${1:-}"
 TARGET=""
 ACTION=""
 case "$CMD" in
-  update)
-    [[ "${2:-}" != "" && "${2:-}" != "--all" ]] && { TARGET="$2"; ACTION=update; }
-    ;;
-  os-update)
-    if [[ "${2:-}" != "" && "${2:-}" != "--all" && "${2:-}" != "--reboot" ]]; then
-      TARGET="$2"
-      ACTION=os-update
-      [[ " $* " == *" --reboot "* ]] && ACTION=os-update-reboot
-    fi
-    ;;
   enforce)
     [[ -n "${2:-}" ]] && { TARGET="$2"; ACTION=enforce; }
     ;;
