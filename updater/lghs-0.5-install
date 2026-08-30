@@ -28,8 +28,10 @@ fi
 install -d -o lghs-agent -g lghs-agent -m 0700 /var/lib/lghs-agent
 install -m 0755 "$ROOT/student/lghs-agent" /usr/local/sbin/lghs-agent
 install -m 0750 "$ROOT/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
+install -m 0755 "$ROOT/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
 install -m 0644 "$ROOT/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
 install -m 0644 "$ROOT/systemd/lghs-command-executor.service" /etc/systemd/system/lghs-command-executor.service
+install -m 0644 "$ROOT/systemd/lghs-discovery-advertise.service" /etc/systemd/system/lghs-discovery-advertise.service
 if [[ -s /etc/lghs/secrets/fleet-api-token ]]; then
   install -o lghs-agent -g lghs-agent -m 0400 /etc/lghs/secrets/fleet-api-token /var/lib/lghs-agent/fleet-api-token
 fi
@@ -41,8 +43,9 @@ chown lghs-agent:lghs-agent /var/lib/lghs-agent/version
 chmod 0400 /var/lib/lghs-agent/version
 systemctl daemon-reload
 systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
-systemctl enable --now lghs-command-executor.service lghs-agent.service
+systemctl enable --now lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service
 sleep 1
 systemctl is-active --quiet lghs-command-executor.service
 systemctl is-active --quiet lghs-agent.service
+systemctl is-active --quiet lghs-discovery-advertise.service
 echo 'LGHS 0.5 unprivileged student agent installed.'
