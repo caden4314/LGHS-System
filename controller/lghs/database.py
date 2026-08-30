@@ -81,12 +81,15 @@ class FleetDB:
         return cid
     def _event(self,db,cid,state,stage,message,progress,ts,detail):db.execute('INSERT INTO command_events(command_id,state,stage,message,progress,created_at,detail_json) VALUES(?,?,?,?,?,?,?)',(cid,state,stage,message,progress,ts,_json(detail)))
     def transition_command(self,cid:str,state:str,*,stage=None,message=None,progress=None,now=None,detail=None)->dict[str,Any]:
-        ns=normalize_command_state(state);ts=time.time() if now is None else float(now)
+        ns=normalize_command_state(state);ts=time.time() if now is None else float(now);detail_obj=dict(detail or {});detail_json=_json(detail_obj)
         with self.transaction() as db:
             r=db.execute('SELECT * FROM commands WHERE command_id=?',(cid,)).fetchone()
             if not r:raise KeyError(cid)
             if not state_can_advance(r['state'],ns):raise ValueError(f"command state regression: {r['state']} -> {ns}")
             vals=dict(r);st=vals['stage'] if stage is None else str(stage);msg=vals['message'] if message is None else str(message);prog=vals['progress'] if progress is None else progress
+            last=db.execute('SELECT state,stage,message,progress,created_at,detail_json FROM command_events WHERE command_id=? ORDER BY id DESC LIMIT 1',(cid,)).fetchone()
+            if last and last['state']==ns and last['stage']==st and last['message']==msg and last['progress']==prog and float(last['created_at'])==ts and last['detail_json']==detail_json:
+                return dict(r)
             delivered=vals['delivered_at'];received=vals['received_at'];accepted=vals['accepted_at'];started=vals['started_at'];completed=vals['completed_at']
             if ns=='delivered' and delivered is None:delivered=ts
             if ns=='received' and received is None:received=ts
@@ -94,7 +97,7 @@ class FleetDB:
             if ns=='running' and started is None:started=ts
             if ns in TERMINAL_COMMAND_STATES and completed is None:completed=ts
             db.execute('UPDATE commands SET state=?,stage=?,message=?,progress=?,updated_at=?,delivered_at=?,received_at=?,accepted_at=?,started_at=?,completed_at=? WHERE command_id=?',(ns,st,msg,prog,ts,delivered,received,accepted,started,completed,cid))
-            self._event(db,cid,ns,st,msg,prog,ts,dict(detail or {}));return dict(db.execute('SELECT * FROM commands WHERE command_id=?',(cid,)).fetchone())
+            self._event(db,cid,ns,st,msg,prog,ts,detail_obj);return dict(db.execute('SELECT * FROM commands WHERE command_id=?',(cid,)).fetchone())
     def reconcile_reported_commands(self,device_id:str,reported:list[Mapping[str,Any]])->None:
         d=normalize_device_id(device_id)
         for item in reported if isinstance(reported,list) else []:
