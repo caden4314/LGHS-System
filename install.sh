@@ -91,6 +91,18 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0750 "$ROOT_DIR/controller/lghs-bt-provision" /usr/local/sbin/lghs-bt-provision
   install -m 0644 "$ROOT_DIR/systemd/lghs-bt-provision.service" /etc/systemd/system/lghs-bt-provision.service
 
+  # Raw RFCOMM sockets are not automatically published in BlueZ SDP. The
+  # controller uses the compatibility SDP interface only to advertise the
+  # bootstrap serial service; authentication and Wi-Fi encryption remain in
+  # the LGHS application protocol.
+  install -d -m 0755 /etc/systemd/system/bluetooth.service.d
+  cat > /etc/systemd/system/bluetooth.service.d/50-lghs-sdp-compat.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/libexec/bluetooth/bluetoothd --compat
+EOF
+  chmod 0644 /etc/systemd/system/bluetooth.service.d/50-lghs-sdp-compat.conf
+
   if [[ ! -f /etc/lghs/fleet.json ]]; then
     printf '%s\n' '{"version":1,"devices":{}}' > /etc/lghs/fleet.json
     chmod 0644 /etc/lghs/fleet.json
@@ -127,6 +139,7 @@ EOF
   /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
   chmod 0640 /var/lib/lghs/db-migration-last.json
 else
+  rm -f /etc/systemd/system/bluetooth.service.d/50-lghs-sdp-compat.conf
   getent group lghs-agent >/dev/null 2>&1 || groupadd --system lghs-agent
   if ! id lghs-agent >/dev/null 2>&1; then useradd --system --gid lghs-agent --home-dir /var/lib/lghs-agent --shell /usr/sbin/nologin lghs-agent; fi
   install -d -o lghs-agent -g lghs-agent -m 0700 /var/lib/lghs-agent
@@ -203,6 +216,11 @@ visudo -cf /etc/sudoers >/dev/null
 systemctl daemon-reload
 systemctl enable lghs-update.service lghs-firstboot-provision.service
 systemctl enable --now avahi-daemon.service bluetooth.service
+if [[ "$ROLE" == "controller" ]]; then
+  # Apply the persistent bluetoothd --compat override now, not only after the
+  # next reboot, so the provisioning service can publish its SDP record.
+  systemctl restart bluetooth.service
+fi
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
   systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
