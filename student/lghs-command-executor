@@ -5,6 +5,7 @@ from pathlib import Path
 SOCK=Path('/run/lghs-command-executor/socket');NETQUEUE='/usr/local/sbin/lghs-netqueue';SEEN=Path('/var/lib/lghs/executor-seen.json')
 ACTIONS={'lghs-update':[NETQUEUE,'enqueue','local-update'],'os-update':[NETQUEUE,'enqueue','os-update']}
 STATUS={'lghs-update':Path('/var/lib/lghs/update/lghs-status.json'),'os-update':Path('/var/lib/lghs/update/os-status.json')}
+AUDIT={'sudo':Path('/var/log/sudo.log'),'audit':Path('/var/log/lghs-sudo-audit.jsonl'),'update':Path('/var/log/lghs-update.log'),'os-update':Path('/var/log/lghs-os-update.log')}
 def load_json(p,d):
     try:return json.loads(p.read_text(encoding='utf-8'))
     except Exception:return d
@@ -18,6 +19,16 @@ def pi_health():
             out.update({'throttled_raw':raw,'undervoltage_now':bool(flags&1),'frequency_capped_now':bool(flags&2),'throttled_now':bool(flags&4),'soft_temp_limit_now':bool(flags&8),'undervoltage_occurred':bool(flags&(1<<16)),'frequency_capped_occurred':bool(flags&(1<<17)),'throttled_occurred':bool(flags&(1<<18)),'soft_temp_limit_occurred':bool(flags&(1<<19))})
         except Exception:pass
     return out
+def audit_chunk(req):
+    kind=str(req.get('kind') or '');path=AUDIT.get(kind)
+    if path is None:return {'ok':False,'error':'unknown-audit-kind'}
+    try:offset=max(0,int(req.get('offset') or 0));limit=max(1,min(int(req.get('limit') or 16384),32768))
+    except Exception:return {'ok':False,'error':'invalid-audit-range'}
+    if not path.exists():return {'ok':True,'kind':kind,'inode':0,'offset':0,'next_offset':0,'text':''}
+    st=path.stat();inode=int(st.st_ino)
+    if offset>st.st_size:offset=0
+    with path.open('rb') as f:f.seek(offset);raw=f.read(limit)
+    return {'ok':True,'kind':kind,'inode':inode,'offset':offset,'next_offset':offset+len(raw),'size':st.st_size,'text':raw.decode('utf-8','replace')}
 def reply(c,obj):c.sendall((json.dumps(obj,separators=(',',':'))+'\n').encode())
 def handle(c):
     data=b''
@@ -28,6 +39,7 @@ def handle(c):
     try:req=json.loads(data.split(b'\n',1)[0])
     except Exception:reply(c,{'ok':False,'error':'invalid-json'});return
     if req.get('op')=='status':reply(c,{'ok':True,'updates':{k:load_json(v,{}) for k,v in STATUS.items()},'health':pi_health()});return
+    if req.get('op')=='audit':reply(c,audit_chunk(req));return
     cid=str(req.get('id') or '');action=str(req.get('action') or '')
     if not cid or len(cid)>128:reply(c,{'ok':False,'error':'invalid-command-id'});return
     if action not in ACTIONS:reply(c,{'ok':False,'error':'unsupported-action'});return
