@@ -2,6 +2,7 @@
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -18,10 +19,20 @@ TOKENS = Path(os.environ.get("LGHS_FLEET_API_TOKENS", "/etc/lghs/fleet-api-token
 ROLE = Path("/etc/lghs/role")
 ALIAS_PREFIX = "LGHS-PROVISION-"
 SOCKET_TIMEOUT = 20
+SOL_BLUETOOTH = getattr(socket, "SOL_BLUETOOTH", 274)
+BT_SECURITY = getattr(socket, "BT_SECURITY", 4)
+BT_SECURITY_LOW = 1
 
 
 def run(cmd):
     return subprocess.run(cmd, text=True, capture_output=True)
+
+
+def set_app_authenticated_security(sock):
+    # Bootstrap authentication/encryption is provided by the LGHS protocol
+    # (token proof + X25519/HKDF + AES-GCM), so do not require an interactive
+    # BlueZ pairing step before the RFCOMM socket can be established.
+    sock.setsockopt(SOL_BLUETOOTH, BT_SECURITY, struct.pack("BB", BT_SECURITY_LOW, 0))
 
 
 def controller_id():
@@ -156,6 +167,7 @@ def main():
         raise SystemExit("Python lacks AF_BLUETOOTH support")
     server = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    set_app_authenticated_security(server)
     server.bind((socket.BDADDR_ANY, CHANNEL))
     server.listen(5)
     print(f"LGHS Bluetooth provisioning listening on RFCOMM channel {CHANNEL}", flush=True)
