@@ -1,0 +1,25 @@
+[Unit]
+Description=LGHS Bluetooth Wi-Fi Provisioning Server
+After=bluetooth.service NetworkManager.service
+Wants=bluetooth.service NetworkManager.service
+ConditionPathExists=/etc/lghs/role
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/lghs-bt-provision
+Restart=always
+RestartSec=5
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadOnlyPaths=/etc/lghs
+ReadWritePaths=/var/lib/lghs /run
+
+[Install]
+WantedBy=multi-user.target
