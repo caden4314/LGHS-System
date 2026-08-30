@@ -6,11 +6,19 @@ SOCK=Path('/run/lghs-command-executor/socket');NETQUEUE='/usr/local/sbin/lghs-ne
 ACTIONS={'lghs-update':[NETQUEUE,'enqueue','local-update'],'os-update':[NETQUEUE,'enqueue','os-update']}
 STATUS={'lghs-update':Path('/var/lib/lghs/update/lghs-status.json'),'os-update':Path('/var/lib/lghs/update/os-status.json')}
 AUDIT={'sudo':Path('/var/log/sudo.log'),'audit':Path('/var/log/lghs-sudo-audit.jsonl'),'update':Path('/var/log/lghs-update.log'),'os-update':Path('/var/log/lghs-os-update.log')}
+SERVICES=('NetworkManager.service','ssh.service','lghs-policy.service','lghs-update.timer','lghs-reconcile.timer','lghs-netqueue.timer','lghs-agent.service','lghs-command-executor.service')
 def load_json(p,d):
     try:return json.loads(p.read_text(encoding='utf-8'))
     except Exception:return d
 def save_seen(x):
     SEEN.parent.mkdir(parents=True,exist_ok=True);t=SEEN.with_suffix('.tmp');t.write_text(json.dumps(x,separators=(',',':'))+'\n',encoding='utf-8');os.chmod(t,0o600);os.replace(t,SEEN)
+def service_states():
+    out={}
+    for unit in SERVICES:
+        try:
+            p=subprocess.run(['systemctl','is-active',unit],text=True,capture_output=True,timeout=2);out[unit]=(p.stdout or '').strip() or 'unknown'
+        except Exception:out[unit]='unknown'
+    return out
 def pi_health():
     out={'reboot_required':Path('/run/reboot-required').exists()}
     if shutil.which('vcgencmd'):
@@ -38,7 +46,7 @@ def handle(c):
         data+=chunk
     try:req=json.loads(data.split(b'\n',1)[0])
     except Exception:reply(c,{'ok':False,'error':'invalid-json'});return
-    if req.get('op')=='status':reply(c,{'ok':True,'updates':{k:load_json(v,{}) for k,v in STATUS.items()},'health':pi_health()});return
+    if req.get('op')=='status':reply(c,{'ok':True,'updates':{k:load_json(v,{}) for k,v in STATUS.items()},'health':pi_health(),'services':service_states()});return
     if req.get('op')=='audit':reply(c,audit_chunk(req));return
     cid=str(req.get('id') or '');action=str(req.get('action') or '')
     if not cid or len(cid)>128:reply(c,{'ok':False,'error':'invalid-command-id'});return
