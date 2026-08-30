@@ -3,23 +3,23 @@
 import json,os,socket,threading,time,urllib.request
 from pathlib import Path
 
-STATE_ROOT=Path('/var/lib/lghs-agent'); CONF=STATE_ROOT/'fleet-api.conf'; TOKEN=STATE_ROOT/'fleet-api-token'; STATE=STATE_ROOT/'state.json'; VERSION=STATE_ROOT/'version'; BOOT=Path('/proc/sys/kernel/random/boot_id'); EXECUTOR='/run/lghs-command-executor/socket'
-REPORT_INTERVAL=float(os.environ.get('LGHS_AGENT_REPORT_SECONDS','5')); LONG_POLL=float(os.environ.get('LGHS_AGENT_LONG_POLL_SECONDS','25')); TIMEOUT=35
-LOCK=threading.RLock(); STOP=threading.Event(); ACTIVE={'checking','queued','downloading','preparing','installing','validating','cleaning','finishing','rolling_back','busy','rebooting'}
+STATE_ROOT=Path('/var/lib/lghs-agent');CONF=STATE_ROOT/'fleet-api.conf';TOKEN=STATE_ROOT/'fleet-api-token';STATE=STATE_ROOT/'state.json';VERSION=STATE_ROOT/'version';BOOT=Path('/proc/sys/kernel/random/boot_id');EXECUTOR='/run/lghs-command-executor/socket'
+REPORT_INTERVAL=float(os.environ.get('LGHS_AGENT_REPORT_SECONDS','5'));LONG_POLL=float(os.environ.get('LGHS_AGENT_LONG_POLL_SECONDS','25'));TIMEOUT=35
+LOCK=threading.RLock();STOP=threading.Event();ACTIVE={'checking','queued','downloading','preparing','installing','validating','cleaning','finishing','rolling_back','busy','rebooting'}
 
 def load_json(path,default):
     try:return json.loads(path.read_text(encoding='utf-8'))
     except Exception:return default
 
 def atomic(path,value):
-    path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_suffix('.tmp'); tmp.write_text(json.dumps(value,separators=(',',':'))+'\n',encoding='utf-8'); os.chmod(tmp,0o600); os.replace(tmp,path)
+    path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value,separators=(',',':'))+'\n',encoding='utf-8');os.chmod(tmp,0o600);os.replace(tmp,path)
 
 def parse_conf():
     out={}
     try:
         for line in CONF.read_text(encoding='utf-8').splitlines():
             if '=' in line and not line.lstrip().startswith('#'):
-                k,v=line.split('=',1); out[k.strip()]=v.strip()
+                k,v=line.split('=',1);out[k.strip()]=v.strip()
     except Exception:pass
     return out
 
@@ -42,36 +42,48 @@ def next_sequence():
     with LOCK:STATE_DATA['sequence']=int(STATE_DATA.get('sequence',0))+1;save();return STATE_DATA['sequence']
 
 def rpc(obj):
-    raw=(json.dumps(obj,separators=(',',':'))+'\n').encode(); s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(10); s.connect(EXECUTOR); s.sendall(raw); data=b''
+    raw=(json.dumps(obj,separators=(',',':'))+'\n').encode();s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(10);s.connect(EXECUTOR);s.sendall(raw);data=b''
     while b'\n' not in data:
         chunk=s.recv(4096)
         if not chunk:break
         data+=chunk
-    s.close(); return json.loads(data.split(b'\n',1)[0])
+    s.close();return json.loads(data.split(b'\n',1)[0])
 
 def cpu_sample():
     def r():
-        nums=list(map(int,Path('/proc/stat').read_text().splitlines()[0].split()[1:])); return sum(nums),nums[3]+nums[4]
+        nums=list(map(int,Path('/proc/stat').read_text().splitlines()[0].split()[1:]));return sum(nums),nums[3]+nums[4]
     a=r();time.sleep(.05);b=r();dt=b[0]-a[0];return round(100*(dt-(b[1]-a[1]))/dt,1) if dt>0 else 0.0
+
+def wifi_signal():
+    try:
+        for line in Path('/proc/net/wireless').read_text().splitlines()[2:]:
+            if ':' in line:
+                iface,rest=line.split(':',1);parts=rest.split();return {'interface':iface.strip(),'quality':float(parts[1].rstrip('.')),'signal_dbm':float(parts[2].rstrip('.'))}
+    except Exception:pass
+    return {}
+
+def clock_synced():
+    p=Path('/run/systemd/timesync/synchronized')
+    return p.exists()
 
 def metrics():
     mem={}
     for line in Path('/proc/meminfo').read_text().splitlines():
         if ':' in line:
             k,v=line.split(':',1);mem[k]=int(v.strip().split()[0])*1024
-    st=os.statvfs('/');total=st.f_blocks*st.f_frsize;free=st.f_bavail*st.f_frsize
+    st=os.statvfs('/');total=st.f_blocks*st.f_frsize;free=st.f_bavail*st.f_frsize;inode_total=st.f_files;inode_free=st.f_favail
     try:temp=round(int(Path('/sys/class/thermal/thermal_zone0/temp').read_text())/1000,1)
     except Exception:temp=None
-    return {'cpu_pct':cpu_sample(),'mem_pct':round(100*(mem.get('MemTotal',1)-mem.get('MemAvailable',0))/max(mem.get('MemTotal',1),1),1),'disk_pct':round(100*(total-free)/max(total,1),1),'temp_c':temp,'load1':os.getloadavg()[0]}
+    return {'cpu_pct':cpu_sample(),'mem_pct':round(100*(mem.get('MemTotal',1)-mem.get('MemAvailable',0))/max(mem.get('MemTotal',1),1),1),'disk_pct':round(100*(total-free)/max(total,1),1),'inode_pct':round(100*(inode_total-inode_free)/max(inode_total,1),1),'temp_c':temp,'load1':os.getloadavg()[0],'wifi':wifi_signal()}
 
 def executor_status():
     try:return rpc({'op':'status'})
-    except Exception:return {'ok':False,'updates':{},'reboot_required':False}
+    except Exception:return {'ok':False,'updates':{},'health':{}}
 
 def update_progress(rows,status_blob):
     now=time.time();statuses=status_blob.get('updates',{}) if isinstance(status_blob,dict) else {}
     for row in rows:
-        status=statuses.get(row.get('action'),{}); started=float(status.get('started_at') or 0);accepted=float(row.get('accepted_at') or 0)
+        status=statuses.get(row.get('action'),{});started=float(status.get('started_at') or 0);accepted=float(row.get('accepted_at') or 0)
         if not started or started+1<accepted:continue
         u=str(status.get('state') or '').lower()
         if u in ACTIVE:st='running'
@@ -85,7 +97,7 @@ def command_states(status_blob):
     with LOCK:STATE_DATA['commands']=update_progress(STATE_DATA.get('commands',[]),status_blob)[-64:];save();return [dict(x) for x in STATE_DATA['commands'][-32:]]
 
 def envelope():
-    status=executor_status();payload={'metrics':metrics(),'health':{'reboot_required':bool(status.get('reboot_required'))},'command_states':command_states(status),'version':version(),'uptime_seconds':time.clock_gettime(time.CLOCK_BOOTTIME)}
+    status=executor_status();health=dict(status.get('health') or {});health['clock_synchronized']=clock_synced();payload={'metrics':metrics(),'health':health,'command_states':command_states(status),'version':version(),'uptime_seconds':time.clock_gettime(time.CLOCK_BOOTTIME)}
     return {'protocol':1,'agent_version':version(),'device_id':device(),'boot_id':boot_id(),'sequence':next_sequence(),'sent_at':time.time(),'payload':payload}
 
 def request(url,method='GET',body=None):
