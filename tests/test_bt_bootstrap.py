@@ -49,7 +49,7 @@ class BluetoothSourceInvariants(unittest.TestCase):
         src = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
         self.assertIn("/etc/lghs/bluetooth-bootstrap-enabled", src)
         self.assertIn("wifi-provisioned.json", src)
-        self.assertIn('["btmgmt", "find", "-b"]', src)
+        self.assertIn('["btmgmt", "-i", BT_INDEX, "find", "-b"]', src)
         self.assertIn("select.select", src)
         self.assertNotIn("SCAN_INTERVAL", src)
 
@@ -57,7 +57,10 @@ class BluetoothSourceInvariants(unittest.TestCase):
         student = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
         controller = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
         for src in (student, controller):
-            self.assertIn('["btmgmt", "io-cap", "3"]', src)
+            self.assertIn('["btmgmt", "-i", BT_INDEX, "io-cap", "3"]', src)
+            self.assertIn('["btmgmt", "-i", BT_INDEX, "pairable", "on"]', src)
+            self.assertIn("COMMAND_TIMEOUT = 6", src)
+            self.assertIn("subprocess.TimeoutExpired", src)
             self.assertIn("set_app_authenticated_security", src)
         self.assertIn('verify_proof(token, "student"', controller)
         self.assertIn('verify_proof(token, "controller"', student)
