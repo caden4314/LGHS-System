@@ -30,8 +30,8 @@ def run(cmd):
 
 def set_app_authenticated_security(sock):
     # Bootstrap authentication/encryption is provided by the LGHS protocol
-    # (token proof + X25519/HKDF + AES-GCM), so do not require an interactive
-    # BlueZ pairing step before the RFCOMM socket can be established.
+    # (token proof + X25519/HKDF + AES-GCM). BlueZ pairing is intentionally
+    # zero-touch and supplies only the underlying RFCOMM transport.
     sock.setsockopt(SOL_BLUETOOTH, BT_SECURITY, struct.pack("BB", BT_SECURITY_LOW, 0))
 
 
@@ -95,9 +95,33 @@ def active_wifi_profile():
 def configure_adapter():
     run(["rfkill", "unblock", "bluetooth"])
     run(["bluetoothctl", "power", "on"])
+    # Raspberry Pi / BlueZ defaults to DisplayYesNo. RFCOMM then waits for an
+    # interactive SSP confirmation even though first-boot provisioning has no
+    # operator. NoInputNoOutput selects Just Works at the link layer; LGHS
+    # still mutually authenticates and encrypts the provisioning payload.
+    run(["btmgmt", "io-cap", "3"])
+    run(["btmgmt", "pairable", "on"])
     run(["bluetoothctl", "system-alias", ALIAS_PREFIX + controller_id()])
     run(["bluetoothctl", "discoverable-timeout", "0"])
     run(["bluetoothctl", "discoverable", "on"])
+
+
+def ensure_sdp_record():
+    # BlueZ does not publish an SDP record merely because a raw RFCOMM socket
+    # is bound. The installer enables bluetoothd --compat so sdptool can make
+    # channel 17 discoverable. Avoid duplicate records on service restarts.
+    browse = run(["sdptool", "browse", "local"])
+    marker = f"Channel: {CHANNEL}"
+    if browse.returncode == 0 and marker in browse.stdout:
+        return
+    added = run(["sdptool", "add", f"--channel={CHANNEL}", "SP"])
+    if added.returncode != 0:
+        detail = (added.stderr or added.stdout).strip()
+        raise RuntimeError(f"could not register RFCOMM SDP channel {CHANNEL}: {detail or 'sdptool failed'}")
+    verify = run(["sdptool", "browse", "local"])
+    if verify.returncode != 0 or marker not in verify.stdout:
+        raise RuntimeError(f"RFCOMM SDP channel {CHANNEL} was not published")
+    print(f"LGHS Bluetooth SDP service published on RFCOMM channel {CHANNEL}", flush=True)
 
 
 def handle_client(conn, address):
@@ -170,6 +194,7 @@ def main():
     set_app_authenticated_security(server)
     server.bind((socket.BDADDR_ANY, CHANNEL))
     server.listen(5)
+    ensure_sdp_record()
     print(f"LGHS Bluetooth provisioning listening on RFCOMM channel {CHANNEL}", flush=True)
     while True:
         conn, address = server.accept()
