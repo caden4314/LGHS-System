@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REMOTE_USER = "lghs_remote"
+KEY_DIR = Path("/etc/lghs/remote-admins")
+AUTHORIZED_KEYS = Path(f"/home/{REMOTE_USER}/.ssh/authorized_keys")
+REMOTE_SHELL = "/usr/local/sbin/lghs-remote-shell"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise SystemExit("Run with sudo")
+
+
+def normalize_key(raw: str) -> str:
+    raw = raw.strip()
+    parts = raw.split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise SystemExit("Only ssh-ed25519 public keys are accepted")
+    candidate = f"{parts[0]} {parts[1]}\n"
+    p = subprocess.run(["ssh-keygen", "-lf", "-"], input=candidate, text=True, capture_output=True)
+    if p.returncode != 0:
+        raise SystemExit("Invalid Ed25519 public key")
+    return candidate.strip()
+
+
+def fingerprint(key: str) -> str:
+    p = subprocess.run(["ssh-keygen", "-lf", "-"], input=key + "\n", text=True, capture_output=True)
+    return (p.stdout or "").strip()
+
+
+def ensure_layout():
+    KEY_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(KEY_DIR, 0o700)
+    home = Path(f"/home/{REMOTE_USER}")
+    if not home.exists():
+        raise SystemExit(f"Remote user {REMOTE_USER} is not installed. Run controller/install-remote-admin first.")
+    ssh_dir = home / ".ssh"
+    ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    subprocess.run(["chown", "-R", f"{REMOTE_USER}:{REMOTE_USER}", str(ssh_dir)], check=True)
+
+
+def rebuild_authorized_keys():
+    ensure_layout()
+    rows = []
+    options = f'command="{REMOTE_SHELL}",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc'
+    for path in sorted(KEY_DIR.glob("*.pub")):
+        try:
+            key = normalize_key(path.read_text(encoding="utf-8"))
+        except SystemExit:
+            continue
+        rows.append(f"{options} {key} LGHS-remote:{path.stem}")
+    fd, tmp = tempfile.mkstemp(prefix="authorized_keys.", dir=str(AUTHORIZED_KEYS.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if rows:
+                f.write("\n".join(rows) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        subprocess.run(["chown", f"{REMOTE_USER}:{REMOTE_USER}", tmp], check=True)
+        os.replace(tmp, AUTHORIZED_KEYS)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def enroll(name: str):
+    require_root()
+    if not NAME_RE.fullmatch(name):
+        raise SystemExit("Admin name may contain letters, numbers, dot, dash, and underscore only")
+    raw = sys.stdin.read()
+    key = normalize_key(raw)
+    ensure_layout()
+    path = KEY_DIR / f"{name}.pub"
+    path.write_text(key + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    os.chown(path, 0, 0)
+    rebuild_authorized_keys()
+    print(f"ENROLLED {name}")
+    print(fingerprint(key))
+
+
+def revoke(name: str):
+    require_root()
+    if not NAME_RE.fullmatch(name):
+        raise SystemExit("Invalid admin name")
+    path = KEY_DIR / f"{name}.pub"
+    if not path.exists():
+        raise SystemExit(f"Unknown remote admin: {name}")
+    path.unlink()
+    rebuild_authorized_keys()
+    print(f"REVOKED {name}")
+
+
+def list_admins():
+    require_root()
+    ensure_layout()
+    found = False
+    for path in sorted(KEY_DIR.glob("*.pub")):
+        key = normalize_key(path.read_text(encoding="utf-8"))
+        print(f"{path.stem:24} {fingerprint(key)}")
+        found = True
+    if not found:
+        print("No LGHS remote administrators enrolled.")
+
+
+def controller_fingerprint():
+    require_root()
+    pub = Path("/etc/ssh/ssh_host_ed25519_key.pub")
+    if not pub.exists():
+        raise SystemExit("Controller Ed25519 SSH host key not found")
+    key = normalize_key(pub.read_text(encoding="utf-8"))
+    print(f"HOST {os.uname().nodename}")
+    print(fingerprint(key))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Manage LGHS remote administrator SSH identities")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    e = sub.add_parser("enroll")
+    e.add_argument("name")
+    r = sub.add_parser("revoke")
+    r.add_argument("name")
+    sub.add_parser("list")
+    sub.add_parser("fingerprint")
+    args = ap.parse_args()
+    if args.cmd == "enroll":
+        enroll(args.name)
+    elif args.cmd == "revoke":
+        revoke(args.name)
+    elif args.cmd == "list":
+        list_admins()
+    elif args.cmd == "fingerprint":
+        controller_fingerprint()
+
+
+if __name__ == "__main__":
+    main()
