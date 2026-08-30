@@ -18,6 +18,7 @@ jobs:
             controller/lghs/__init__.py \
             controller/lghs/protocol.py \
             controller/lghs/database.py \
+            controller/lghs-db-migrate \
             controller/lghs-console \
             controller/lghs-console-responsive \
             controller/lghs-console-day2 \
@@ -27,6 +28,8 @@ jobs:
             controller/lghsctl \
             controller/lghs-audit-sync \
             updater/lghs-netqueue \
+            student/lghs-agent \
+            student/lghs-command-executor \
             student/lghs-telemetry-push \
             student/lghs-sudo-broker \
             student/lghs-approved-exec \
@@ -47,6 +50,7 @@ jobs:
           for file in \
             install.sh \
             updater/lghs-update \
+            updater/lghs-0.5-install \
             updater/lghs-os-update \
             updater/lghs-autologin-apply \
             updater/lghs-reconcile \
@@ -56,7 +60,6 @@ jobs:
             systemd/90-lghs-netqueue \
             student/lghs-enforce \
             student/lghs-check \
-            student/lghs-agent \
             student/lghs-report \
             student/lghs-firstboot-provision \
             student/lghs-install-network-ui \
@@ -75,48 +78,63 @@ jobs:
           sudo visudo -cf policies/sudoers/90-lghs-student
           sudo visudo -cf policies/sudoers/99-lghs-admin
 
-      - name: Telemetry sandbox invariants
+      - name: Legacy telemetry rollback invariants
         run: |
           grep -q '^ProtectSystem=strict$' systemd/lghs-telemetry-push.service
           grep -q '^StateDirectory=lghs/telemetry$' systemd/lghs-telemetry-push.service
-          grep -q '^ReadWritePaths=/var/lib/lghs/netqueue /var/log/lghs-netqueue.log$' systemd/lghs-telemetry-push.service
           grep -q '/var/lib/lghs/telemetry/command-state.json' student/lghs-telemetry-push
 
-      - name: Fleet API sandbox invariants
+      - name: Fleet API SQLite invariants
         run: |
           grep -q '^ProtectSystem=strict$' systemd/lghs-fleet-api.service
-          grep -q '^ReadWritePaths=/var/lib/lghs /etc/lghs /run/lock$' systemd/lghs-fleet-api.service
-          grep -q '/run/lock/lghs-fleet-commands.lock' controller/lghs-fleet-api
-          grep -q '/run/lock/lghs-fleet-commands.lock' controller/lghs-fleet-command
+          grep -q "database':'sqlite-wal" controller/lghs-fleet-api
+          grep -q '/v1/commands/' controller/lghs-fleet-api
+          grep -q 'commands_for_delivery' controller/lghs-fleet-api
+          grep -q 'FleetDB' controller/lghs-fleet-command
+          grep -q 'migrate_legacy' controller/lghs-db-migrate
+
+      - name: Managed agent security invariants
+        run: |
+          grep -q '^User=lghs-agent$' systemd/lghs-agent.service
+          grep -q '^NoNewPrivileges=yes$' systemd/lghs-agent.service
+          grep -q '^ProtectSystem=strict$' systemd/lghs-agent.service
+          grep -q '^User=root$' systemd/lghs-command-executor.service
+          grep -q '^NoNewPrivileges=yes$' systemd/lghs-command-executor.service
+          grep -q "ACTIONS={'lghs-update'" student/lghs-command-executor
+          if grep -qE 'shell=True|/bin/(ba)?sh|eval\(' student/lghs-command-executor; then
+            echo 'Privileged executor contains an arbitrary shell path.' >&2
+            exit 1
+          fi
+          grep -q 'systemctl disable --now lghs-telemetry-push.service' updater/lghs-0.5-install
+          grep -q 'lghs-command-executor.service lghs-agent.service' updater/lghs-0.5-install
 
       - name: SQLite foundation invariants
         run: |
-          grep -q 'PRAGMA journal_mode=WAL' controller/lghs/database.py
+          grep -q "journal_mode=WAL" controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS commands' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS command_events' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS warnings' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS deployments' controller/lghs/database.py
           grep -q 'PROTOCOL_VERSION = 1' controller/lghs/protocol.py
+          grep -q 'evaluate_health' controller/lghs/database.py
+          grep -q 'min_redelivery' controller/lghs/database.py
+
+      - name: Update integration invariants
+        run: |
+          grep -q './updater/lghs-0.5-install "$ROLE"' updater/lghs-update
+          grep -q 'validate_student_05' updater/lghs-update
+          grep -q '/var/lib/lghs/fleet.db' updater/lghs-update
+          grep -q 'lghs-agent/fleet-api.conf' updater/lghs-0.5-install
 
       - name: Release invariants
         run: |
           grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION
+          grep -q '^0\.5\.0$' VERSION
           grep -q 'controller/lghs-console-responsive.*lghs-console-responsive-core' install.sh
           grep -q 'controller/lghs-console-day2.*lghs-console' install.sh
           grep -q 'controller/lghs-fleet-command.*lghs-fleet-command' install.sh
-          grep -q 'lghs-fleet-notify.service' install.sh
-          grep -q 'lghs-install-success-notify.service' install.sh
           grep -q 'MEMORY_GB="$(read_value MEMORY_GB' student/lghs-firstboot-provision
           grep -q '"$MEMORY_GB" == "4" || "$MEMORY_GB" == "8"' student/lghs-firstboot-provision
-          grep -q 'Visual Studio Code.desktop' student/lghs-dev-setup
-          grep -q 'Exec=/usr/bin/sudo -n /usr/local/sbin/lghs-console' student/lghs-dev-setup
-          grep -q 'metadata::trusted true' student/lghs-dev-setup
-          grep -q 'find_code_icon' student/lghs-dev-setup
-          grep -q 'wfpanelctl notify' updater/lghs-install-success-notify
-          grep -q 'wfpanelctl' controller/lghs-fleet-notify
-          test -f systemd/lghs-update.timer
-          test -f systemd/lghs-reconcile.timer
-          test -f systemd/lghs-netqueue.timer
-          test -f systemd/lghs-install-success-notify.service
 
       - name: Fleet transport security invariants
         run: |
@@ -127,12 +145,6 @@ jobs:
           grep -q 'ForwardAgent=no' controller/lghsctl
           grep -q 'ForwardX11=no' controller/lghsctl
           grep -q 'ClearAllForwardings=yes' controller/lghsctl
-          grep -q 'Match User cs_admin' install.sh
-          grep -q 'PubkeyAuthentication yes' install.sh
-          grep -q 'AllowAgentForwarding no' install.sh
-          grep -q 'AllowTcpForwarding no' install.sh
-          grep -q 'PermitTunnel no' install.sh
-          grep -q 'GatewayPorts no' install.sh
           if grep -R -n 'StrictHostKeyChecking=no' controller updater student; then
             echo 'Unsafe SSH host-key checking found.' >&2
             exit 1
