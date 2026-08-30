@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-import argparse
 import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -25,10 +25,21 @@ PROVISIONED = STATE_DIR / "wifi-provisioned.json"
 TOKEN_PATHS = (Path("/etc/lghs/secrets/fleet-api-token"), Path("/var/lib/lghs-agent/fleet-api-token"))
 CONF_PATHS = (Path("/etc/lghs/fleet-api.conf"), Path("/var/lib/lghs-agent/fleet-api.conf"))
 MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\b")
+SOL_BLUETOOTH = getattr(socket, "SOL_BLUETOOTH", 274)
+BT_SECURITY = getattr(socket, "BT_SECURITY", 4)
+BT_SECURITY_LOW = 1
 
 
 def run(cmd, timeout=None):
     return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+
+
+def set_app_authenticated_security(sock):
+    # The LGHS protocol authenticates both endpoints with the per-device Fleet
+    # token and encrypts the payload with X25519/HKDF + AES-GCM. Keep the
+    # RFCOMM transport itself pairing-free so first-boot provisioning remains
+    # zero-touch instead of waiting on an interactive BlueZ pairing agent.
+    sock.setsockopt(SOL_BLUETOOTH, BT_SECURITY, struct.pack("BB", BT_SECURITY_LOW, 0))
 
 
 def device_id():
@@ -58,10 +69,6 @@ def configure_adapter():
 
 
 def discover_controller():
-    # BlueZ's bluetoothctl discovery/cache path is not reliable for classic
-    # BR/EDR inquiry on all Raspberry Pi/BlueZ combinations. Use the kernel
-    # management interface directly; the controller's RFCOMM service is
-    # classic Bluetooth and advertises its LGHS alias in the inquiry name.
     try:
         inquiry = run(
             ["timeout", str(SCAN_SECONDS), "btmgmt", "find", "-b"],
@@ -83,8 +90,6 @@ def discover_controller():
                 return current_mac, name
             current_mac = None
 
-    # Some BlueZ versions may still populate bluetoothctl's cache during the
-    # management inquiry, so keep this as a compatibility fallback only.
     devices = run(["bluetoothctl", "devices"])
     if devices.returncode == 0:
         for line in devices.stdout.splitlines():
@@ -134,12 +139,12 @@ def validate_wifi(wifi):
         raise ValueError("unsupported Wi-Fi security mode")
     if key_mgmt != "open" and not psk:
         raise ValueError("secured Wi-Fi profile has no PSK")
-    return ssid, key_mgmt, psk, hidden
+    return ssid, key_mgmt, hidden
 
 
 def apply_wifi(wifi):
-    ssid, key_mgmt, psk, hidden = validate_wifi(wifi)
-
+    ssid, key_mgmt, hidden = validate_wifi(wifi)
+    psk = str(wifi.get("psk") or "")
     name = "LGHS-Bootstrap-" + "".join(c if c.isalnum() or c in "._-" else "_" for c in ssid)[:40]
     run(["nmcli", "connection", "delete", name])
     cmd = ["nmcli", "connection", "add", "type", "wifi", "ifname", "*", "con-name", name, "ssid", ssid]
@@ -162,10 +167,11 @@ def apply_wifi(wifi):
     return name
 
 
-def provision(address, dry_run=False):
+def exchange(address, dry_run=False):
     token = fleet_token()
     did = device_id()
     sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    set_app_authenticated_security(sock)
     sock.settimeout(20)
     try:
         sock.connect((address, CHANNEL))
@@ -195,9 +201,9 @@ def provision(address, dry_run=False):
         payload = decrypt_payload(key, tx, response)
         if payload.get("type") != "wifi_profile" or not isinstance(payload.get("wifi"), dict):
             raise ValueError("invalid Wi-Fi provisioning payload")
-
         wifi = payload["wifi"]
-        ssid, key_mgmt, _psk, hidden = validate_wifi(wifi)
+        ssid, key_mgmt, hidden = validate_wifi(wifi)
+
         if dry_run:
             send_frame(sock, {"v": PROTOCOL_VERSION, "type": "result", "status": "dry-run-ok"})
             print("Authenticated Bluetooth bootstrap handshake succeeded.")
@@ -232,43 +238,34 @@ def provision(address, dry_run=False):
         sock.close()
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="LGHS encrypted Bluetooth Wi-Fi bootstrap client")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="discover, authenticate, derive/decrypt the provisioning payload, and validate it without changing Wi-Fi",
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv=None):
-    args = parse_args(argv)
+def main():
+    dry_run = "--dry-run" in sys.argv[1:]
+    unknown = [arg for arg in sys.argv[1:] if arg != "--dry-run"]
+    if unknown:
+        print("Usage: lghs-bt-bootstrap [--dry-run]", file=sys.stderr)
+        return 2
     if os.geteuid() != 0:
         raise SystemExit("Run as root")
     if not hasattr(socket, "AF_BLUETOOTH"):
         raise SystemExit("Python lacks AF_BLUETOOTH support")
-
-    if not args.dry_run:
+    if not dry_run:
         if not ENABLED.exists():
             print("LGHS Bluetooth bootstrap is not enabled on this device.")
             return 0
         if PROVISIONED.exists():
             print("LGHS Bluetooth bootstrap already completed.")
             return 0
-
     configure_adapter()
-
-    if args.dry_run:
+    if dry_run:
         print("LGHS Bluetooth bootstrap dry-run: no NetworkManager changes will be made.", flush=True)
         found = discover_controller()
         if not found:
-            print("No LGHS provisioning controller found.", file=sys.stderr)
+            print("Bluetooth bootstrap dry-run failed: no LGHS controller found", file=sys.stderr)
             return 1
         address, name = found
         print(f"Found {name} at {address}; testing authenticated encrypted handshake", flush=True)
         try:
-            return 0 if provision(address, dry_run=True) else 1
+            return 0 if exchange(address, dry_run=True) else 1
         except Exception as exc:
             print(f"Bluetooth bootstrap dry-run failed: {exc}", file=sys.stderr, flush=True)
             return 1
@@ -280,7 +277,7 @@ def main(argv=None):
             address, name = found
             try:
                 print(f"Found {name}; attempting authenticated provisioning", flush=True)
-                if provision(address):
+                if exchange(address):
                     print("LGHS Bluetooth Wi-Fi bootstrap completed.", flush=True)
                     return 0
             except Exception as exc:
