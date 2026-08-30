@@ -13,18 +13,15 @@ import json
 import os
 import shutil
 import subprocess
-import threading
 import time
-import uuid
 from pathlib import Path
 
 LEGACY = "/usr/local/libexec/lghs-console-legacy"
 REGISTRY_FILE = Path("/etc/lghs/fleet.json")
 CACHE_FILE = Path("/var/lib/lghs/fleet-cache.json")
-COMMANDS_FILE = Path("/var/lib/lghs/fleet-commands.json")
+FLEET_COMMAND = "/usr/local/sbin/lghs-fleet-command"
 CLOUDFLARED = shutil.which("cloudflared") or "/usr/local/bin/cloudflared"
 STALE_SECONDS = float(os.environ.get("LGHS_FLEET_STALE_SECONDS", "15"))
-COMMAND_LOCK = threading.Lock()
 HTTPS_UPDATE_COMMANDS = {
     "sudo -n /usr/local/sbin/lghs-update": "lghs-update",
     "sudo -n /usr/local/sbin/lghs-os-update": "os-update",
@@ -51,20 +48,6 @@ def load_json(path, default):
         return value
     except Exception:
         return default
-
-
-def atomic_json(path, value, mode=0o600):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-    try:
-        tmp.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def load_registry():
@@ -157,32 +140,18 @@ def refresh_fleet(discovered):
 
 
 def queue_https_update(target, action):
+    """Delegate all command creation to the canonical serialized writer."""
     device = str(target_meta(target).get("device") or target).upper()
     if not device or len(device) > 64:
         raise RuntimeError("invalid fleet device")
-    with COMMAND_LOCK:
-        data = load_json(COMMANDS_FILE, {"version": 1, "devices": {}})
-        if not isinstance(data, dict):
-            data = {"version": 1, "devices": {}}
-        data.setdefault("version", 1)
-        devices = data.setdefault("devices", {})
-        if not isinstance(devices, dict):
-            devices = {}
-            data["devices"] = devices
-        rows = devices.setdefault(device, [])
-        if not isinstance(rows, list):
-            rows = []
-            devices[device] = rows
-        for row in rows:
-            if isinstance(row, dict) and row.get("action") == action and row.get("state", "pending") == "pending":
-                return str(row.get("id") or "existing")
-        now = time.time()
-        command_id = uuid.uuid4().hex
-        rows.append({"id": command_id, "action": action, "state": "pending", "created_at": now})
-        devices[device] = rows[-64:]
-        data["updated_at"] = now
-        atomic_json(COMMANDS_FILE, data)
-        return command_id
+    p = subprocess.run(
+        [FLEET_COMMAND, "enqueue", device, action],
+        text=True,
+        capture_output=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout or "fleet command queue failed").strip())
+    return p.stdout.strip().splitlines()[-1] if p.stdout.strip() else "unknown"
 
 
 def trusted_host(target):
