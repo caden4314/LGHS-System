@@ -3,9 +3,8 @@ import hmac,json,os,sys,time,urllib.parse
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 sys.path.insert(0,'/usr/local/lib/lghs-python');sys.path.insert(0,str(Path(__file__).resolve().parent))
-from lghs.audit import record_batches
+from lghs.audit import evaluate_report,record_batches
 from lghs.database import FleetDB
-from lghs.health import evaluate_report
 from lghs.protocol import PROTOCOL_VERSION,ProtocolError,TelemetryEnvelope,response,normalize_device_id
 BIND=os.environ.get('LGHS_FLEET_API_BIND','127.0.0.1');PORT=int(os.environ.get('LGHS_FLEET_API_PORT','8789'));TOKENS=Path('/etc/lghs/fleet-api-tokens.json');CACHE=Path('/var/lib/lghs/fleet-cache.json');DB=FleetDB();MAX_BODY=256*1024
 
