@@ -6,6 +6,7 @@ import math
 import time
 from typing import Any, Mapping
 
+from .health import device_health_gate, normalize_health_gate
 from .protocol import TERMINAL_COMMAND_STATES, normalize_device_id
 
 FAILURE_STATES = frozenset(TERMINAL_COMMAND_STATES - {'succeeded'})
@@ -81,6 +82,7 @@ def normalize_strategy(strategy: Mapping[str, Any] | None, device_count: int) ->
         raise StrategyError('strategy type must be all-at-once or phased')
     if device_count < 1:
         raise StrategyError('deployment has no devices')
+    health_gate = normalize_health_gate(raw.get('health_gate'))
     if kind == 'all-at-once':
         return {
             'type': 'all-at-once',
@@ -91,6 +93,7 @@ def normalize_strategy(strategy: Mapping[str, Any] | None, device_count: int) ->
             'failure_threshold_count': max(2, int(raw.get('failure_threshold_count') or 2)),
             'failure_threshold_percent': float(raw.get('failure_threshold_percent') or 10.0),
             'require_health': str(raw.get('require_health') or 'healthy').lower(),
+            'health_gate': health_gate,
         }
     try:
         canary_count = int(raw.get('canary_count') or 1)
@@ -129,6 +132,7 @@ def normalize_strategy(strategy: Mapping[str, Any] | None, device_count: int) ->
         'failure_threshold_count': count_threshold,
         'failure_threshold_percent': percent_threshold,
         'require_health': str(raw.get('require_health') or 'healthy').lower(),
+        'health_gate': health_gate,
     }
 
 
@@ -215,6 +219,15 @@ def freeze_deployment(
     }
 
 
+def _audit_phase(store: Any, deployment_id: str, phase: int, action: str, detail: Mapping[str, Any], *, now: float) -> None:
+    payload = {'deployment_id': deployment_id, 'phase': int(phase), 'action': action, **dict(detail)}
+    with store.transaction() as db:
+        db.execute(
+            'INSERT INTO audit_events(device_id,kind,severity,created_at,sequence,detail_json) VALUES(NULL,?,?,?,?,?)',
+            ('deployment-wave', 'info', now, None, json.dumps(payload, sort_keys=True, separators=(',', ':'))),
+        )
+
+
 def dispatch_phase(store: Any, deployment_id: str, phase: int, *, deadline_at: float | None = None, now: float | None = None) -> list[str]:
     ts = time.time() if now is None else float(now)
     deployment = store.get_deployment(deployment_id)
@@ -227,6 +240,7 @@ def dispatch_phase(store: Any, deployment_id: str, phase: int, *, deadline_at: f
     if not executions:
         raise StrategyError(f'phase {phase} does not exist')
     created: list[str] = []
+    devices: list[str] = []
     for row in executions:
         if row.get('command_id'):
             continue
@@ -245,11 +259,14 @@ def dispatch_phase(store: Any, deployment_id: str, phase: int, *, deadline_at: f
                 (command_id, ts, deployment_id, device),
             )
         created.append(command_id)
+        devices.append(device)
     with store.transaction() as db:
         db.execute(
             "UPDATE deployments SET state='running',started_at=COALESCE(started_at,?),updated_at=? WHERE deployment_id=?",
             (ts, ts, deployment_id),
         )
+    if created:
+        _audit_phase(store, deployment_id, phase, 'dispatched', {'devices': devices, 'command_ids': created, 'target_commit': deployment['target_commit']}, now=ts)
     return created
 
 
@@ -261,7 +278,8 @@ def _strategy_for(deployment: Mapping[str, Any]) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
-def phase_gate(store: Any, deployment_id: str, phase: int) -> dict[str, Any]:
+def phase_gate(store: Any, deployment_id: str, phase: int, *, now: float | None = None) -> dict[str, Any]:
+    ts = time.time() if now is None else float(now)
     deployment = store.get_deployment(deployment_id)
     if not deployment:
         raise KeyError(deployment_id)
@@ -273,9 +291,8 @@ def phase_gate(store: Any, deployment_id: str, phase: int) -> dict[str, Any]:
     pending: list[str] = []
     verified: list[str] = []
     health_blocked: list[str] = []
+    health_details: dict[str, Any] = {}
     target = str(deployment['target_commit'])
-    require_health = str(strategy.get('require_health') or 'healthy').lower()
-    allowed_health = {'healthy'} if require_health == 'healthy' else {'healthy', 'warning'}
     for row in rows:
         device = str(row['device_id'])
         state = str(row.get('state') or 'queued').lower()
@@ -289,8 +306,9 @@ def phase_gate(store: Any, deployment_id: str, phase: int) -> dict[str, Any]:
         if state != 'succeeded' or str(inventory.get('current_commit') or '').lower() != target.lower():
             pending.append(device)
             continue
-        health = str(inventory.get('health_state') or 'unknown').lower()
-        if health not in allowed_health:
+        gate = device_health_gate(store, device, strategy=strategy, now=ts)
+        health_details[device] = gate
+        if not gate['allowed']:
             health_blocked.append(device)
             continue
         verified.append(device)
@@ -309,11 +327,14 @@ def phase_gate(store: Any, deployment_id: str, phase: int) -> dict[str, Any]:
         state = 'waiting'
         reason = 'phase still executing or awaiting commit verification'
     elif health_blocked:
-        state = 'waiting'
+        first = health_details.get(health_blocked[0], {})
         reason = 'post-update health gate not satisfied'
+        if first.get('reason'):
+            reason += f": {health_blocked[0]}: {first['reason']}"
+        state = 'waiting'
     else:
         state = 'ready'
-        reason = 'phase complete and health verified'
+        reason = 'phase complete and structured health verified'
     return {
         'deployment_id': deployment_id,
         'phase': int(phase),
@@ -324,17 +345,18 @@ def phase_gate(store: Any, deployment_id: str, phase: int) -> dict[str, Any]:
         'failed': failures,
         'pending': pending,
         'health_blocked': health_blocked,
+        'health_details': health_details,
         'failure_rate': round(failure_rate, 2),
     }
 
 
-def rollout_status(store: Any, deployment_id: str) -> dict[str, Any]:
+def rollout_status(store: Any, deployment_id: str, *, now: float | None = None) -> dict[str, Any]:
     deployment = store.get_deployment(deployment_id)
     if not deployment:
         raise KeyError(deployment_id)
     rows = store.list_deployment_executions(deployment_id)
     phases = sorted({int(row.get('phase') or 0) for row in rows})
-    gates = [phase_gate(store, deployment_id, phase) for phase in phases]
+    gates = [phase_gate(store, deployment_id, phase, now=now) for phase in phases]
     dispatched = [phase for phase in phases if any(row.get('command_id') for row in rows if int(row.get('phase') or 0) == phase)]
     active_phase = max(dispatched) if dispatched else None
     next_phase = None
@@ -354,22 +376,27 @@ def rollout_status(store: Any, deployment_id: str) -> dict[str, Any]:
 
 
 def advance_rollout(store: Any, deployment_id: str, *, deadline_at: float | None = None, now: float | None = None) -> dict[str, Any]:
-    status = rollout_status(store, deployment_id)
+    ts = time.time() if now is None else float(now)
+    status = rollout_status(store, deployment_id, now=ts)
     active = status['active_phase']
     if active is not None:
         gate = next(item for item in status['phases'] if item['phase'] == active)
         if gate['state'] == 'paused':
             with store.transaction() as db:
-                db.execute("UPDATE deployments SET state='paused',paused_reason=?,updated_at=? WHERE deployment_id=?", (gate['reason'], time.time() if now is None else float(now), deployment_id))
-            return rollout_status(store, deployment_id)
+                db.execute("UPDATE deployments SET state='paused',paused_reason=?,updated_at=? WHERE deployment_id=?", (gate['reason'], ts, deployment_id))
+            _audit_phase(store, deployment_id, active, 'paused', {'reason': gate['reason'], 'gate': gate}, now=ts)
+            return rollout_status(store, deployment_id, now=ts)
         if gate['state'] != 'ready':
             raise StrategyError(gate['reason'])
     phase = status['next_phase']
     if phase is None:
         if status['phases'] and all(item['state'] == 'ready' for item in status['phases']):
             with store.transaction() as db:
-                ts = time.time() if now is None else float(now)
                 db.execute("UPDATE deployments SET state='succeeded',completed_at=COALESCE(completed_at,?),updated_at=? WHERE deployment_id=?", (ts, ts, deployment_id))
-        return rollout_status(store, deployment_id)
-    dispatch_phase(store, deployment_id, phase, deadline_at=deadline_at, now=now)
-    return rollout_status(store, deployment_id)
+            if active is not None:
+                _audit_phase(store, deployment_id, active, 'completed', {'gate': next(item for item in status['phases'] if item['phase'] == active)}, now=ts)
+        return rollout_status(store, deployment_id, now=ts)
+    dispatch_phase(store, deployment_id, phase, deadline_at=deadline_at, now=ts)
+    if active is not None:
+        _audit_phase(store, deployment_id, active, 'advanced', {'next_phase': phase}, now=ts)
+    return rollout_status(store, deployment_id, now=ts)
