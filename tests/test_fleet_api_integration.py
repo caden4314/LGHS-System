@@ -273,10 +273,11 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         status, detail = self.request('/v1/admin/deployments/dep-http', token='admin-secret')
         self.assertEqual(status, 200)
         self.assertEqual(detail['deployment']['target_commit'], target)
-        self.assertEqual(detail['deployment']['state'], 'succeeded')
+        self.assertEqual(detail['deployment']['state'], 'running')
         self.assertEqual(detail['executions'][0]['previous_commit'], current)
         self.assertEqual(detail['executions'][0]['state'], 'succeeded')
         self.assertEqual(detail['executions'][0]['stage'], 'Complete')
+        self.assertEqual(detail['rollout']['phases'][0]['state'], 'waiting')
 
         status, verifying = self.request('/v1/admin/devices/CS-999', token='admin-secret')
         self.assertEqual(verifying['device']['current_commit'], current)
@@ -288,6 +289,11 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         self.assertEqual(synced['device']['current_commit'], target)
         self.assertEqual(synced['device']['desired_commit'], target)
         self.assertEqual(synced['device']['sync_state'], 'in_sync')
+
+        status, advanced = self.request('/v1/admin/deployments/dep-http/advance', 'POST', {}, token='admin-secret')
+        self.assertEqual(status, 200)
+        self.assertEqual(advanced['deployment']['state'], 'succeeded')
+        self.assertEqual(advanced['phases'][0]['state'], 'ready')
 
         with self.assertRaises(urllib.error.HTTPError) as moving:
             self.request(
