@@ -28,7 +28,8 @@ jobs:
             tests/test_deployment_recovery.py \
             tests/test_fleet_api_recovery.py \
             tests/test_fleet_api_maintenance.py \
-            tests/test_maintenance.py
+            tests/test_maintenance.py \
+            tests/test_reboot_cancel_semantics.py
 
       - name: Frozen target, recovery, maintenance, reboot, and API tests
         run: |
@@ -38,7 +39,8 @@ jobs:
             tests/test_deployment_recovery.py \
             tests/test_fleet_api_recovery.py \
             tests/test_fleet_api_maintenance.py \
-            tests/test_maintenance.py
+            tests/test_maintenance.py \
+            tests/test_reboot_cancel_semantics.py
 
       - name: Security and Fleet Control invariants
         run: |
@@ -53,6 +55,8 @@ jobs:
           grep -q "retry-failed" controller/lghs/recovery.py
           grep -q "current-commit-does-not-match-deployment-target" controller/lghs/recovery.py
           grep -q "reboot-schedule:" controller/lghs/maintenance.py
+          grep -q "CANCELABLE_COMMAND_STATES = frozenset({'queued'})" controller/lghs/maintenance.py
+          grep -q "reboot-execution" controller/lghs/maintenance.py
           grep -q "boot_id_before" controller/lghs/maintenance.py
           grep -q "Waiting for current boot_id before dispatch" controller/lghs/maintenance.py
           grep -q "Reboot verified by boot_id change" controller/lghs/maintenance.py
