@@ -51,6 +51,13 @@ def load_json(path: Path, default: Any) -> Any:
         return default
 
 
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding='utf-8', errors='replace').replace('\x00', '').strip()
+    except Exception:
+        return ''
+
+
 def save_seen(value: dict[str, float]) -> None:
     SEEN.parent.mkdir(parents=True, exist_ok=True)
     tmp = SEEN.with_suffix('.tmp')
@@ -89,8 +96,48 @@ def service_states() -> dict[str, str]:
     return out
 
 
+def pi_inventory() -> dict[str, Any]:
+    mem_kb = 0
+    try:
+        for line in Path('/proc/meminfo').read_text(encoding='utf-8').splitlines():
+            if line.startswith('MemTotal:'):
+                mem_kb = int(line.split()[1])
+                break
+    except Exception:
+        pass
+
+    serial = read_text(Path('/sys/firmware/devicetree/base/serial-number'))
+    if not serial:
+        try:
+            for line in Path('/proc/cpuinfo').read_text(encoding='utf-8').splitlines():
+                if line.lower().startswith('serial') and ':' in line:
+                    serial = line.split(':', 1)[1].strip()
+                    break
+        except Exception:
+            pass
+
+    current_commit = read_text(Path('/var/lib/lghs/update/current-commit')) or read_text(Path('/etc/lghs/source-commit'))
+    current_commit = current_commit.lower()
+    if current_commit and not COMMIT_RE.fullmatch(current_commit):
+        current_commit = ''
+
+    out: dict[str, Any] = {
+        'hostname': socket.gethostname().upper(),
+        'role': read_text(Path('/etc/lghs/role')),
+        'model': read_text(Path('/proc/device-tree/model')),
+        'ram_mb': int(round(mem_kb / 1024)) if mem_kb else None,
+        'serial': serial,
+        'current_commit': current_commit,
+        'current_version': read_text(Path('/etc/lghs/version')),
+    }
+    return {key: value for key, value in out.items() if value not in ('', None)}
+
+
 def pi_health() -> dict[str, Any]:
-    out: dict[str, Any] = {'reboot_required': Path('/run/reboot-required').exists()}
+    out: dict[str, Any] = {
+        'reboot_required': Path('/run/reboot-required').exists(),
+        'inventory': pi_inventory(),
+    }
     if shutil.which('vcgencmd'):
         try:
             proc = subprocess.run(['vcgencmd', 'get_throttled'], text=True, capture_output=True, timeout=3)
