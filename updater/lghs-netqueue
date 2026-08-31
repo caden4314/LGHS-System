@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Persistent, idempotent LGHS offline job queue."""
 import argparse
 import datetime as dt
 import hashlib
@@ -69,11 +70,10 @@ def ensure_dirs():
 
 def log(msg):
     ensure_dirs()
-    line = f'{now_iso()} {msg}\n'
-    with LOG.open('a', encoding='utf-8') as f:
-        f.write(line)
-        f.flush()
-        os.fsync(f.fileno())
+    with LOG.open('a', encoding='utf-8') as handle:
+        handle.write(f'{now_iso()} {msg}\n')
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def atomic_json(path, data):
@@ -81,11 +81,11 @@ def atomic_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '-', dir=str(path.parent))
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, separators=(',', ':'), sort_keys=True)
-            f.write('\n')
-            f.flush()
-            os.fsync(f.fileno())
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(data, handle, separators=(',', ':'), sort_keys=True)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     finally:
@@ -105,7 +105,7 @@ def load_jobs():
             jobs.append(data)
         except Exception as exc:
             log(f'corrupt job retained path={path.name} error={exc}')
-    jobs.sort(key=lambda j: (float(j.get('created_epoch', 0)), j.get('id', '')))
+    jobs.sort(key=lambda item: (float(item.get('created_epoch', 0)), item.get('id', '')))
     return jobs
 
 
@@ -116,7 +116,7 @@ def load_ledger():
         data = {'version': 1, 'entries': {}}
     if not isinstance(data, dict):
         data = {'version': 1, 'entries': {}}
-    entries = data.get('entries', {})
+    entries = data.get('entries')
     if not isinstance(entries, dict):
         entries = {}
     return {'version': 1, 'entries': entries}
@@ -127,10 +127,10 @@ def save_ledger(data):
     if len(entries) > IDEMPOTENCY_LIMIT:
         ordered = sorted(
             entries.items(),
-            key=lambda item: float((item[1] or {}).get('updated_epoch') or (item[1] or {}).get('created_epoch') or 0),
+            key=lambda item: float((item[1] or {}).get('updated_epoch') or 0),
         )
-        removable = [item for item in ordered if str((item[1] or {}).get('state')) == 'completed']
-        for key, _ in removable[:max(0, len(entries) - IDEMPOTENCY_LIMIT)]:
+        completed = [item for item in ordered if str((item[1] or {}).get('state')) == 'completed']
+        for key, _ in completed[:max(0, len(entries) - IDEMPOTENCY_LIMIT)]:
             entries.pop(key, None)
     atomic_json(IDEMPOTENCY_FILE, data)
 
@@ -185,9 +185,9 @@ def enqueue(kind, params, idempotency_key=None):
             if str(entry.get('fingerprint') or '') != fingerprint:
                 raise ValueError('idempotency key reused with different job payload')
             jid = str(entry.get('job_id') or '')
-            state = str(entry.get('state') or 'reserved')
             if not jid:
                 raise ValueError('corrupt idempotency ledger entry')
+            state = str(entry.get('state') or 'reserved')
             path = JOBS_DIR / f'{jid}.json'
             if state == 'completed':
                 path.unlink(missing_ok=True)
@@ -234,14 +234,13 @@ def enqueue(kind, params, idempotency_key=None):
         print(jid)
         return jid
 
-    # Backward-compatible local/manual queue calls dedupe identical pending work.
+    # Backward-compatible local/manual calls dedupe only identical pending jobs.
     for job in load_jobs():
         if same_job(job, kind, params):
             print(job['id'])
             return job['id']
     jid = uuid.uuid4().hex
-    data = new_job(jid, kind, params)
-    atomic_json(JOBS_DIR / f'{jid}.json', data)
+    atomic_json(JOBS_DIR / f'{jid}.json', new_job(jid, kind, params))
     log(f'enqueued id={jid} kind={kind} params={json.dumps(params, separators=(",", ":"))}')
     start_drain()
     print(jid)
@@ -259,8 +258,8 @@ def command_for(job):
     if kind == 'os-update':
         return ['/usr/local/sbin/lghs-os-update']
     if kind == 'fleet':
-        target = str(params.get('target', '')).strip()
-        action = str(params.get('action', '')).strip()
+        target = str(params.get('target') or '').strip()
+        action = str(params.get('action') or '').strip()
         if not target or action not in ALLOWED_FLEET_ACTIONS:
             raise ValueError('invalid fleet queue job')
         return ['/usr/local/sbin/lghsctl', *ALLOWED_FLEET_ACTIONS[action], target]
@@ -276,13 +275,13 @@ def run_job(job):
     if job.get('idempotency_key'):
         env['LGHS_IDEMPOTENCY_KEY'] = str(job['idempotency_key'])
     try:
-        p = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=3600)
+        proc = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=3600)
     except subprocess.TimeoutExpired:
         return 124, 'timed out after 3600 seconds'
     except Exception as exc:
         return 127, str(exc)
-    detail = (p.stderr or p.stdout or '').strip()
-    return p.returncode, detail[-2000:]
+    detail = (proc.stderr or proc.stdout or '').strip()
+    return proc.returncode, detail[-2000:]
 
 
 def ledger_before_run(job):
@@ -329,6 +328,11 @@ def ledger_after_run(job, rc, detail):
         entry['completed_epoch'] = now
         entry['completed_at'] = now_iso()
         entry['last_error'] = ''
+    elif rc == 124:
+        # Timeout means the child may have crossed a side-effect boundary.
+        # Never execute it again automatically.
+        entry['state'] = 'uncertain'
+        entry['last_error'] = f'exit={rc} {detail}'[:2000]
     else:
         entry['state'] = 'pending'
         entry['last_error'] = f'exit={rc} {detail}'[:2000]
@@ -365,6 +369,9 @@ def drain():
                 subprocess.Popen(['systemctl', 'reboot'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return 0
             continue
+        if rc == 124 and job.get('idempotency_key'):
+            log(f'uncertain id={jid} kind={job.get("kind")} after timeout; explicit retry required')
+            continue
         attempts = int(job.get('attempts', 0)) + 1
         backoff = min(MAX_BACKOFF, max(30, 30 * (2 ** min(attempts - 1, 5))))
         job.pop('_path', None)
@@ -374,7 +381,6 @@ def drain():
         job['next_try_epoch'] = time.time() + backoff
         atomic_json(path, job)
         log(f'deferred id={jid} kind={job.get("kind")} exit={rc} retry_in={backoff}s')
-    # Deferred or uncertain work is an expected state, not a service failure.
     return 0
 
 
@@ -428,17 +434,22 @@ def show_status():
 
 def main():
     require_root()
-    ap = argparse.ArgumentParser(prog='lghs-netqueue', description='Persistent LGHS offline network job queue')
-    sub = ap.add_subparsers(dest='cmd', required=True)
-    ep = sub.add_parser('enqueue')
-    ep.add_argument('kind', choices=['local-update', 'os-update', 'fleet'])
-    ep.add_argument('args', nargs='*')
-    ep.add_argument('--idempotency-key')
+    parser = argparse.ArgumentParser(prog='lghs-netqueue', description='Persistent LGHS offline network job queue')
+    sub = parser.add_subparsers(dest='cmd', required=True)
+
+    enqueue_parser = sub.add_parser('enqueue')
+    enqueue_parser.add_argument('kind', choices=['local-update', 'os-update', 'fleet'])
+    enqueue_parser.add_argument('target', nargs='?')
+    enqueue_parser.add_argument('action', nargs='?')
+    enqueue_parser.add_argument('--commit')
+    enqueue_parser.add_argument('--reboot', action='store_true')
+    enqueue_parser.add_argument('--idempotency-key')
+
     sub.add_parser('drain')
     sub.add_parser('status')
     retry = sub.add_parser('retry')
     retry.add_argument('idempotency_key')
-    args = ap.parse_args()
+    args = parser.parse_args()
 
     if args.cmd == 'status':
         return show_status()
@@ -450,39 +461,30 @@ def main():
         except ValueError as exc:
             raise SystemExit(str(exc)) from None
         return 0
-    if args.kind == 'local-update':
-        params = {}
-        if args.args:
-            if len(args.args) != 2 or args.args[0] != '--commit':
-                raise SystemExit('local-update usage: lghs-netqueue enqueue local-update [--commit SHA] [--idempotency-key KEY]')
-            try:
-                params['target_commit'] = normalize_commit(args.args[1])
-            except ValueError as exc:
-                raise SystemExit(str(exc)) from None
-        try:
+
+    try:
+        if args.kind == 'local-update':
+            if args.target or args.action or args.reboot:
+                raise ValueError('local-update usage: lghs-netqueue enqueue local-update [--commit SHA] [--idempotency-key KEY]')
+            params = {}
+            if args.commit:
+                params['target_commit'] = normalize_commit(args.commit)
             enqueue('local-update', params, args.idempotency_key)
-        except (ValueError, RuntimeError) as exc:
-            raise SystemExit(str(exc)) from None
-        return 0
-    if args.kind == 'os-update':
-        if any(x != '--reboot' for x in args.args):
-            raise SystemExit('os-update only accepts --reboot')
-        try:
-            enqueue('os-update', {'reboot': '--reboot' in args.args}, args.idempotency_key)
-        except (ValueError, RuntimeError) as exc:
-            raise SystemExit(str(exc)) from None
-        return 0
-    if args.kind == 'fleet':
-        if len(args.args) != 2:
-            raise SystemExit('fleet queue usage: lghs-netqueue enqueue fleet TARGET ACTION')
-        target, action = args.args
-        if action not in ALLOWED_FLEET_ACTIONS:
-            raise SystemExit('unsupported queued fleet action')
-        try:
-            enqueue('fleet', {'target': target, 'action': action}, args.idempotency_key)
-        except (ValueError, RuntimeError) as exc:
-            raise SystemExit(str(exc)) from None
-        return 0
+            return 0
+        if args.kind == 'os-update':
+            if args.target or args.action or args.commit:
+                raise ValueError('os-update usage: lghs-netqueue enqueue os-update [--reboot] [--idempotency-key KEY]')
+            enqueue('os-update', {'reboot': bool(args.reboot)}, args.idempotency_key)
+            return 0
+        if args.kind == 'fleet':
+            if not args.target or not args.action or args.commit or args.reboot:
+                raise ValueError('fleet queue usage: lghs-netqueue enqueue fleet TARGET ACTION [--idempotency-key KEY]')
+            if args.action not in ALLOWED_FLEET_ACTIONS:
+                raise ValueError('unsupported queued fleet action')
+            enqueue('fleet', {'target': args.target, 'action': args.action}, args.idempotency_key)
+            return 0
+    except (ValueError, RuntimeError) as exc:
+        raise SystemExit(str(exc)) from None
     return 2
 
 
