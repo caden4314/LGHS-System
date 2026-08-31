@@ -444,7 +444,7 @@ def reconcile_reboot_schedule(store: Any, schedule_id: str, *, now: float | None
         if row_state in TERMINAL_REBOOT_STATES:
             continue
         inventory = store.get_device(device) or {}
-        boot_now = str(inventory.get('boot_id') or '')
+        boot_now = str(inventory.get('boot_id') or '').strip()
         command_id = row.get('command_id')
         if command_id:
             command = store.get_command(str(command_id)) or {}
@@ -490,11 +490,19 @@ def reconcile_reboot_schedule(store: Any, schedule_id: str, *, now: float | None
                 continue
         elif not maintenance_state(store, device, now=ts)['allowed']:
             continue
+        if not boot_now:
+            if row.get('message') != 'Waiting for current boot_id before dispatch':
+                row.update({'state': 'queued', 'updated_at': ts, 'message': 'Waiting for current boot_id before dispatch'})
+                executions[device] = row
+                changed = True
+                actions.append({'device_id': device, 'action': 'waiting-for-boot-id'})
+            continue
+        row['boot_id_before'] = boot_now
         command_id = _dispatch_reboot(store, schedule, device, now=ts)
         row.update({'state': 'dispatched', 'command_id': command_id, 'dispatched_at': ts, 'updated_at': ts, 'message': 'Reboot command dispatched'})
         executions[device] = row
         changed = True
-        actions.append({'device_id': device, 'action': 'dispatched', 'command_id': command_id})
+        actions.append({'device_id': device, 'action': 'dispatched', 'command_id': command_id, 'boot_id_before': boot_now})
 
     schedule['executions'] = executions
     states = [str(row.get('state') or '') for row in executions.values()]
