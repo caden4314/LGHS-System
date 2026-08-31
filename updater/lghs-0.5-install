@@ -29,6 +29,7 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0644 "$ROOT/controller/lghs/sudo_state.py" /usr/local/lib/lghs-python/lghs/sudo_state.py
   install -m 0644 "$ROOT/controller/lghs/rollout.py" /usr/local/lib/lghs-python/lghs/rollout.py
   install -m 0644 "$ROOT/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
+  install -m 0644 "$ROOT/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
   install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
