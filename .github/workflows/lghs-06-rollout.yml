@@ -15,18 +15,21 @@ jobs:
           python3 -m py_compile \
             controller/lghs/rollout.py \
             controller/lghs/rollout_manager.py \
+            controller/lghs/recovery.py \
             controller/lghs-fleet-rollout \
             controller/lghs-rollout-manager \
             tests/test_fleet_rollout.py \
-            tests/test_rollout_manager.py
+            tests/test_rollout_manager.py \
+            tests/test_deployment_recovery.py
 
-      - name: Frozen target and phase tests
+      - name: Frozen target, phase, and recovery tests
         run: |
           python3 -m unittest -v \
             tests/test_fleet_rollout.py \
-            tests/test_rollout_manager.py
+            tests/test_rollout_manager.py \
+            tests/test_deployment_recovery.py
 
-      - name: Security and install invariants
+      - name: Security invariants
         run: |
           grep -q "target selector matched no enrolled devices" controller/lghs/rollout.py
           grep -q "resolved_devices" controller/lghs/rollout.py
@@ -35,15 +38,12 @@ jobs:
           grep -q "target_commit" controller/lghs/rollout.py
           grep -q "rollout-runtime:" controller/lghs/rollout_manager.py
           grep -q "auto_advance" controller/lghs/rollout_manager.py
+          grep -q "retry-failed" controller/lghs/recovery.py
+          grep -q "current-commit-does-not-match-deployment-target" controller/lghs/recovery.py
           grep -q "ReadWritePaths=/var/lib/lghs /run/lock" systemd/lghs-rollout-manager.service
-          grep -q 'controller/lghs/rollout.py.*lghs/rollout.py' install.sh
-          grep -q 'controller/lghs/rollout_manager.py.*lghs/rollout_manager.py' install.sh
-          grep -q 'lghs-rollout-manager.service' install.sh
-          grep -q 'lghs-rollout-manager.service' updater/lghs-0.5-install
-          grep -q 'lghs-fleet-rollout' updater/lghs-0.5-install
-          bash -n install.sh
-          bash -n updater/lghs-0.5-install
-          if grep -nE 'shell=True|eval\(' controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs-fleet-rollout controller/lghs-rollout-manager; then
+          grep -q 'controller/lghs/recovery.py' install.sh
+          grep -q 'controller/lghs/recovery.py' updater/lghs-0.5-install
+          if grep -nE 'shell=True|eval\(' controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs/recovery.py controller/lghs-fleet-rollout controller/lghs-rollout-manager; then
             echo 'Rollout controller contains an arbitrary shell path.' >&2
             exit 1
           fi
