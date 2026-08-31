@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -12,9 +13,12 @@ from pathlib import Path
 
 QUEUE_DIR = Path('/var/lib/lghs/netqueue')
 JOBS_DIR = QUEUE_DIR / 'jobs'
+IDEMPOTENCY_FILE = QUEUE_DIR / 'idempotency.json'
 LOG = Path('/var/log/lghs-netqueue.log')
 MAX_BACKOFF = 900
+IDEMPOTENCY_LIMIT = 2048
 COMMIT_RE = re.compile(r'^[0-9a-fA-F]{40}$')
+IDEMPOTENCY_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$')
 
 ALLOWED_FLEET_ACTIONS = {
     'update': ['update'],
@@ -39,6 +43,13 @@ def normalize_commit(value):
     if not COMMIT_RE.fullmatch(commit):
         raise ValueError('target commit must be an exact 40-character Git SHA')
     return commit
+
+
+def normalize_idempotency_key(value):
+    key = str(value or '').strip()
+    if not IDEMPOTENCY_RE.fullmatch(key):
+        raise ValueError('invalid idempotency key')
+    return key
 
 
 def ensure_dirs():
@@ -67,7 +78,8 @@ def log(msg):
 
 def atomic_json(path, data):
     ensure_dirs()
-    fd, tmp = tempfile.mkstemp(prefix='.job-', dir=str(JOBS_DIR))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '-', dir=str(path.parent))
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(data, f, separators=(',', ':'), sort_keys=True)
@@ -97,18 +109,43 @@ def load_jobs():
     return jobs
 
 
+def load_ledger():
+    try:
+        data = json.loads(IDEMPOTENCY_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        data = {'version': 1, 'entries': {}}
+    if not isinstance(data, dict):
+        data = {'version': 1, 'entries': {}}
+    entries = data.get('entries', {})
+    if not isinstance(entries, dict):
+        entries = {}
+    return {'version': 1, 'entries': entries}
+
+
+def save_ledger(data):
+    entries = data.setdefault('entries', {})
+    if len(entries) > IDEMPOTENCY_LIMIT:
+        ordered = sorted(
+            entries.items(),
+            key=lambda item: float((item[1] or {}).get('updated_epoch') or (item[1] or {}).get('created_epoch') or 0),
+        )
+        removable = [item for item in ordered if str((item[1] or {}).get('state')) == 'completed']
+        for key, _ in removable[:max(0, len(entries) - IDEMPOTENCY_LIMIT)]:
+            entries.pop(key, None)
+    atomic_json(IDEMPOTENCY_FILE, data)
+
+
+def job_fingerprint(kind, params):
+    raw = json.dumps({'kind': kind, 'params': params}, separators=(',', ':'), sort_keys=True).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
 def same_job(job, kind, params):
     return job.get('kind') == kind and job.get('params', {}) == params
 
 
-def enqueue(kind, params):
-    ensure_dirs()
-    for job in load_jobs():
-        if same_job(job, kind, params):
-            print(job['id'])
-            return job['id']
-    jid = uuid.uuid4().hex
-    now = time.time()
+def new_job(jid, kind, params, idempotency_key=None, created_epoch=None):
+    now = time.time() if created_epoch is None else float(created_epoch)
     data = {
         'id': jid,
         'kind': kind,
@@ -119,8 +156,13 @@ def enqueue(kind, params):
         'next_try_epoch': now,
         'last_error': '',
     }
-    atomic_json(JOBS_DIR / f'{jid}.json', data)
-    log(f'enqueued id={jid} kind={kind} params={json.dumps(params, separators=(",", ":"))}')
+    if idempotency_key:
+        data['idempotency_key'] = idempotency_key
+        data['fingerprint'] = job_fingerprint(kind, params)
+    return data
+
+
+def start_drain():
     try:
         subprocess.Popen(
             ['systemctl', 'start', '--no-block', 'lghs-netqueue.service'],
@@ -129,6 +171,79 @@ def enqueue(kind, params):
         )
     except Exception:
         pass
+
+
+def enqueue(kind, params, idempotency_key=None):
+    ensure_dirs()
+    if idempotency_key:
+        key = normalize_idempotency_key(idempotency_key)
+        fingerprint = job_fingerprint(kind, params)
+        ledger = load_ledger()
+        entries = ledger['entries']
+        entry = entries.get(key)
+        if isinstance(entry, dict):
+            if str(entry.get('fingerprint') or '') != fingerprint:
+                raise ValueError('idempotency key reused with different job payload')
+            jid = str(entry.get('job_id') or '')
+            state = str(entry.get('state') or 'reserved')
+            if not jid:
+                raise ValueError('corrupt idempotency ledger entry')
+            path = JOBS_DIR / f'{jid}.json'
+            if state == 'completed':
+                path.unlink(missing_ok=True)
+                print(jid)
+                return jid
+            if state in {'executing', 'uncertain'}:
+                entry['state'] = 'uncertain'
+                entry['updated_epoch'] = time.time()
+                entry['updated_at'] = now_iso()
+                save_ledger(ledger)
+                raise RuntimeError(f'idempotent job {jid} has uncertain prior execution; use retry explicitly')
+            if not path.exists():
+                atomic_json(path, new_job(jid, kind, params, key, entry.get('created_epoch')))
+                log(f'restored reserved idempotent job id={jid} key={key}')
+            entry['state'] = 'pending'
+            entry['updated_epoch'] = time.time()
+            entry['updated_at'] = now_iso()
+            save_ledger(ledger)
+            start_drain()
+            print(jid)
+            return jid
+
+        jid = 'idem-' + hashlib.sha256(key.encode()).hexdigest()[:24]
+        created = time.time()
+        entries[key] = {
+            'job_id': jid,
+            'fingerprint': fingerprint,
+            'kind': kind,
+            'params': params,
+            'state': 'reserved',
+            'created_epoch': created,
+            'created_at': now_iso(),
+            'updated_epoch': created,
+            'updated_at': now_iso(),
+        }
+        save_ledger(ledger)
+        atomic_json(JOBS_DIR / f'{jid}.json', new_job(jid, kind, params, key, created))
+        entries[key]['state'] = 'pending'
+        entries[key]['updated_epoch'] = time.time()
+        entries[key]['updated_at'] = now_iso()
+        save_ledger(ledger)
+        log(f'enqueued id={jid} kind={kind} idempotency_key={key} params={json.dumps(params, separators=(",", ":"))}')
+        start_drain()
+        print(jid)
+        return jid
+
+    # Backward-compatible local/manual queue calls dedupe identical pending work.
+    for job in load_jobs():
+        if same_job(job, kind, params):
+            print(job['id'])
+            return job['id']
+    jid = uuid.uuid4().hex
+    data = new_job(jid, kind, params)
+    atomic_json(JOBS_DIR / f'{jid}.json', data)
+    log(f'enqueued id={jid} kind={kind} params={json.dumps(params, separators=(",", ":"))}')
+    start_drain()
     print(jid)
     return jid
 
@@ -158,6 +273,8 @@ def run_job(job):
     env['LGHS_NETQUEUE_RUNNING'] = '1'
     if job.get('kind') == 'local-update' and job.get('params', {}).get('target_commit'):
         env['LGHS_TARGET_COMMIT'] = normalize_commit(job['params']['target_commit'])
+    if job.get('idempotency_key'):
+        env['LGHS_IDEMPOTENCY_KEY'] = str(job['idempotency_key'])
     try:
         p = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=3600)
     except subprocess.TimeoutExpired:
@@ -168,6 +285,58 @@ def run_job(job):
     return p.returncode, detail[-2000:]
 
 
+def ledger_before_run(job):
+    key = job.get('idempotency_key')
+    if not key:
+        return True
+    ledger = load_ledger()
+    entry = ledger['entries'].get(str(key))
+    if not isinstance(entry, dict) or entry.get('fingerprint') != job_fingerprint(job.get('kind'), job.get('params', {})):
+        log(f'idempotency ledger mismatch id={job.get("id")} key={key}; job retained')
+        return False
+    state = str(entry.get('state') or 'pending')
+    if state == 'completed':
+        job['_path'].unlink(missing_ok=True)
+        log(f'skipped completed idempotent job id={job.get("id")} key={key}')
+        return False
+    if state in {'executing', 'uncertain'}:
+        entry['state'] = 'uncertain'
+        entry['updated_epoch'] = time.time()
+        entry['updated_at'] = now_iso()
+        save_ledger(ledger)
+        log(f'held uncertain idempotent job id={job.get("id")} key={key}; explicit retry required')
+        return False
+    entry['state'] = 'executing'
+    entry['started_epoch'] = time.time()
+    entry['started_at'] = now_iso()
+    entry['updated_epoch'] = time.time()
+    entry['updated_at'] = now_iso()
+    save_ledger(ledger)
+    return True
+
+
+def ledger_after_run(job, rc, detail):
+    key = job.get('idempotency_key')
+    if not key:
+        return
+    ledger = load_ledger()
+    entry = ledger['entries'].get(str(key))
+    if not isinstance(entry, dict):
+        return
+    now = time.time()
+    if rc == 0:
+        entry['state'] = 'completed'
+        entry['completed_epoch'] = now
+        entry['completed_at'] = now_iso()
+        entry['last_error'] = ''
+    else:
+        entry['state'] = 'pending'
+        entry['last_error'] = f'exit={rc} {detail}'[:2000]
+    entry['updated_epoch'] = now
+    entry['updated_at'] = now_iso()
+    save_ledger(ledger)
+
+
 def drain():
     ensure_dirs()
     now = time.time()
@@ -176,14 +345,18 @@ def drain():
         if float(job.get('next_try_epoch', 0)) > now:
             continue
         jid = job.get('id', path.stem)
+        if not ledger_before_run(job):
+            continue
         try:
             rc, detail = run_job(job)
         except ValueError as exc:
             log(f'invalid job id={jid}: {exc}')
             path.rename(path.with_suffix('.invalid'))
+            ledger_after_run(job, 2, str(exc))
             continue
+        ledger_after_run(job, rc, detail)
         if rc == 0:
-            log(f'completed id={jid} kind={job.get("kind")}')
+            log(f'completed id={jid} kind={job.get("kind")} idempotency_key={job.get("idempotency_key", "-")}')
             reboot_after = job.get('kind') == 'os-update' and bool(job.get('params', {}).get('reboot'))
             path.unlink(missing_ok=True)
             if reboot_after:
@@ -201,19 +374,55 @@ def drain():
         job['next_try_epoch'] = time.time() + backoff
         atomic_json(path, job)
         log(f'deferred id={jid} kind={job.get("kind")} exit={rc} retry_in={backoff}s')
-    # Deferred work is an expected offline state, not a service failure.
+    # Deferred or uncertain work is an expected state, not a service failure.
     return 0
+
+
+def retry_idempotent(key):
+    key = normalize_idempotency_key(key)
+    ledger = load_ledger()
+    entry = ledger['entries'].get(key)
+    if not isinstance(entry, dict):
+        raise ValueError('unknown idempotency key')
+    if str(entry.get('state')) == 'completed':
+        raise ValueError('idempotent job already completed')
+    jid = str(entry.get('job_id') or '')
+    if not jid:
+        raise ValueError('corrupt idempotency ledger entry')
+    path = JOBS_DIR / f'{jid}.json'
+    if not path.exists():
+        atomic_json(path, new_job(jid, entry.get('kind'), entry.get('params', {}), key, entry.get('created_epoch')))
+    entry['state'] = 'pending'
+    entry['retry_requested_at'] = now_iso()
+    entry['updated_epoch'] = time.time()
+    entry['updated_at'] = now_iso()
+    save_ledger(ledger)
+    job = json.loads(path.read_text(encoding='utf-8'))
+    job['next_try_epoch'] = time.time()
+    atomic_json(path, job)
+    log(f'explicit retry id={jid} idempotency_key={key}')
+    start_drain()
+    print(jid)
+    return jid
 
 
 def show_status():
     jobs = load_jobs()
+    ledger = load_ledger()['entries']
     if not jobs:
         print('LGHS network queue: empty')
-        return 0
-    print(f'LGHS network queue: {len(jobs)} pending')
-    for job in jobs:
-        params = json.dumps(job.get('params', {}), separators=(',', ':'))
-        print(f"{job.get('id')}  {job.get('kind')}  attempts={job.get('attempts', 0)}  {params}")
+    else:
+        print(f'LGHS network queue: {len(jobs)} pending')
+        for job in jobs:
+            params = json.dumps(job.get('params', {}), separators=(',', ':'))
+            key = job.get('idempotency_key', '-')
+            state = str((ledger.get(key) or {}).get('state') or '-') if key != '-' else '-'
+            print(f"{job.get('id')}  {job.get('kind')}  attempts={job.get('attempts', 0)}  idem={key} state={state}  {params}")
+    uncertain = [(key, value) for key, value in ledger.items() if isinstance(value, dict) and value.get('state') == 'uncertain']
+    if uncertain:
+        print(f'LGHS network queue: {len(uncertain)} uncertain idempotent execution(s); explicit retry required')
+        for key, value in uncertain:
+            print(f"UNCERTAIN {value.get('job_id')} key={key} kind={value.get('kind')}")
     return 0
 
 
@@ -224,29 +433,44 @@ def main():
     ep = sub.add_parser('enqueue')
     ep.add_argument('kind', choices=['local-update', 'os-update', 'fleet'])
     ep.add_argument('args', nargs='*')
+    ep.add_argument('--idempotency-key')
     sub.add_parser('drain')
     sub.add_parser('status')
+    retry = sub.add_parser('retry')
+    retry.add_argument('idempotency_key')
     args = ap.parse_args()
 
     if args.cmd == 'status':
         return show_status()
     if args.cmd == 'drain':
         return drain()
+    if args.cmd == 'retry':
+        try:
+            retry_idempotent(args.idempotency_key)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        return 0
     if args.kind == 'local-update':
         params = {}
         if args.args:
             if len(args.args) != 2 or args.args[0] != '--commit':
-                raise SystemExit('local-update usage: lghs-netqueue enqueue local-update [--commit SHA]')
+                raise SystemExit('local-update usage: lghs-netqueue enqueue local-update [--commit SHA] [--idempotency-key KEY]')
             try:
                 params['target_commit'] = normalize_commit(args.args[1])
             except ValueError as exc:
                 raise SystemExit(str(exc)) from None
-        enqueue('local-update', params)
+        try:
+            enqueue('local-update', params, args.idempotency_key)
+        except (ValueError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from None
         return 0
     if args.kind == 'os-update':
         if any(x != '--reboot' for x in args.args):
             raise SystemExit('os-update only accepts --reboot')
-        enqueue('os-update', {'reboot': '--reboot' in args.args})
+        try:
+            enqueue('os-update', {'reboot': '--reboot' in args.args}, args.idempotency_key)
+        except (ValueError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from None
         return 0
     if args.kind == 'fleet':
         if len(args.args) != 2:
@@ -254,7 +478,10 @@ def main():
         target, action = args.args
         if action not in ALLOWED_FLEET_ACTIONS:
             raise SystemExit('unsupported queued fleet action')
-        enqueue('fleet', {'target': target, 'action': action})
+        try:
+            enqueue('fleet', {'target': target, 'action': action}, args.idempotency_key)
+        except (ValueError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from None
         return 0
     return 2
 
