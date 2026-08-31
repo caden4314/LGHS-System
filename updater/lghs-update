@@ -7,6 +7,9 @@ UPDATE_ENV=/etc/lghs/update.env
 ENV_REPO_URL="${LGHS_REPO_URL-}"
 ENV_BRANCH="${LGHS_UPDATE_BRANCH-}"
 ENV_CHECKOUT="${LGHS_UPDATE_CHECKOUT-}"
+# Exact deployment targets are deliberately request-scoped. Never inherit a
+# pinned target from update.env or the fallback timer would remain pinned.
+ENV_TARGET_COMMIT="${LGHS_TARGET_COMMIT-}"
 if [[ -r "$UPDATE_ENV" ]]; then
     # shellcheck disable=SC1090
     source "$UPDATE_ENV"
@@ -14,10 +17,12 @@ fi
 [[ -n "$ENV_REPO_URL" ]] && LGHS_REPO_URL="$ENV_REPO_URL"
 [[ -n "$ENV_BRANCH" ]] && LGHS_UPDATE_BRANCH="$ENV_BRANCH"
 [[ -n "$ENV_CHECKOUT" ]] && LGHS_UPDATE_CHECKOUT="$ENV_CHECKOUT"
+LGHS_TARGET_COMMIT="$ENV_TARGET_COMMIT"
 
 REPO_URL="${LGHS_REPO_URL:-https://github.com/caden4314/LGHS-System.git}"
 BRANCH="${LGHS_UPDATE_BRANCH:-main}"
 CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
+REQUESTED_TARGET_COMMIT="${LGHS_TARGET_COMMIT:-}"
 STATE_DIR=/var/lib/lghs/update
 STATUS_FILE="$STATE_DIR/lghs-status.json"
 ROLE="$(cat /etc/lghs/role 2>/dev/null || true)"
@@ -30,6 +35,10 @@ PREVIOUS_COMMIT=""
 
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
 [[ "$ROLE" == "controller" || "$ROLE" == "student" ]] || { echo "Invalid or missing LGHS role" >&2; exit 1; }
+if [[ -n "$REQUESTED_TARGET_COMMIT" ]]; then
+    [[ "$REQUESTED_TARGET_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "LGHS_TARGET_COMMIT must be an exact 40-character Git SHA" >&2; exit 2; }
+    REQUESTED_TARGET_COMMIT="${REQUESTED_TARGET_COMMIT,,}"
+fi
 
 install -d -m 0755 "$STATE_DIR" /opt/lghs
 
@@ -66,7 +75,11 @@ os.replace(tmp, path)
 PY
 }
 
-write_status "checking" "Starting LGHS update" 2 "Preparing updater for branch $BRANCH"
+if [[ -n "$REQUESTED_TARGET_COMMIT" ]]; then
+    write_status "checking" "Starting pinned LGHS update" 2 "Preparing exact commit ${REQUESTED_TARGET_COMMIT:0:12}"
+else
+    write_status "checking" "Starting LGHS update" 2 "Preparing updater for branch $BRANCH"
+fi
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     write_status "busy" "Update already running" 0 "Another LGHS update process owns the lock"
@@ -80,7 +93,11 @@ queue_for_network() {
     write_status "queued" "Waiting for network" 0 "$reason"
     if [[ "${LGHS_NETQUEUE_RUNNING:-0}" == "1" ]]; then return 75; fi
     if [[ -x "$NETQUEUE" ]]; then
-        "$NETQUEUE" enqueue local-update >/dev/null
+        if [[ -n "$REQUESTED_TARGET_COMMIT" ]]; then
+            "$NETQUEUE" enqueue local-update --commit "$REQUESTED_TARGET_COMMIT" >/dev/null
+        else
+            "$NETQUEUE" enqueue local-update >/dev/null
+        fi
         echo "LGHS updater: network work queued persistently."
         return 0
     fi
@@ -112,7 +129,25 @@ if ! GIT_TERMINAL_PROMPT=0 git fetch --prune origin \
     "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"; then
     if queue_for_network "fetch failed; deferring update."; then exit 0; else exit 75; fi
 fi
-TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/$BRANCH^{commit}")"
+
+if [[ -n "$REQUESTED_TARGET_COMMIT" ]]; then
+    if ! git cat-file -e "${REQUESTED_TARGET_COMMIT}^{commit}" 2>/dev/null; then
+        write_status "downloading" "Fetching pinned LGHS revision" 24 "Fetching ${REQUESTED_TARGET_COMMIT:0:12}"
+        if ! GIT_TERMINAL_PROMPT=0 git fetch origin "$REQUESTED_TARGET_COMMIT"; then
+            write_status "failed" "Pinned commit unavailable" 100 "Git could not fetch ${REQUESTED_TARGET_COMMIT:0:12}"
+            echo "Pinned LGHS commit is unavailable from origin: $REQUESTED_TARGET_COMMIT" >&2
+            exit 65
+        fi
+    fi
+    if ! git cat-file -e "${REQUESTED_TARGET_COMMIT}^{commit}" 2>/dev/null; then
+        write_status "failed" "Pinned commit invalid" 100 "Target is not a Git commit"
+        echo "Pinned LGHS target is not a commit: $REQUESTED_TARGET_COMMIT" >&2
+        exit 65
+    fi
+    TARGET_COMMIT="$(git rev-parse --verify "${REQUESTED_TARGET_COMMIT}^{commit}")"
+else
+    TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/$BRANCH^{commit}")"
+fi
 write_status "preparing" "Comparing versions" 28 "Target ${TARGET_COMMIT:0:12}"
 
 if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
@@ -184,10 +219,10 @@ apply_install() {
     write_status "installing" "Applying LGHS configuration" 55 "Running install.sh for $ROLE"
     /bin/bash ./install.sh "$ROLE"
     if [[ -x ./updater/lghs-0.5-install ]]; then
-        write_status "installing" "Installing 0.5 state/agent layer" 68 "Applying staged 0.5 architecture"
+        write_status "installing" "Installing managed state/agent layer" 68 "Applying managed fleet architecture"
         ./updater/lghs-0.5-install "$ROLE"
     elif [[ "$ROLE" == "student" ]]; then
-        write_status "installing" "Removing 0.5-only services" 68 "Restoring legacy telemetry for downgrade"
+        write_status "installing" "Removing managed-only services" 68 "Restoring legacy telemetry for downgrade"
         cleanup_legacy_student_services
     fi
     write_status "installing" "Reloading services" 75 "Refreshing systemd units"
