@@ -5,6 +5,7 @@ import json
 import time
 from typing import Any
 
+from .maintenance import phase_maintenance_gate
 from .rollout import advance_rollout, dispatch_phase, rollout_status
 
 RUNTIME_PREFIX = 'rollout-runtime:'
@@ -50,7 +51,31 @@ def _reset_soak(runtime: dict[str, Any], active_phase: int | None) -> dict[str, 
     runtime['active_phase'] = active_phase
     runtime['ready_since'] = None
     runtime['next_action_at'] = None
+    runtime['maintenance_next_open_at'] = None
+    runtime['maintenance_blocked_devices'] = []
     return runtime
+
+
+def _maintenance_wait(store: Any, deployment_id: str, phase: int, runtime: dict[str, Any], *, now: float) -> dict[str, Any] | None:
+    gate = phase_maintenance_gate(store, deployment_id, phase, now=now)
+    if gate['allowed']:
+        if runtime.get('maintenance_next_open_at') is not None or runtime.get('maintenance_blocked_devices'):
+            runtime['maintenance_next_open_at'] = None
+            runtime['maintenance_blocked_devices'] = []
+            save_runtime(store, deployment_id, runtime, now=now)
+        return None
+    runtime['maintenance_next_open_at'] = gate.get('next_open_at')
+    runtime['maintenance_blocked_devices'] = list(gate.get('blocked_devices') or [])
+    save_runtime(store, deployment_id, runtime, now=now)
+    return {
+        'deployment_id': deployment_id,
+        'action': 'maintenance-wait',
+        'phase': int(phase),
+        'blocked_devices': gate['blocked_devices'],
+        'next_open_at': gate.get('next_open_at'),
+        'gate': gate,
+        'runtime': runtime,
+    }
 
 
 def reconcile_deployment(store: Any, deployment_id: str, *, now: float | None = None) -> dict[str, Any]:
@@ -75,6 +100,10 @@ def reconcile_deployment(store: Any, deployment_id: str, *, now: float | None = 
         phase = status['next_phase']
         if phase is None:
             return {'deployment_id': deployment_id, 'action': 'empty', 'state': state, 'runtime': runtime}
+        if bool(policy.get('respect_maintenance')):
+            waiting = _maintenance_wait(store, deployment_id, phase, runtime, now=ts)
+            if waiting is not None:
+                return waiting
         command_ids = dispatch_phase(store, deployment_id, phase, now=ts)
         runtime = _reset_soak(runtime, phase)
         runtime['phase_started_at'] = ts
@@ -123,10 +152,17 @@ def reconcile_deployment(store: Any, deployment_id: str, *, now: float | None = 
 
     before = rollout_status(store, deployment_id)
     next_phase = before['next_phase']
+    if next_phase is not None and bool(policy.get('respect_maintenance')):
+        waiting = _maintenance_wait(store, deployment_id, next_phase, runtime, now=ts)
+        if waiting is not None:
+            waiting['completed_phase'] = active
+            return waiting
     after = advance_rollout(store, deployment_id, now=ts)
     if next_phase is None:
         runtime['completed_at'] = ts
         runtime['next_action_at'] = None
+        runtime['maintenance_next_open_at'] = None
+        runtime['maintenance_blocked_devices'] = []
         save_runtime(store, deployment_id, runtime, now=ts)
         return {'deployment_id': deployment_id, 'action': 'completed', 'phase': active, 'status': after, 'runtime': runtime}
     runtime = _reset_soak(runtime, next_phase)
