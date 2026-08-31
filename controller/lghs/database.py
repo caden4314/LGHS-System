@@ -1,18 +1,25 @@
-"""Transactional SQLite state store for LGHS 0.5."""
+'''Transactional SQLite state store for LGHS 0.6.'''
 from __future__ import annotations
-import json, sqlite3, time, uuid
+import json, re, sqlite3, time, uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 from .protocol import ALLOWED_COMMANDS, TERMINAL_COMMAND_STATES, normalize_command_state, normalize_device_id, state_can_advance
 
 DEFAULT_DB = Path('/var/lib/lghs/fleet.db')
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 OPEN_STATES = {'queued','delivered','received','accepted','running'}
+HEALTH_STATES = frozenset({'unknown','healthy','warning','critical','offline','maintenance'})
+COMMIT_RE = re.compile(r'^[0-9a-fA-F]{40}$')
 SCHEMA = r'''
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS devices(device_id TEXT PRIMARY KEY,created_at REAL NOT NULL,updated_at REAL NOT NULL,agent_version TEXT,protocol INTEGER,boot_id TEXT,last_sequence INTEGER,last_seen REAL,transport TEXT,ssh_host TEXT,labels_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS devices(device_id TEXT PRIMARY KEY,created_at REAL NOT NULL,updated_at REAL NOT NULL,agent_version TEXT,protocol INTEGER,boot_id TEXT,last_sequence INTEGER,last_seen REAL,transport TEXT,ssh_host TEXT,hostname TEXT,role TEXT,model TEXT,ram_mb INTEGER,serial TEXT,current_commit TEXT,current_version TEXT,desired_commit TEXT,health_state TEXT NOT NULL DEFAULT 'unknown',labels_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS device_tags(device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,tag TEXT NOT NULL,created_at REAL NOT NULL,PRIMARY KEY(device_id,tag));
+CREATE INDEX IF NOT EXISTS idx_device_tags_tag ON device_tags(tag,device_id);
+CREATE TABLE IF NOT EXISTS fleet_groups(group_id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,description TEXT NOT NULL DEFAULT '',created_at REAL NOT NULL,updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS group_members(group_id TEXT NOT NULL REFERENCES fleet_groups(group_id) ON DELETE CASCADE,device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,created_at REAL NOT NULL,PRIMARY KEY(group_id,device_id));
+CREATE INDEX IF NOT EXISTS idx_group_members_device ON group_members(device_id,group_id);
 CREATE TABLE IF NOT EXISTS telemetry_latest(device_id TEXT PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,received_at REAL NOT NULL,sent_at REAL,boot_id TEXT,sequence INTEGER,payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS commands(command_id TEXT PRIMARY KEY,device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,action TEXT NOT NULL,state TEXT NOT NULL,stage TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '',progress REAL,created_at REAL NOT NULL,updated_at REAL NOT NULL,deadline_at REAL,delivered_at REAL,received_at REAL,accepted_at REAL,started_at REAL,completed_at REAL,last_delivery_at REAL,deliveries INTEGER NOT NULL DEFAULT 0,payload_json TEXT NOT NULL DEFAULT '{}');
 CREATE INDEX IF NOT EXISTS idx_commands_device_created ON commands(device_id,created_at DESC);
@@ -22,8 +29,9 @@ CREATE INDEX IF NOT EXISTS idx_command_events_command ON command_events(command_
 CREATE TABLE IF NOT EXISTS warnings(warning_id TEXT PRIMARY KEY,device_id TEXT REFERENCES devices(device_id) ON DELETE CASCADE,kind TEXT NOT NULL,severity TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',recommended_action TEXT NOT NULL DEFAULT '',first_seen REAL NOT NULL,last_seen REAL NOT NULL,acknowledged_at REAL,resolved_at REAL);
 CREATE INDEX IF NOT EXISTS idx_warnings_device_state ON warnings(device_id,state,severity);
 CREATE TABLE IF NOT EXISTS warning_events(id INTEGER PRIMARY KEY AUTOINCREMENT,warning_id TEXT NOT NULL REFERENCES warnings(warning_id) ON DELETE CASCADE,state TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created_at REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS deployments(deployment_id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,target_version TEXT,target_commit TEXT,state TEXT NOT NULL,created_by TEXT,created_at REAL NOT NULL,updated_at REAL NOT NULL,policy_json TEXT NOT NULL DEFAULT '{}');
-CREATE TABLE IF NOT EXISTS deployment_executions(deployment_id TEXT NOT NULL REFERENCES deployments(deployment_id) ON DELETE CASCADE,device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,command_id TEXT REFERENCES commands(command_id) ON DELETE SET NULL,phase INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL,updated_at REAL NOT NULL,PRIMARY KEY(deployment_id,device_id));
+CREATE TABLE IF NOT EXISTS deployments(deployment_id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,target_version TEXT,target_commit TEXT,state TEXT NOT NULL,created_by TEXT,created_at REAL NOT NULL,updated_at REAL NOT NULL,policy_json TEXT NOT NULL DEFAULT '{}',target_json TEXT NOT NULL DEFAULT '{}',strategy_json TEXT NOT NULL DEFAULT '{}',paused_reason TEXT NOT NULL DEFAULT '',started_at REAL,completed_at REAL);
+CREATE TABLE IF NOT EXISTS deployment_executions(deployment_id TEXT NOT NULL REFERENCES deployments(deployment_id) ON DELETE CASCADE,device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,command_id TEXT REFERENCES commands(command_id) ON DELETE SET NULL,phase INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL,stage TEXT NOT NULL DEFAULT '',target_commit TEXT,previous_commit TEXT,attempt INTEGER NOT NULL DEFAULT 0,started_at REAL,completed_at REAL,error_code TEXT,error_message TEXT NOT NULL DEFAULT '',updated_at REAL NOT NULL,PRIMARY KEY(deployment_id,device_id));
+CREATE INDEX IF NOT EXISTS idx_deployment_executions_state ON deployment_executions(deployment_id,state,phase);
 CREATE TABLE IF NOT EXISTS sudo_requests(request_id TEXT PRIMARY KEY,device_id TEXT REFERENCES devices(device_id) ON DELETE CASCADE,state TEXT NOT NULL,command TEXT NOT NULL,requested_at REAL NOT NULL,updated_at REAL NOT NULL,expires_at REAL,detail_json TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT REFERENCES devices(device_id) ON DELETE SET NULL,kind TEXT NOT NULL,severity TEXT NOT NULL DEFAULT 'info',created_at REAL NOT NULL,sequence INTEGER,detail_json TEXT NOT NULL DEFAULT '{}');
 CREATE INDEX IF NOT EXISTS idx_audit_events_device_time ON audit_events(device_id,created_at DESC);
@@ -43,9 +51,29 @@ class FleetDB:
         db=sqlite3.connect(self.path,timeout=15,isolation_level=None);db.row_factory=sqlite3.Row
         db.execute('PRAGMA foreign_keys=ON');db.execute('PRAGMA journal_mode=WAL');db.execute('PRAGMA synchronous=NORMAL');db.execute('PRAGMA busy_timeout=15000')
         return db
+    @staticmethod
+    def _ensure_columns(db:sqlite3.Connection,table:str,columns:Mapping[str,str])->None:
+        existing={str(r['name']) for r in db.execute(f'PRAGMA table_info({table})')}
+        for name,declaration in columns.items():
+            if name not in existing:db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {declaration}')
     def initialize(self)->None:
         with self.connect() as db:
-            db.executescript(SCHEMA);db.execute("INSERT INTO metadata(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(SCHEMA_VERSION),))
+            db.executescript(SCHEMA)
+            self._ensure_columns(db,'devices',{
+                'hostname':'TEXT','role':'TEXT','model':'TEXT','ram_mb':'INTEGER','serial':'TEXT',
+                'current_commit':'TEXT','current_version':'TEXT','desired_commit':'TEXT',
+                'health_state':"TEXT NOT NULL DEFAULT 'unknown'",
+            })
+            self._ensure_columns(db,'deployments',{
+                'target_json':"TEXT NOT NULL DEFAULT '{}'",'strategy_json':"TEXT NOT NULL DEFAULT '{}'",
+                'paused_reason':"TEXT NOT NULL DEFAULT ''",'started_at':'REAL','completed_at':'REAL',
+            })
+            self._ensure_columns(db,'deployment_executions',{
+                'stage':"TEXT NOT NULL DEFAULT ''",'target_commit':'TEXT','previous_commit':'TEXT',
+                'attempt':'INTEGER NOT NULL DEFAULT 0','started_at':'REAL','completed_at':'REAL',
+                'error_code':'TEXT','error_message':"TEXT NOT NULL DEFAULT ''",
+            })
+            db.execute("INSERT INTO metadata(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(SCHEMA_VERSION),))
     @contextmanager
     def transaction(self,immediate: bool=True)->Iterator[sqlite3.Connection]:
         db=self.connect()
@@ -60,6 +88,86 @@ class FleetDB:
         else:
             with self.transaction() as tx:tx.execute(sql,vals)
         return d
+    def update_device_inventory(self,device_id:str,*,hostname=None,role=None,model=None,ram_mb=None,serial=None,current_commit=None,current_version=None,desired_commit=None,health_state=None,now=None)->dict[str,Any]:
+        d=normalize_device_id(device_id);ts=time.time() if now is None else float(now)
+        values={
+            'hostname':hostname,'role':role,'model':model,'ram_mb':int(ram_mb) if ram_mb is not None else None,
+            'serial':serial,'current_commit':current_commit,'current_version':current_version,'desired_commit':desired_commit,
+            'health_state':str(health_state).strip().lower() if health_state is not None else None,
+        }
+        if values['health_state'] is not None and values['health_state'] not in HEALTH_STATES:raise ValueError('invalid health_state')
+        for key in ('current_commit','desired_commit'):
+            value=values[key]
+            if value is not None and value!='' and not COMMIT_RE.fullmatch(str(value)):raise ValueError(f'invalid {key}')
+        with self.transaction() as db:
+            self.upsert_device(d,db=db)
+            pairs=[(k,v) for k,v in values.items() if v is not None]
+            if pairs:
+                db.execute('UPDATE devices SET '+','.join(f'{k}=?' for k,_ in pairs)+',updated_at=? WHERE device_id=?',tuple(v for _,v in pairs)+(ts,d))
+            return dict(db.execute('SELECT * FROM devices WHERE device_id=?',(d,)).fetchone())
+    def get_device(self,device_id:str):
+        with self.connect() as db:
+            r=db.execute('SELECT * FROM devices WHERE device_id=?',(normalize_device_id(device_id),)).fetchone();return dict(r) if r else None
+    @staticmethod
+    def _normalize_tag(value:Any)->str:
+        tag=str(value or '').strip().lower()
+        if not tag or len(tag)>128 or any(ch.isspace() for ch in tag):raise ValueError('invalid tag')
+        return tag
+    def set_device_tags(self,device_id:str,tags:list[str]|tuple[str,...]|set[str],*,now=None)->list[str]:
+        d=normalize_device_id(device_id);ts=time.time() if now is None else float(now);normalized=sorted({self._normalize_tag(x) for x in tags})
+        with self.transaction() as db:
+            self.upsert_device(d,db=db);db.execute('DELETE FROM device_tags WHERE device_id=?',(d,))
+            db.executemany('INSERT INTO device_tags(device_id,tag,created_at) VALUES(?,?,?)',[(d,t,ts) for t in normalized])
+        return normalized
+    def list_device_tags(self,device_id:str)->list[str]:
+        with self.connect() as db:return [str(r['tag']) for r in db.execute('SELECT tag FROM device_tags WHERE device_id=? ORDER BY tag',(normalize_device_id(device_id),)).fetchall()]
+    def create_group(self,name:str,*,description='',group_id=None,now=None)->str:
+        clean_name=str(name or '').strip()
+        if not clean_name or len(clean_name)>128:raise ValueError('invalid group name')
+        gid=str(group_id or f'grp-{uuid.uuid4().hex[:12]}').strip().lower()
+        if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}',gid):raise ValueError('invalid group_id')
+        ts=time.time() if now is None else float(now)
+        with self.transaction() as db:db.execute('INSERT INTO fleet_groups(group_id,name,description,created_at,updated_at) VALUES(?,?,?,?,?)',(gid,clean_name,str(description or ''),ts,ts))
+        return gid
+    def add_device_to_group(self,device_id:str,group_id:str,*,now=None)->None:
+        d=normalize_device_id(device_id);gid=str(group_id).strip().lower();ts=time.time() if now is None else float(now)
+        with self.transaction() as db:
+            self.upsert_device(d,db=db)
+            if not db.execute('SELECT 1 FROM fleet_groups WHERE group_id=?',(gid,)).fetchone():raise KeyError(gid)
+            db.execute('INSERT OR IGNORE INTO group_members(group_id,device_id,created_at) VALUES(?,?,?)',(gid,d,ts))
+    def remove_device_from_group(self,device_id:str,group_id:str)->None:
+        with self.transaction() as db:db.execute('DELETE FROM group_members WHERE group_id=? AND device_id=?',(str(group_id).strip().lower(),normalize_device_id(device_id)))
+    def list_groups(self,device_id=None)->list[dict[str,Any]]:
+        with self.connect() as db:
+            if device_id:
+                rows=db.execute('SELECT g.* FROM fleet_groups g JOIN group_members m ON m.group_id=g.group_id WHERE m.device_id=? ORDER BY g.name',(normalize_device_id(device_id),)).fetchall()
+            else:rows=db.execute('SELECT * FROM fleet_groups ORDER BY name').fetchall()
+            return [dict(x) for x in rows]
+    @staticmethod
+    def _normalize_commit(value:Any)->str:
+        commit=str(value or '').strip().lower()
+        if not COMMIT_RE.fullmatch(commit):raise ValueError('target_commit must be an exact 40-character Git commit SHA')
+        return commit
+    def create_deployment(self,name:str,target_commit:str,*,target_version=None,kind='software',created_by=None,target=None,policy=None,strategy=None,deployment_id=None,now=None)->str:
+        clean_name=str(name or '').strip()
+        if not clean_name:raise ValueError('deployment name required')
+        commit=self._normalize_commit(target_commit);ts=time.time() if now is None else float(now);did=deployment_id or uuid.uuid4().hex
+        with self.transaction() as db:
+            db.execute('''INSERT INTO deployments(deployment_id,name,kind,target_version,target_commit,state,created_by,created_at,updated_at,policy_json,target_json,strategy_json) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)''',(did,clean_name,str(kind or 'software'),target_version,commit,created_by,ts,ts,_json(dict(policy or {})),_json(dict(target or {})),_json(dict(strategy or {}))))
+        return did
+    def add_deployment_execution(self,deployment_id:str,device_id:str,*,command_id=None,phase=0,state='queued',target_commit=None,previous_commit=None,attempt=0,now=None)->None:
+        d=normalize_device_id(device_id);ts=time.time() if now is None else float(now);st=normalize_command_state(state)
+        with self.transaction() as db:
+            dep=db.execute('SELECT target_commit FROM deployments WHERE deployment_id=?',(deployment_id,)).fetchone()
+            if not dep:raise KeyError(deployment_id)
+            commit=self._normalize_commit(target_commit or dep['target_commit']);previous=self._normalize_commit(previous_commit) if previous_commit else None
+            self.upsert_device(d,db=db)
+            db.execute('''INSERT INTO deployment_executions(deployment_id,device_id,command_id,phase,state,stage,target_commit,previous_commit,attempt,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)''',(deployment_id,d,command_id,int(phase),st,'',commit,previous,int(attempt),ts))
+    def get_deployment(self,deployment_id:str):
+        with self.connect() as db:
+            r=db.execute('SELECT * FROM deployments WHERE deployment_id=?',(deployment_id,)).fetchone();return dict(r) if r else None
+    def list_deployment_executions(self,deployment_id:str)->list[dict[str,Any]]:
+        with self.connect() as db:return [dict(x) for x in db.execute('SELECT * FROM deployment_executions WHERE deployment_id=? ORDER BY phase,device_id',(deployment_id,)).fetchall()]
     def record_telemetry(self,device_id:str,payload:Mapping[str,Any],*,received_at=None,sent_at=None,agent_version=None,protocol=None,boot_id=None,sequence=None)->None:
         d=normalize_device_id(device_id);received=time.time() if received_at is None else float(received_at)
         with self.transaction() as db:
