@@ -11,10 +11,15 @@ sys.path.insert(0, '/usr/local/lib/lghs-python')
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lghs.database import FleetDB
+from lghs.recovery import cancel_remaining, create_rollback, resume_deployment, retry_failed
 from lghs.rollout import advance_rollout, dispatch_phase, freeze_deployment, rollout_status
 from lghs.rollout_manager import load_runtime
 
 DB = FleetDB(Path(os.environ.get('LGHS_FLEET_DB', '/var/lib/lghs/fleet.db')))
+
+
+def actor_default():
+    return os.environ.get('SUDO_USER') or os.environ.get('USER') or 'unknown'
 
 
 def selector_from_args(args):
@@ -45,6 +50,33 @@ def strategy_from_args(args):
     }
 
 
+def decode(value, default):
+    try:
+        result = json.loads(value or '')
+    except Exception:
+        return default
+    return result
+
+
+def deployment_list():
+    with DB.connect() as db:
+        rows = db.execute('SELECT * FROM deployments ORDER BY created_at DESC').fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item['policy'] = decode(item.pop('policy_json', '{}'), {})
+            item['target'] = decode(item.pop('target_json', '{}'), {})
+            item['strategy'] = decode(item.pop('strategy_json', '{}'), {})
+            counts = {
+                str(x['state']): int(x['n'])
+                for x in db.execute('SELECT state,COUNT(*) AS n FROM deployment_executions WHERE deployment_id=? GROUP BY state', (item['deployment_id'],)).fetchall()
+            }
+            item['execution_counts'] = counts
+            item['device_count'] = sum(counts.values())
+            out.append(item)
+    return out
+
+
 def print_json(value):
     print(json.dumps(value, indent=2, sort_keys=True))
 
@@ -52,14 +84,14 @@ def print_json(value):
 def main() -> int:
     if os.geteuid() != 0:
         raise SystemExit('Run with sudo')
-    parser = argparse.ArgumentParser(prog='lghs-fleet-rollout', description='LGHS 0.6 frozen-target deployment planner')
+    parser = argparse.ArgumentParser(prog='lghs-fleet-rollout', description='LGHS 0.6 frozen-target deployment planner and recovery controller')
     sub = parser.add_subparsers(dest='command', required=True)
 
     create = sub.add_parser('create', help='freeze target membership and create a deployment')
     create.add_argument('--name', required=True)
     create.add_argument('--target-commit', required=True)
     create.add_argument('--target-version')
-    create.add_argument('--created-by', default=os.environ.get('SUDO_USER') or os.environ.get('USER') or 'unknown')
+    create.add_argument('--created-by', default=actor_default())
     target = create.add_mutually_exclusive_group(required=True)
     target.add_argument('--device', action='append', help='device ID; repeat for multiple devices')
     target.add_argument('--group', help='fleet group ID')
@@ -77,6 +109,8 @@ def main() -> int:
     mode.add_argument('--dispatch', action='store_true', help='dispatch the first phase immediately and advance manually')
     mode.add_argument('--auto', action='store_true', help='let lghs-rollout-manager dispatch, soak, and advance phases automatically')
 
+    sub.add_parser('list', help='list deployments and aggregate execution state')
+
     status = sub.add_parser('status', help='show frozen membership and phase gates')
     status.add_argument('deployment_id')
 
@@ -86,6 +120,29 @@ def main() -> int:
 
     advance = sub.add_parser('advance', help='advance only when the active phase passes verification')
     advance.add_argument('deployment_id')
+
+    retry = sub.add_parser('retry-failed', help='create new command attempts for failed/timed-out/rejected executions')
+    retry.add_argument('deployment_id')
+    retry.add_argument('--actor', default=actor_default())
+
+    resume = sub.add_parser('resume', help='resume a paused deployment after its pause condition is cleared')
+    resume.add_argument('deployment_id')
+    resume.add_argument('--actor', default=actor_default())
+
+    cont = sub.add_parser('continue', help='safe alias for resume; does not waive active failure gates')
+    cont.add_argument('deployment_id')
+    cont.add_argument('--actor', default=actor_default())
+
+    cancel = sub.add_parser('cancel-remaining', help='cancel undispatched and not-yet-accepted work')
+    cancel.add_argument('deployment_id')
+    cancel.add_argument('--actor', default=actor_default())
+
+    rollback = sub.add_parser('rollback', help='create rollback deployment(s) from recorded previous commits')
+    rollback.add_argument('deployment_id')
+    rollback.add_argument('--actor', default=actor_default())
+    rb_mode = rollback.add_mutually_exclusive_group()
+    rb_mode.add_argument('--dispatch', action='store_true', help='dispatch each rollback immediately')
+    rb_mode.add_argument('--auto', action='store_true', help='allow rollout manager to dispatch rollback deployment(s)')
 
     args = parser.parse_args()
     DB.initialize()
@@ -107,9 +164,13 @@ def main() -> int:
             result['command_ids'] = dispatch_phase(DB, result['deployment_id'], first_phase)
         print_json(result)
         return 0
+    if args.command == 'list':
+        print_json({'deployments': deployment_list()})
+        return 0
     if args.command == 'status':
         result = rollout_status(DB, args.deployment_id)
         result['runtime'] = load_runtime(DB, args.deployment_id)
+        result['executions'] = DB.list_deployment_executions(args.deployment_id)
         print_json(result)
         return 0
     if args.command == 'dispatch':
@@ -117,6 +178,18 @@ def main() -> int:
         return 0
     if args.command == 'advance':
         print_json(advance_rollout(DB, args.deployment_id))
+        return 0
+    if args.command == 'retry-failed':
+        print_json(retry_failed(DB, args.deployment_id, actor=args.actor))
+        return 0
+    if args.command in {'resume', 'continue'}:
+        print_json(resume_deployment(DB, args.deployment_id, actor=args.actor))
+        return 0
+    if args.command == 'cancel-remaining':
+        print_json(cancel_remaining(DB, args.deployment_id, actor=args.actor))
+        return 0
+    if args.command == 'rollback':
+        print_json(create_rollback(DB, args.deployment_id, actor=args.actor, dispatch=bool(args.dispatch), auto_advance=bool(args.auto)))
         return 0
     return 2
 
