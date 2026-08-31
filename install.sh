@@ -34,6 +34,8 @@ install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-report" /usr/l
 install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
 install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
 install -m 0644 "$ROOT_DIR/bluetooth/lghs_bt_protocol.py" /usr/local/lib/lghs-bt/lghs_bt_protocol.py
+install -m 0755 "$ROOT_DIR/bluetooth/lghs-bt-prepare" /usr/local/sbin/lghs-bt-prepare
+install -m 0644 "$ROOT_DIR/systemd/lghs-bt-prepare.service" /etc/systemd/system/lghs-bt-prepare.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
 install -m 0644 "$ROOT_DIR/systemd/lghs-firstboot-provision.service" /etc/systemd/system/lghs-firstboot-provision.service
@@ -221,11 +223,15 @@ if [[ "$ROLE" == "controller" ]]; then
   # next reboot, so the provisioning service can publish its SDP record.
   systemctl restart bluetooth.service
 fi
+systemctl enable lghs-bt-prepare.service
+systemctl reset-failed lghs-bt-prepare.service >/dev/null 2>&1 || true
+systemctl restart lghs-bt-prepare.service
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
   systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
   systemctl enable --now lghs-policy.service lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service ssh.service
   systemctl enable lghs-bt-bootstrap.service
+  systemctl reset-failed lghs-bt-bootstrap.service >/dev/null 2>&1 || true
   if [[ -f /etc/lghs/bluetooth-bootstrap-enabled && ! -f /var/lib/lghs/bootstrap/wifi-provisioned.json ]]; then
     systemctl start lghs-bt-bootstrap.service || true
   fi
@@ -233,6 +239,7 @@ if [[ "$ROLE" == "student" ]]; then
   systemctl try-restart ssh.service >/dev/null 2>&1 || true
 else
   systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service lghs-fleet-api.service lghs-bt-provision.service
+  systemctl reset-failed lghs-bt-provision.service >/dev/null 2>&1 || true
   systemctl try-restart lghs-fleet-notify.service
   systemctl try-restart lghs-fleet-api.service
   systemctl try-restart lghs-bt-provision.service
