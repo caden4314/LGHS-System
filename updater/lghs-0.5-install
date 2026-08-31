@@ -99,6 +99,9 @@ fi
 systemctl daemon-reload
 systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
 systemctl enable --now lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service
+# Binaries may have just been replaced while these units were already active.
+# Restart them so the running processes execute the newly installed code.
+systemctl restart lghs-command-executor.service lghs-agent.service
 systemctl enable lghs-bt-prepare.service lghs-bt-bootstrap.service
 systemctl reset-failed lghs-bt-prepare.service lghs-bt-bootstrap.service >/dev/null 2>&1 || true
 systemctl restart lghs-bt-prepare.service
