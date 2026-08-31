@@ -16,6 +16,7 @@ TOKENS=Path(os.environ.get('LGHS_FLEET_API_TOKENS','/etc/lghs/fleet-api-tokens.j
 CACHE=Path(os.environ.get('LGHS_FLEET_CACHE','/var/lib/lghs/fleet-cache.json'))
 LEGACY_COMMANDS=Path(os.environ.get('LGHS_FLEET_COMMAND_EXPORT','/var/lib/lghs/fleet-commands.json'))
 DB=FleetDB(Path(os.environ.get('LGHS_FLEET_DB','/var/lib/lghs/fleet.db')));MAX_BODY=256*1024
+TERMINAL={'succeeded','failed','timed_out','rejected','canceled'}
 
 def load_json(path,default):
     try:return json.loads(path.read_text(encoding='utf-8'))
@@ -33,8 +34,7 @@ def ensure_admin_token():
     if not isinstance(data,dict):data={}
     if 'devices' not in data:
         legacy=dict(data);data={'version':2,'devices':legacy}
-    if not str(data.get('admin_token') or ''):
-        data['admin_token']=secrets.token_urlsafe(48)
+    if not str(data.get('admin_token') or ''):data['admin_token']=secrets.token_urlsafe(48)
     data['version']=max(2,int(data.get('version') or 1));atomic_json(TOKENS,data,0o600)
 def token_for(device):
     data=load_json(TOKENS,{});data=data.get('devices',{}) if isinstance(data,dict) and 'devices' in data else data;value=data.get(device) if isinstance(data,dict) else None
@@ -57,13 +57,37 @@ def legacy_cache(device,payload):
     if not isinstance(cache,dict):cache={'version':1,'devices':{}}
     devices=cache.setdefault('devices',{});p=dict(payload);p.pop('audit_batches',None);p['device_id']=device;p['received_at']=time.time();p['fleet_commands']=[legacy_command_view(x) for x in DB.list_commands(device,16)];p['warnings']=DB.list_warnings(device,False,32);devices[device]=p;cache['updated_at']=time.time();tmp=CACHE.with_suffix('.tmp');tmp.write_text(json.dumps(cache,separators=(',',':'))+'\n',encoding='utf-8');os.chmod(tmp,0o640);os.replace(tmp,CACHE)
 def auth_device(handler,device):return authorized(device,bearer(handler))
+def sync_deployment_execution(command_id):
+    command=DB.get_command(command_id)
+    if not command:return
+    state=str(command.get('state') or 'queued');stage=str(command.get('stage') or '');message=str(command.get('message') or '');ts=float(command.get('updated_at') or time.time())
+    with DB.transaction() as db:
+        rows=db.execute('SELECT * FROM deployment_executions WHERE command_id=?',(command_id,)).fetchall()
+        deployment_ids=set()
+        for row in rows:
+            deployment_ids.add(str(row['deployment_id']));started=row['started_at'];completed=row['completed_at'];error_code=row['error_code'];error_message=row['error_message']
+            if state=='running' and started is None:started=command.get('started_at') or ts
+            if state in TERMINAL and completed is None:completed=command.get('completed_at') or ts
+            if state in TERMINAL and state!='succeeded':error_code=state.upper();error_message=message
+            if state=='succeeded':error_code=None;error_message=''
+            db.execute('UPDATE deployment_executions SET state=?,stage=?,started_at=?,completed_at=?,error_code=?,error_message=?,updated_at=? WHERE deployment_id=? AND device_id=?',(state,stage,started,completed,error_code,error_message,ts,row['deployment_id'],row['device_id']))
+        for did in deployment_ids:
+            states=[str(r['state']) for r in db.execute('SELECT state FROM deployment_executions WHERE deployment_id=?',(did,)).fetchall()]
+            if states and all(s=='succeeded' for s in states):dep_state='succeeded'
+            elif states and all(s in TERMINAL for s in states) and any(s!='succeeded' for s in states):dep_state='failed'
+            elif any(s in {'delivered','received','accepted','running'} for s in states):dep_state='running'
+            else:dep_state='queued'
+            if dep_state=='running':db.execute("UPDATE deployments SET state='running',started_at=COALESCE(started_at,?),updated_at=? WHERE deployment_id=?",(ts,ts,did))
+            elif dep_state in {'succeeded','failed'}:db.execute('UPDATE deployments SET state=?,completed_at=COALESCE(completed_at,?),updated_at=? WHERE deployment_id=?',(dep_state,ts,ts,did))
+            else:db.execute("UPDATE deployments SET state='queued',updated_at=? WHERE deployment_id=?",(ts,did))
 def reconcile_command_milestones(device,rows):
     '''Preserve fast RECEIVED/ACCEPTED/RUNNING timestamps even when one report spans several states.'''
+    command_ids=[]
     for item in rows if isinstance(rows,list) else []:
         if not isinstance(item,dict):continue
         cid=str(item.get('id') or '')
         if not cid:continue
-        current=DB.get_command(cid)
+        command_ids.append(cid);current=DB.get_command(cid)
         if not current or current.get('device_id')!=device:continue
         for state,field in (('received','received_at'),('accepted','accepted_at'),('running','running_at')):
             stamp=item.get(field)
@@ -73,6 +97,7 @@ def reconcile_command_milestones(device,rows):
             try:DB.transition_command(cid,state,stage=f'{state.title()} by device',message='Milestone reported by managed agent',now=float(stamp),detail={'backfilled':True})
             except (TypeError,ValueError):pass
     DB.reconcile_reported_commands(device,rows)
+    for cid in command_ids:sync_deployment_execution(cid)
 def decode_json_field(value,default):
     try:return json.loads(value or '')
     except Exception:return default
@@ -95,7 +120,7 @@ def list_deployments():
     return [deployment_view(r) for r in rows]
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='LGHSFleetAPI/14'
+    server_version='LGHSFleetAPI/15'
     def log_message(self,*a):return
     def reply(self,code,payload):
         body=json.dumps(payload,separators=(',',':')).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
@@ -119,8 +144,7 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/v1/admin/groups':self.reply(200,{'ok':True,'groups':list_groups()});return True
         if path=='/v1/admin/deployments':self.reply(200,{'ok':True,'deployments':list_deployments()});return True
         if path.startswith('/v1/admin/deployments/'):
-            deployment_id=path[len('/v1/admin/deployments/'):].strip()
-            row=DB.get_deployment(deployment_id)
+            deployment_id=path[len('/v1/admin/deployments/'):].strip();row=DB.get_deployment(deployment_id)
             if not row:self.reply(404,{'ok':False,'error':'deployment-not-found'});return True
             self.reply(200,{'ok':True,'deployment':deployment_view(row),'executions':DB.list_deployment_executions(deployment_id)});return True
         return False
@@ -140,19 +164,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not DB.get_device(device):self.reply(404,{'ok':False,'error':'device-not-found'});return True
                 DB.add_device_to_group(device,gid);self.reply(200,{'ok':True,'group_id':gid,'device_id':device});return True
             if path=='/v1/admin/deployments':
-                raw=self.read_json();device=normalize_device_id(raw.get('device_id'))
-                inventory=DB.get_device(device)
+                raw=self.read_json();device=normalize_device_id(raw.get('device_id'));inventory=DB.get_device(device)
                 if not inventory:self.reply(404,{'ok':False,'error':'device-not-found'});return True
-                target_commit=str(raw.get('target_commit') or '').strip().lower()
+                target_commit=DB._normalize_commit(raw.get('target_commit'))
                 did=DB.create_deployment(raw.get('name') or f'Deploy {target_commit[:12]} to {device}',target_commit,target_version=raw.get('target_version'),kind=raw.get('kind','software'),created_by=raw.get('created_by'),target={'device_id':device},policy=raw.get('policy'),strategy=raw.get('strategy'),deployment_id=raw.get('deployment_id'))
-                DB.add_deployment_execution(did,device,phase=0,state='queued',target_commit=target_commit,previous_commit=inventory.get('current_commit'))
-                DB.update_device_inventory(device,desired_commit=target_commit)
-                self.reply(201,{'ok':True,'deployment_id':did,'state':'queued','dispatch_ready':False,'reason':'exact-commit executor support pending'});return True
+                cid=DB.create_command(device,'lghs-update',payload={'target_commit':target_commit,'deployment_id':did},deadline_at=raw.get('deadline_at'),dedupe=False)
+                DB.add_deployment_execution(did,device,command_id=cid,phase=0,state='queued',target_commit=target_commit,previous_commit=inventory.get('current_commit'))
+                DB.update_device_inventory(device,desired_commit=target_commit);sync_deployment_execution(cid);export_legacy_commands()
+                self.reply(201,{'ok':True,'deployment_id':did,'command_id':cid,'state':'queued','dispatch_ready':True});return True
         except KeyError as exc:self.reply(404,{'ok':False,'error':f'not-found:{exc.args[0]}'});return True
         except (ProtocolError,ValueError,TypeError) as exc:self.reply(400,{'ok':False,'error':str(exc)});return True
         return False
     def do_GET(self):
-        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':1,'fleet_operations':1,'time':time.time()});return
+        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':1,'fleet_operations':1,'exact_commit_deployments':True,'time':time.time()});return
         parsed=urllib.parse.urlparse(self.path)
         if parsed.path.startswith('/v1/admin/'):
             if not auth_admin(self):self.reply(401,{'ok':False,'error':'unauthorized'});return
