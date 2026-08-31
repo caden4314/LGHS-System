@@ -3,6 +3,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -13,6 +14,7 @@ QUEUE_DIR = Path('/var/lib/lghs/netqueue')
 JOBS_DIR = QUEUE_DIR / 'jobs'
 LOG = Path('/var/log/lghs-netqueue.log')
 MAX_BACKOFF = 900
+COMMIT_RE = re.compile(r'^[0-9a-fA-F]{40}$')
 
 ALLOWED_FLEET_ACTIONS = {
     'update': ['update'],
@@ -30,6 +32,13 @@ def now_iso():
 def require_root():
     if os.geteuid() != 0:
         raise SystemExit('Run as root')
+
+
+def normalize_commit(value):
+    commit = str(value or '').strip().lower()
+    if not COMMIT_RE.fullmatch(commit):
+        raise ValueError('target commit must be an exact 40-character Git SHA')
+    return commit
 
 
 def ensure_dirs():
@@ -128,11 +137,12 @@ def command_for(job):
     kind = job.get('kind')
     params = job.get('params', {})
     if kind == 'local-update':
+        target = params.get('target_commit')
+        if target:
+            normalize_commit(target)
         return ['/usr/local/sbin/lghs-update']
     if kind == 'os-update':
-        cmd = ['/usr/local/sbin/lghs-os-update']
-        # A requested reboot is performed only after the job file is removed.
-        return cmd
+        return ['/usr/local/sbin/lghs-os-update']
     if kind == 'fleet':
         target = str(params.get('target', '')).strip()
         action = str(params.get('action', '')).strip()
@@ -146,6 +156,8 @@ def run_job(job):
     cmd = command_for(job)
     env = os.environ.copy()
     env['LGHS_NETQUEUE_RUNNING'] = '1'
+    if job.get('kind') == 'local-update' and job.get('params', {}).get('target_commit'):
+        env['LGHS_TARGET_COMMIT'] = normalize_commit(job['params']['target_commit'])
     try:
         p = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=3600)
     except subprocess.TimeoutExpired:
@@ -221,9 +233,15 @@ def main():
     if args.cmd == 'drain':
         return drain()
     if args.kind == 'local-update':
+        params = {}
         if args.args:
-            raise SystemExit('local-update takes no extra arguments')
-        enqueue('local-update', {})
+            if len(args.args) != 2 or args.args[0] != '--commit':
+                raise SystemExit('local-update usage: lghs-netqueue enqueue local-update [--commit SHA]')
+            try:
+                params['target_commit'] = normalize_commit(args.args[1])
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from None
+        enqueue('local-update', params)
         return 0
     if args.kind == 'os-update':
         if any(x != '--reboot' for x in args.args):
