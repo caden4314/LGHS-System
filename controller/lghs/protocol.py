@@ -39,7 +39,7 @@ COMMAND_ORDER = {
     "rejected": 5,
     "canceled": 5,
 }
-ALLOWED_COMMANDS = frozenset({"lghs-update", "os-update"})
+ALLOWED_COMMANDS = frozenset({"lghs-update", "os-update", "reboot"})
 
 
 class ProtocolError(ValueError):
