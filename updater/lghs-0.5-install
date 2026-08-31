@@ -55,6 +55,7 @@ install -d -o root -g root -m 0700 /var/lib/lghs/bootstrap
 install -m 0755 "$ROOT/student/lghs-agent" /usr/local/sbin/lghs-agent
 python3 "$ROOT/updater/patch-agent-status-guard.py" /usr/local/sbin/lghs-agent
 install -m 0750 "$ROOT/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
+python3 "$ROOT/updater/patch-executor-netqueue-cli.py" /usr/local/sbin/lghs-command-executor
 install -m 0755 "$ROOT/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
 install -m 0750 "$ROOT/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap
 install -m 0644 "$ROOT/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
