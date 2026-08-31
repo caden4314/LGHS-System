@@ -12,6 +12,7 @@ sys.path.insert(0, '/usr/local/lib/lghs-python')
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lghs.database import FleetDB
+from lghs.maintenance import reconcile_reboot_schedules
 from lghs.rollout_manager import reconcile_all
 
 DB = FleetDB(Path(os.environ.get('LGHS_FLEET_DB', '/var/lib/lghs/fleet.db')))
@@ -34,7 +35,12 @@ def main() -> int:
         results = reconcile_all(DB)
         for result in results:
             action = result.get('action')
-            if action in {'paused', 'advanced', 'completed', 'error'}:
+            if action in {'paused', 'advanced', 'completed', 'maintenance-wait', 'error'}:
+                print(json.dumps(result, sort_keys=True, separators=(',', ':')), flush=True)
+        reboot_results = reconcile_reboot_schedules(DB)
+        for result in reboot_results:
+            actions = result.get('actions') or []
+            if actions or result.get('action') == 'error':
                 print(json.dumps(result, sort_keys=True, separators=(',', ':')), flush=True)
         deadline = time.monotonic() + INTERVAL
         while not STOP and time.monotonic() < deadline:
