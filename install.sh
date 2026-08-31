@@ -74,6 +74,7 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0644 "$ROOT_DIR/controller/lghs/rollout.py" /usr/local/lib/lghs-python/lghs/rollout.py
   install -m 0644 "$ROOT_DIR/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
   install -m 0644 "$ROOT_DIR/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/maintenance.py" /usr/local/lib/lghs-python/lghs/maintenance.py
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/libexec/lghsctl-real
   install -m 0755 "$ROOT_DIR/controller/lghsctl-wrapper" /usr/local/sbin/lghsctl
   install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-legacy
@@ -85,6 +86,7 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
   install -m 0755 "$ROOT_DIR/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-rollout" /usr/local/sbin/lghs-fleet-rollout
+  install -m 0755 "$ROOT_DIR/controller/lghs-fleet-maintenance" /usr/local/sbin/lghs-fleet-maintenance
   install -m 0755 "$ROOT_DIR/controller/lghs-rollout-manager" /usr/local/sbin/lghs-rollout-manager
   install -m 0755 "$ROOT_DIR/controller/lghs-cloudflare-provision" /usr/local/sbin/lghs-cloudflare-provision
   install -m 0644 "$ROOT_DIR/systemd/lghs-fleet-notify.service" /etc/systemd/system/lghs-fleet-notify.service
