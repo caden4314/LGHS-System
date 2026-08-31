@@ -44,50 +44,51 @@ jobs:
 
       - name: Security and Fleet Control invariants
         run: |
-          grep -q "target selector matched no enrolled devices" controller/lghs/rollout.py
-          grep -q "resolved_devices" controller/lghs/rollout.py
-          grep -q "canary failure" controller/lghs/rollout.py
-          grep -q "failure threshold exceeded" controller/lghs/rollout.py
-          grep -q "target_commit" controller/lghs/rollout.py
-          grep -q "rollout-runtime:" controller/lghs/rollout_manager.py
-          grep -q "respect_maintenance" controller/lghs/rollout_manager.py
-          grep -q "maintenance-wait" controller/lghs/rollout_manager.py
-          grep -q "retry-failed" controller/lghs/recovery.py
-          grep -q "current-commit-does-not-match-deployment-target" controller/lghs/recovery.py
-          grep -q "reboot-schedule:" controller/lghs/maintenance.py
-          grep -q "CANCELABLE_COMMAND_STATES = frozenset({'queued'})" controller/lghs/maintenance.py
-          grep -q "reboot-execution" controller/lghs/maintenance.py
-          grep -q "boot_id_before" controller/lghs/maintenance.py
-          grep -q "Waiting for current boot_id before dispatch" controller/lghs/maintenance.py
-          grep -q "Reboot verified by boot_id change" controller/lghs/maintenance.py
-          grep -q "'reboot'" controller/lghs/protocol.py
-          grep -q "systemd-run" student/lghs-command-executor
-          grep -q "deployment_recovery_controls" controller/lghs-fleet-api
-          grep -q "maintenance_windows" controller/lghs-fleet-api
-          grep -q "scheduled_reboots" controller/lghs-fleet-api
-          grep -q "Deployments / Updates" controller/lghs-console-day2
-          grep -q "L Rollback" controller/lghs-console-day2
-          grep -q 'ord("l"), ord("L")' controller/lghs-console-day2
-          if grep -q "B Rollback" controller/lghs-console-day2; then
+          set -euxo pipefail
+          grep -Fq "target selector matched no enrolled devices" controller/lghs/rollout.py
+          grep -Fq "resolved_devices" controller/lghs/rollout.py
+          grep -Fq "canary failure" controller/lghs/rollout.py
+          grep -Fq "failure threshold exceeded" controller/lghs/rollout.py
+          grep -Fq "target_commit" controller/lghs/rollout.py
+          grep -Fq "rollout-runtime:" controller/lghs/rollout_manager.py
+          grep -Fq "respect_maintenance" controller/lghs/rollout_manager.py
+          grep -Fq "maintenance-wait" controller/lghs/rollout_manager.py
+          grep -Fq "retry-failed" controller/lghs/recovery.py
+          grep -Fq "current-commit-does-not-match-deployment-target" controller/lghs/recovery.py
+          grep -Fq "reboot-schedule:" controller/lghs/maintenance.py
+          grep -Fq "CANCELABLE_COMMAND_STATES = frozenset({'queued'})" controller/lghs/maintenance.py
+          grep -Fq "reboot-execution" controller/lghs/maintenance.py
+          grep -Fq "boot_id_before" controller/lghs/maintenance.py
+          grep -Fq "Waiting for current boot_id before dispatch" controller/lghs/maintenance.py
+          grep -Fq "Reboot verified by boot_id change" controller/lghs/maintenance.py
+          grep -Fq "'reboot'" controller/lghs/protocol.py
+          grep -Fq "systemd-run" student/lghs-command-executor
+          grep -Fq "deployment_recovery_controls" controller/lghs-fleet-api
+          grep -Fq "maintenance_windows" controller/lghs-fleet-api
+          grep -Fq "scheduled_reboots" controller/lghs-fleet-api
+          grep -Fq "Deployments / Updates" controller/lghs-console-day2
+          grep -Fq "L Rollback" controller/lghs-console-day2
+          grep -Fq 'ord("l"), ord("L")' controller/lghs-console-day2
+          if grep -Fq "B Rollback" controller/lghs-console-day2; then
             echo 'Fleet Control rollback hotkey conflicts with the global Back key.' >&2
             exit 1
           fi
-          grep -q "Rollback is planned only; it is never auto-dispatched from Fleet Control" controller/lghs-console-day2
-          grep -q "Maintenance / Reboots" controller/lghs-console-day3
-          grep -q "boot_id verified" controller/lghs-console-day3
-          grep -q "A reboot already accepted locally may continue" controller/lghs-console-day3
-          grep -q "lghs-console-day2-core" controller/lghs-console-day3
-          grep -q "ReadWritePaths=/var/lib/lghs /run/lock" systemd/lghs-rollout-manager.service
-          grep -q 'controller/lghs/recovery.py' install.sh
-          grep -q 'controller/lghs/maintenance.py' install.sh
-          grep -q 'controller/lghs-fleet-maintenance' install.sh
-          grep -q 'controller/lghs-console-day2.*lghs-console-day2-core' install.sh
-          grep -q 'controller/lghs-console-day3.*lghs-console' install.sh
-          grep -q 'controller/lghs/recovery.py' updater/lghs-0.5-install
-          grep -q 'controller/lghs/maintenance.py' updater/lghs-0.5-install
-          grep -q 'controller/lghs-fleet-maintenance' updater/lghs-0.5-install
-          grep -q 'controller/lghs-console-day2.*lghs-console-day2-core' updater/lghs-0.5-install
-          grep -q 'controller/lghs-console-day3.*lghs-console' updater/lghs-0.5-install
+          grep -Fq "Rollback is planned only; it is never auto-dispatched from Fleet Control" controller/lghs-console-day2
+          grep -Fq "Maintenance / Reboots" controller/lghs-console-day3
+          grep -Fq "boot_id verified" controller/lghs-console-day3
+          grep -Fq "A reboot already accepted locally may continue" controller/lghs-console-day3
+          grep -Fq "lghs-console-day2-core" controller/lghs-console-day3
+          grep -Fq "ReadWritePaths=/var/lib/lghs /run/lock" systemd/lghs-rollout-manager.service
+          grep -Fq 'controller/lghs/recovery.py' install.sh
+          grep -Fq 'controller/lghs/maintenance.py' install.sh
+          grep -Fq 'controller/lghs-fleet-maintenance' install.sh
+          grep -Eq 'controller/lghs-console-day2.*lghs-console-day2-core' install.sh
+          grep -Eq 'controller/lghs-console-day3.*lghs-console' install.sh
+          grep -Fq 'controller/lghs/recovery.py' updater/lghs-0.5-install
+          grep -Fq 'controller/lghs/maintenance.py' updater/lghs-0.5-install
+          grep -Fq 'controller/lghs-fleet-maintenance' updater/lghs-0.5-install
+          grep -Eq 'controller/lghs-console-day2.*lghs-console-day2-core' updater/lghs-0.5-install
+          grep -Eq 'controller/lghs-console-day3.*lghs-console' updater/lghs-0.5-install
           if grep -nE 'shell=True|eval\(' controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs/recovery.py controller/lghs/maintenance.py controller/lghs-fleet-rollout controller/lghs-fleet-maintenance controller/lghs-rollout-manager controller/lghs-console-day3 student/lghs-command-executor; then
             echo 'Fleet operations contains an arbitrary shell path.' >&2
             exit 1
