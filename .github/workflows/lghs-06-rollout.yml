@@ -31,6 +31,7 @@ jobs:
             tests/test_deployment_recovery.py \
             tests/test_fleet_api_recovery.py \
             tests/test_fleet_api_maintenance.py \
+            tests/test_fleet_api_structured_health.py \
             tests/test_maintenance.py \
             tests/test_reboot_cancel_semantics.py \
             tests/test_structured_health_gate.py
@@ -43,6 +44,7 @@ jobs:
             tests/test_deployment_recovery.py \
             tests/test_fleet_api_recovery.py \
             tests/test_fleet_api_maintenance.py \
+            tests/test_fleet_api_structured_health.py \
             tests/test_maintenance.py \
             tests/test_reboot_cancel_semantics.py \
             tests/test_structured_health_gate.py
@@ -84,6 +86,9 @@ jobs:
           grep -Fq "deployment_recovery_controls" controller/lghs-fleet-api
           grep -Fq "maintenance_windows" controller/lghs-fleet-api
           grep -Fq "scheduled_reboots" controller/lghs-fleet-api
+          grep -Fq "'health_schema':2" controller/lghs-fleet-api
+          grep -Fq "'structured_health_gates':True" controller/lghs-fleet-api
+          grep -Fq "'deployment_wave_audit':True" controller/lghs-fleet-api
           grep -Fq "Deployments / Updates" controller/lghs-console-day2
           grep -Fq "L Rollback" controller/lghs-console-day2
           grep -Fq 'ord("l"), ord("L")' controller/lghs-console-day2
