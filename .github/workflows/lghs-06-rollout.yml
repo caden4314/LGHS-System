@@ -16,21 +16,26 @@ jobs:
             controller/lghs/rollout.py \
             controller/lghs/rollout_manager.py \
             controller/lghs/recovery.py \
+            controller/lghs/maintenance.py \
             controller/lghs-fleet-rollout \
+            controller/lghs-fleet-maintenance \
             controller/lghs-rollout-manager \
             controller/lghs-console-day2 \
+            student/lghs-command-executor \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
-            tests/test_fleet_api_recovery.py
+            tests/test_fleet_api_recovery.py \
+            tests/test_maintenance.py
 
-      - name: Frozen target, phase, recovery, and API tests
+      - name: Frozen target, recovery, maintenance, reboot, and API tests
         run: |
           python3 -m unittest -v \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
-            tests/test_fleet_api_recovery.py
+            tests/test_fleet_api_recovery.py \
+            tests/test_maintenance.py
 
       - name: Security and Fleet Control invariants
         run: |
@@ -40,10 +45,18 @@ jobs:
           grep -q "failure threshold exceeded" controller/lghs/rollout.py
           grep -q "target_commit" controller/lghs/rollout.py
           grep -q "rollout-runtime:" controller/lghs/rollout_manager.py
-          grep -q "auto_advance" controller/lghs/rollout_manager.py
+          grep -q "respect_maintenance" controller/lghs/rollout_manager.py
+          grep -q "maintenance-wait" controller/lghs/rollout_manager.py
           grep -q "retry-failed" controller/lghs/recovery.py
           grep -q "current-commit-does-not-match-deployment-target" controller/lghs/recovery.py
+          grep -q "reboot-schedule:" controller/lghs/maintenance.py
+          grep -q "boot_id_before" controller/lghs/maintenance.py
+          grep -q "Reboot verified by boot_id change" controller/lghs/maintenance.py
+          grep -q "'reboot'" controller/lghs/protocol.py
+          grep -q "systemd-run" student/lghs-command-executor
           grep -q "deployment_recovery_controls" controller/lghs-fleet-api
+          grep -q "maintenance_windows" controller/lghs-fleet-api
+          grep -q "scheduled_reboots" controller/lghs-fleet-api
           grep -q "Deployments / Updates" controller/lghs-console-day2
           grep -q "L Rollback" controller/lghs-console-day2
           grep -q 'ord("l"), ord("L")' controller/lghs-console-day2
@@ -54,8 +67,12 @@ jobs:
           grep -q "Rollback is planned only; it is never auto-dispatched from Fleet Control" controller/lghs-console-day2
           grep -q "ReadWritePaths=/var/lib/lghs /run/lock" systemd/lghs-rollout-manager.service
           grep -q 'controller/lghs/recovery.py' install.sh
+          grep -q 'controller/lghs/maintenance.py' install.sh
+          grep -q 'controller/lghs-fleet-maintenance' install.sh
           grep -q 'controller/lghs/recovery.py' updater/lghs-0.5-install
-          if grep -nE 'shell=True|eval\(' controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs/recovery.py controller/lghs-fleet-rollout controller/lghs-rollout-manager; then
-            echo 'Rollout controller contains an arbitrary shell path.' >&2
+          grep -q 'controller/lghs/maintenance.py' updater/lghs-0.5-install
+          grep -q 'controller/lghs-fleet-maintenance' updater/lghs-0.5-install
+          if grep -nE 'shell=True|eval\(' controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs/recovery.py controller/lghs/maintenance.py controller/lghs-fleet-rollout controller/lghs-fleet-maintenance controller/lghs-rollout-manager student/lghs-command-executor; then
+            echo 'Fleet operations contains an arbitrary shell path.' >&2
             exit 1
           fi
