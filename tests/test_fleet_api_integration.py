@@ -112,6 +112,8 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         self.assertTrue(health['exact_commit_deployments'])
         self.assertTrue(health['inventory_reporting'])
         self.assertTrue(health['desired_state_reconciliation'])
+        self.assertTrue(health['frozen_target_rollouts'])
+        self.assertTrue(health['deployment_recovery_controls'])
 
         cid = self.mod.DB.create_command('CS-999', 'lghs-update', command_id='cmd-http')
         status, first = self.report(1)
@@ -221,14 +223,15 @@ class FleetAPIIntegrationTests(unittest.TestCase):
                 'target_commit': target,
                 'target_version': '0.6.0-dev',
                 'created_by': 'cs_admin',
-                'strategy': {'type': 'single-device'},
+                'strategy': {'type': 'all-at-once'},
             },
             token='admin-secret',
         )
         self.assertEqual(status, 201)
         self.assertEqual(deployment['deployment_id'], 'dep-http')
         self.assertTrue(deployment['dispatch_ready'])
-        cid = deployment['command_id']
+        self.assertEqual(len(deployment['command_ids']), 1)
+        cid = deployment['command_ids'][0]
         command = self.mod.DB.get_command(cid)
         self.assertEqual(json.loads(command['payload_json'])['target_commit'], target)
         self.assertEqual(json.loads(command['payload_json'])['deployment_id'], 'dep-http')
