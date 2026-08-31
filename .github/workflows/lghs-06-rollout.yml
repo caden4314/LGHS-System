@@ -1,0 +1,33 @@
+name: LGHS 0.6 Rollout Validate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rollout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax
+        run: |
+          python3 -m py_compile \
+            controller/lghs/rollout.py \
+            controller/lghs-fleet-rollout \
+            tests/test_fleet_rollout.py
+
+      - name: Frozen target and phase tests
+        run: python3 -m unittest -v tests/test_fleet_rollout.py
+
+      - name: Security invariants
+        run: |
+          grep -q "target selector matched no enrolled devices" controller/lghs/rollout.py
+          grep -q "resolved_devices" controller/lghs/rollout.py
+          grep -q "canary failure" controller/lghs/rollout.py
+          grep -q "failure threshold exceeded" controller/lghs/rollout.py
+          grep -q "target_commit" controller/lghs/rollout.py
+          if grep -nE 'shell=True|eval\(' controller/lghs/rollout.py controller/lghs-fleet-rollout; then
+            echo 'Rollout controller contains an arbitrary shell path.' >&2
+            exit 1
+          fi
