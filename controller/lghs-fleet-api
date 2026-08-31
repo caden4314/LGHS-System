@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0,'/usr/local/lib/lghs-python');sys.path.insert(0,str(Path(__file__).resolve().parent))
 from lghs.audit import evaluate_report,record_batches
 from lghs.database import FleetDB
+from lghs.maintenance import cancel_reboot_schedule,clear_device_policy,clear_group_policy,create_reboot_schedule,get_reboot_schedule,list_policies,list_reboot_schedules,maintenance_state,reconcile_reboot_schedule,set_device_policy,set_group_policy
 from lghs.protocol import PROTOCOL_VERSION,ProtocolError,TelemetryEnvelope,response,normalize_device_id
 from lghs.recovery import cancel_remaining,create_rollback,resume_deployment,retry_failed
 from lghs.rollout import advance_rollout,dispatch_phase,freeze_deployment,rollout_status
@@ -27,7 +28,6 @@ LOCKED_DEPLOYMENT_STATES={'canceled','paused','succeeded'}
 def load_json(path,default):
     try:return json.loads(path.read_text(encoding='utf-8'))
     except Exception:return default
-
 def atomic_json(path,value,mode=0o600):
     path.parent.mkdir(parents=True,exist_ok=True);fd,tmp=tempfile.mkstemp(prefix=path.name+'.',dir=str(path.parent))
     try:
@@ -36,7 +36,6 @@ def atomic_json(path,value,mode=0o600):
     finally:
         try:os.unlink(tmp)
         except FileNotFoundError:pass
-
 def ensure_admin_token():
     data=load_json(TOKENS,{})
     if not isinstance(data,dict):data={}
@@ -44,7 +43,6 @@ def ensure_admin_token():
         legacy=dict(data);data={'version':2,'devices':legacy}
     if not str(data.get('admin_token') or ''):data['admin_token']=secrets.token_urlsafe(48)
     data['version']=max(2,int(data.get('version') or 1));atomic_json(TOKENS,data,0o600)
-
 def token_for(device):
     data=load_json(TOKENS,{});data=data.get('devices',{}) if isinstance(data,dict) and 'devices' in data else data;value=data.get(device) if isinstance(data,dict) else None
     if isinstance(value,dict):value=value.get('token')
@@ -149,7 +147,7 @@ def device_view(row):
     elif latest and latest.get('execution_state') in TERMINAL and latest.get('execution_state')!='succeeded':sync_state='update_failed'
     elif desired:sync_state='update_pending'
     else:sync_state='no_desired_state'
-    x['sync_state']=sync_state;x['desired_version']=latest.get('target_version') if latest and latest.get('target_commit')==desired else None;x['latest_deployment']=latest
+    x['sync_state']=sync_state;x['desired_version']=latest.get('target_version') if latest and latest.get('target_commit')==desired else None;x['latest_deployment']=latest;x['maintenance']=maintenance_state(DB,device)
     return x
 def deployment_view(row):
     x=dict(row)
@@ -169,12 +167,12 @@ def list_deployments():
 def target_from_request(raw):
     if isinstance(raw.get('target'),dict):return raw['target']
     keys=[key for key in ('device_id','device_ids','group_id','tag','all') if raw.get(key) not in (None,False,'',[])]
-    if len(keys)!=1:raise ProtocolError('deployment target must specify exactly one selector')
+    if len(keys)!=1:raise ProtocolError('target must specify exactly one selector')
     return {keys[0]:raw[keys[0]]}
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='LGHSFleetAPI/17'
+    server_version='LGHSFleetAPI/18'
     def log_message(self,*a):return
     def reply(self,code,payload):
         body=json.dumps(payload,separators=(',',':')).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
@@ -189,6 +187,14 @@ class Handler(BaseHTTPRequestHandler):
         return value
     def admin_get(self,path):
         if path=='/v1/admin/devices':self.reply(200,{'ok':True,'devices':list_devices()});return True
+        if path=='/v1/admin/maintenance/policies':self.reply(200,{'ok':True,'policies':list_policies(DB)});return True
+        if path.startswith('/v1/admin/maintenance/devices/'):
+            device=normalize_device_id(path[len('/v1/admin/maintenance/devices/'):]);self.reply(200,{'ok':True,'maintenance':maintenance_state(DB,device)});return True
+        if path=='/v1/admin/reboots':self.reply(200,{'ok':True,'reboots':list_reboot_schedules(DB)});return True
+        if path.startswith('/v1/admin/reboots/'):
+            schedule_id=path[len('/v1/admin/reboots/'):].strip();value=get_reboot_schedule(DB,schedule_id)
+            if not value:self.reply(404,{'ok':False,'error':'reboot-schedule-not-found'});return True
+            self.reply(200,{'ok':True,'reboot':value});return True
         if path.startswith('/v1/admin/devices/'):
             try:device=normalize_device_id(path[len('/v1/admin/devices/'):])
             except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return True
@@ -210,6 +216,24 @@ class Handler(BaseHTTPRequestHandler):
                 raw=self.read_json();tags=raw.get('tags')
                 if not isinstance(tags,list):raise ProtocolError('tags must be a list')
                 self.reply(200,{'ok':True,'device_id':device,'tags':DB.set_device_tags(device,tags)});return True
+            if path.startswith('/v1/admin/maintenance/device/'):
+                rest=path[len('/v1/admin/maintenance/device/'):].strip('/')
+                if rest.endswith('/clear'):
+                    device=normalize_device_id(rest[:-len('/clear')].strip('/'));raw=self.read_json(required=False);clear_device_policy(DB,device,actor=raw.get('actor') or 'fleet-api-admin');self.reply(200,{'ok':True,'device_id':device,'cleared':True});return True
+                device=normalize_device_id(rest);raw=self.read_json();policy=raw.get('policy') if isinstance(raw.get('policy'),dict) else raw;self.reply(200,{'ok':True,'device_id':device,'policy':set_device_policy(DB,device,policy,actor=raw.get('actor') or 'fleet-api-admin')});return True
+            if path.startswith('/v1/admin/maintenance/group/'):
+                rest=path[len('/v1/admin/maintenance/group/'):].strip('/')
+                if rest.endswith('/clear'):
+                    group=rest[:-len('/clear')].strip('/');raw=self.read_json(required=False);clear_group_policy(DB,group,actor=raw.get('actor') or 'fleet-api-admin');self.reply(200,{'ok':True,'group_id':group,'cleared':True});return True
+                group=rest;raw=self.read_json();policy=raw.get('policy') if isinstance(raw.get('policy'),dict) else raw;self.reply(200,{'ok':True,'group_id':group,'policy':set_group_policy(DB,group,policy,actor=raw.get('actor') or 'fleet-api-admin')});return True
+            if path=='/v1/admin/reboots':
+                raw=self.read_json();result=create_reboot_schedule(DB,selector=target_from_request(raw),mode=raw.get('mode','at'),scheduled_at=raw.get('scheduled_at'),not_before=raw.get('not_before'),created_by=raw.get('created_by') or 'fleet-api-admin',reason=raw.get('reason',''),verify_timeout_seconds=raw.get('verify_timeout_seconds',1800),schedule_id=raw.get('schedule_id'));self.reply(201,{'ok':True,**result});return True
+            if path.startswith('/v1/admin/reboots/') and '/' in path[len('/v1/admin/reboots/'):]:
+                rest=path[len('/v1/admin/reboots/'):];schedule_id,action=rest.split('/',1);raw=self.read_json(required=False)
+                if action=='cancel':result=cancel_reboot_schedule(DB,schedule_id,actor=raw.get('actor') or 'fleet-api-admin')
+                elif action=='reconcile':result=reconcile_reboot_schedule(DB,schedule_id)
+                else:return False
+                export_legacy_commands();self.reply(200,{'ok':True,**result});return True
             if path=='/v1/admin/groups':
                 raw=self.read_json();gid=DB.create_group(raw.get('name'),description=raw.get('description',''),group_id=raw.get('group_id'))
                 self.reply(201,{'ok':True,'group_id':gid});return True
@@ -220,6 +244,7 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/v1/admin/deployments':
                 raw=self.read_json();target_commit=DB._normalize_commit(raw.get('target_commit'));policy=dict(raw.get('policy') or {})
                 if raw.get('auto') is not None:policy['auto_advance']=bool(raw.get('auto'))
+                if raw.get('respect_maintenance') is not None:policy['respect_maintenance']=bool(raw.get('respect_maintenance'))
                 selector=target_from_request(raw)
                 result=freeze_deployment(DB,name=raw.get('name') or f"Deploy {target_commit[:12]}",target_commit=target_commit,target_version=raw.get('target_version'),created_by=raw.get('created_by') or 'fleet-api-admin',selector=selector,policy=policy,strategy=raw.get('strategy'),deployment_id=raw.get('deployment_id'))
                 legacy_single='device_id' in raw and 'dispatch' not in raw and not policy.get('auto_advance')
@@ -240,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ProtocolError,ValueError,TypeError) as exc:self.reply(400,{'ok':False,'error':str(exc)});return True
         return False
     def do_GET(self):
-        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':1,'fleet_operations':1,'exact_commit_deployments':True,'inventory_reporting':True,'desired_state_reconciliation':True,'frozen_target_rollouts':True,'deployment_recovery_controls':True,'time':time.time()});return
+        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':1,'fleet_operations':1,'exact_commit_deployments':True,'inventory_reporting':True,'desired_state_reconciliation':True,'frozen_target_rollouts':True,'deployment_recovery_controls':True,'maintenance_windows':True,'scheduled_reboots':True,'typed_reboot_command':True,'time':time.time()});return
         parsed=urllib.parse.urlparse(self.path)
         if parsed.path.startswith('/v1/admin/'):
             if not auth_admin(self):self.reply(401,{'ok':False,'error':'unauthorized'});return
