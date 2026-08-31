@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import hmac,json,os,sys,time,urllib.parse
+import hmac,json,os,secrets,sys,tempfile,time,urllib.parse
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 sys.path.insert(0,'/usr/local/lib/lghs-python');sys.path.insert(0,str(Path(__file__).resolve().parent))
@@ -20,12 +20,34 @@ DB=FleetDB(Path(os.environ.get('LGHS_FLEET_DB','/var/lib/lghs/fleet.db')));MAX_B
 def load_json(path,default):
     try:return json.loads(path.read_text(encoding='utf-8'))
     except Exception:return default
+def atomic_json(path,value,mode=0o600):
+    path.parent.mkdir(parents=True,exist_ok=True);fd,tmp=tempfile.mkstemp(prefix=path.name+'.',dir=str(path.parent))
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as handle:json.dump(value,handle,indent=2,sort_keys=True);handle.write('\n')
+        os.chmod(tmp,mode);os.replace(tmp,path)
+    finally:
+        try:os.unlink(tmp)
+        except FileNotFoundError:pass
+def ensure_admin_token():
+    data=load_json(TOKENS,{})
+    if not isinstance(data,dict):data={}
+    if 'devices' not in data:
+        legacy=dict(data);data={'version':2,'devices':legacy}
+    if not str(data.get('admin_token') or ''):
+        data['admin_token']=secrets.token_urlsafe(48)
+    data['version']=max(2,int(data.get('version') or 1));atomic_json(TOKENS,data,0o600)
 def token_for(device):
     data=load_json(TOKENS,{});data=data.get('devices',{}) if isinstance(data,dict) and 'devices' in data else data;value=data.get(device) if isinstance(data,dict) else None
     if isinstance(value,dict):value=value.get('token')
     return str(value or '')
+def admin_token():
+    data=load_json(TOKENS,{});return str(data.get('admin_token') or '') if isinstance(data,dict) else ''
+def bearer(handler):
+    auth=handler.headers.get('Authorization','');return auth[7:].strip() if auth.startswith('Bearer ') else ''
 def authorized(device,supplied):
     expected=token_for(device);return bool(expected and supplied and hmac.compare_digest(expected,supplied))
+def auth_admin(handler):
+    expected=admin_token();supplied=bearer(handler);return bool(expected and supplied and hmac.compare_digest(expected,supplied))
 def legacy_command_view(row):
     x=dict(row);x['id']=x.pop('command_id',x.get('id'));x['device']=x.pop('device_id',x.get('device'));x.pop('payload_json',None);return x
 def export_legacy_commands():
@@ -34,10 +56,9 @@ def legacy_cache(device,payload):
     CACHE.parent.mkdir(parents=True,exist_ok=True);cache=load_json(CACHE,{'version':1,'devices':{}})
     if not isinstance(cache,dict):cache={'version':1,'devices':{}}
     devices=cache.setdefault('devices',{});p=dict(payload);p.pop('audit_batches',None);p['device_id']=device;p['received_at']=time.time();p['fleet_commands']=[legacy_command_view(x) for x in DB.list_commands(device,16)];p['warnings']=DB.list_warnings(device,False,32);devices[device]=p;cache['updated_at']=time.time();tmp=CACHE.with_suffix('.tmp');tmp.write_text(json.dumps(cache,separators=(',',':'))+'\n',encoding='utf-8');os.chmod(tmp,0o640);os.replace(tmp,CACHE)
-def auth_device(handler,device):
-    auth=handler.headers.get('Authorization','');supplied=auth[7:].strip() if auth.startswith('Bearer ') else '';return authorized(device,supplied)
+def auth_device(handler,device):return authorized(device,bearer(handler))
 def reconcile_command_milestones(device,rows):
-    """Preserve fast RECEIVED/ACCEPTED/RUNNING timestamps even when one report spans several states."""
+    '''Preserve fast RECEIVED/ACCEPTED/RUNNING timestamps even when one report spans several states.'''
     for item in rows if isinstance(rows,list) else []:
         if not isinstance(item,dict):continue
         cid=str(item.get('id') or '')
@@ -47,23 +68,97 @@ def reconcile_command_milestones(device,rows):
         for state,field in (('received','received_at'),('accepted','accepted_at'),('running','running_at')):
             stamp=item.get(field)
             if stamp is None:continue
-            current=DB.get_command(cid)
-            column='started_at' if state=='running' else field
+            current=DB.get_command(cid);column='started_at' if state=='running' else field
             if current and current.get(column) is not None:continue
-            try:
-                DB.transition_command(cid,state,stage=f'{state.title()} by device',message='Milestone reported by managed agent',now=float(stamp),detail={'backfilled':True})
-            except (TypeError,ValueError):
-                pass
+            try:DB.transition_command(cid,state,stage=f'{state.title()} by device',message='Milestone reported by managed agent',now=float(stamp),detail={'backfilled':True})
+            except (TypeError,ValueError):pass
     DB.reconcile_reported_commands(device,rows)
+def decode_json_field(value,default):
+    try:return json.loads(value or '')
+    except Exception:return default
+def device_view(row):
+    x=dict(row);x['labels']=decode_json_field(x.pop('labels_json','{}'),{});x['tags']=DB.list_device_tags(x['device_id']);x['groups']=DB.list_groups(x['device_id']);return x
+def deployment_view(row):
+    x=dict(row)
+    for key,out in (('policy_json','policy'),('target_json','target'),('strategy_json','strategy')):x[out]=decode_json_field(x.pop(key,'{}'),{})
+    return x
+def list_devices():
+    with DB.connect() as db:rows=db.execute('SELECT * FROM devices ORDER BY device_id').fetchall()
+    return [device_view(r) for r in rows]
+def list_groups():
+    with DB.connect() as db:
+        groups=[dict(r) for r in db.execute('SELECT * FROM fleet_groups ORDER BY name').fetchall()]
+        for group in groups:group['members']=[str(r['device_id']) for r in db.execute('SELECT device_id FROM group_members WHERE group_id=? ORDER BY device_id',(group['group_id'],)).fetchall()]
+    return groups
+def list_deployments():
+    with DB.connect() as db:rows=db.execute('SELECT * FROM deployments ORDER BY created_at DESC').fetchall()
+    return [deployment_view(r) for r in rows]
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='LGHSFleetAPI/13'
+    server_version='LGHSFleetAPI/14'
     def log_message(self,*a):return
     def reply(self,code,payload):
         body=json.dumps(payload,separators=(',',':')).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+    def read_json(self,required=True):
+        try:length=int(self.headers.get('Content-Length','0'))
+        except ValueError:length=0
+        if length==0 and not required:return {}
+        if length<=0 or length>MAX_BODY:raise ValueError('invalid-size')
+        try:value=json.loads(self.rfile.read(length))
+        except Exception:raise ProtocolError('invalid-json') from None
+        if not isinstance(value,dict):raise ProtocolError('body must be an object')
+        return value
+    def admin_get(self,path):
+        if path=='/v1/admin/devices':self.reply(200,{'ok':True,'devices':list_devices()});return True
+        if path.startswith('/v1/admin/devices/'):
+            try:device=normalize_device_id(path[len('/v1/admin/devices/'):])
+            except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return True
+            row=DB.get_device(device)
+            if not row:self.reply(404,{'ok':False,'error':'device-not-found'});return True
+            self.reply(200,{'ok':True,'device':device_view(row)});return True
+        if path=='/v1/admin/groups':self.reply(200,{'ok':True,'groups':list_groups()});return True
+        if path=='/v1/admin/deployments':self.reply(200,{'ok':True,'deployments':list_deployments()});return True
+        if path.startswith('/v1/admin/deployments/'):
+            deployment_id=path[len('/v1/admin/deployments/'):].strip()
+            row=DB.get_deployment(deployment_id)
+            if not row:self.reply(404,{'ok':False,'error':'deployment-not-found'});return True
+            self.reply(200,{'ok':True,'deployment':deployment_view(row),'executions':DB.list_deployment_executions(deployment_id)});return True
+        return False
+    def admin_post(self,path):
+        try:
+            if path.startswith('/v1/admin/devices/') and path.endswith('/tags'):
+                device=normalize_device_id(path[len('/v1/admin/devices/'):-len('/tags')].strip('/'))
+                if not DB.get_device(device):self.reply(404,{'ok':False,'error':'device-not-found'});return True
+                raw=self.read_json();tags=raw.get('tags')
+                if not isinstance(tags,list):raise ProtocolError('tags must be a list')
+                self.reply(200,{'ok':True,'device_id':device,'tags':DB.set_device_tags(device,tags)});return True
+            if path=='/v1/admin/groups':
+                raw=self.read_json();gid=DB.create_group(raw.get('name'),description=raw.get('description',''),group_id=raw.get('group_id'))
+                self.reply(201,{'ok':True,'group_id':gid});return True
+            if path.startswith('/v1/admin/groups/') and '/members/' in path:
+                rest=path[len('/v1/admin/groups/'):];gid,device_raw=rest.split('/members/',1);device=normalize_device_id(device_raw)
+                if not DB.get_device(device):self.reply(404,{'ok':False,'error':'device-not-found'});return True
+                DB.add_device_to_group(device,gid);self.reply(200,{'ok':True,'group_id':gid,'device_id':device});return True
+            if path=='/v1/admin/deployments':
+                raw=self.read_json();device=normalize_device_id(raw.get('device_id'))
+                inventory=DB.get_device(device)
+                if not inventory:self.reply(404,{'ok':False,'error':'device-not-found'});return True
+                target_commit=str(raw.get('target_commit') or '').strip().lower()
+                did=DB.create_deployment(raw.get('name') or f'Deploy {target_commit[:12]} to {device}',target_commit,target_version=raw.get('target_version'),kind=raw.get('kind','software'),created_by=raw.get('created_by'),target={'device_id':device},policy=raw.get('policy'),strategy=raw.get('strategy'),deployment_id=raw.get('deployment_id'))
+                DB.add_deployment_execution(did,device,phase=0,state='queued',target_commit=target_commit,previous_commit=inventory.get('current_commit'))
+                DB.update_device_inventory(device,desired_commit=target_commit)
+                self.reply(201,{'ok':True,'deployment_id':did,'state':'queued','dispatch_ready':False,'reason':'exact-commit executor support pending'});return True
+        except KeyError as exc:self.reply(404,{'ok':False,'error':f'not-found:{exc.args[0]}'});return True
+        except (ProtocolError,ValueError,TypeError) as exc:self.reply(400,{'ok':False,'error':str(exc)});return True
+        return False
     def do_GET(self):
-        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':1,'time':time.time()});return
-        parsed=urllib.parse.urlparse(self.path);prefix='/v1/commands/'
+        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':1,'fleet_operations':1,'time':time.time()});return
+        parsed=urllib.parse.urlparse(self.path)
+        if parsed.path.startswith('/v1/admin/'):
+            if not auth_admin(self):self.reply(401,{'ok':False,'error':'unauthorized'});return
+            if not self.admin_get(parsed.path):self.reply(404,{'ok':False});return
+            return
+        prefix='/v1/commands/'
         if not parsed.path.startswith(prefix):self.reply(404,{'ok':False});return
         try:device=normalize_device_id(parsed.path[len(prefix):])
         except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
@@ -78,24 +173,26 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(.25)
         export_legacy_commands();self.reply(200,response(commands))
     def do_POST(self):
+        parsed=urllib.parse.urlparse(self.path)
+        if parsed.path.startswith('/v1/admin/'):
+            if not auth_admin(self):self.reply(401,{'ok':False,'error':'unauthorized'});return
+            if not self.admin_post(parsed.path):self.reply(404,{'ok':False});return
+            return
         prefix='/v1/report/'
-        if not self.path.startswith(prefix):self.reply(404,{'ok':False});return
-        try:device=normalize_device_id(self.path[len(prefix):].split('?',1)[0])
+        if not parsed.path.startswith(prefix):self.reply(404,{'ok':False});return
+        try:device=normalize_device_id(parsed.path[len(prefix):])
         except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
         if not auth_device(self,device):self.reply(401,{'ok':False,'error':'unauthorized'});return
-        try:length=int(self.headers.get('Content-Length','0'))
-        except ValueError:length=0
-        if length<=0 or length>MAX_BODY:self.reply(413,{'ok':False,'error':'invalid-size'});return
-        try:raw=json.loads(self.rfile.read(length))
-        except Exception:self.reply(400,{'ok':False,'error':'invalid-json'});return
+        try:raw=self.read_json()
+        except ValueError as exc:self.reply(413,{'ok':False,'error':str(exc)});return
+        except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
         now=time.time();audit_ack={}
         try:
-            if isinstance(raw,dict) and raw.get('protocol')==PROTOCOL_VERSION and 'payload' in raw:
+            if raw.get('protocol')==PROTOCOL_VERSION and 'payload' in raw:
                 env=TelemetryEnvelope.from_mapping(raw,now=now)
                 if env.device_id!=device:raise ProtocolError('device-mismatch')
                 payload=dict(env.payload);command_states=payload.get('command_states',[]);DB.record_telemetry(device,payload,received_at=now,sent_at=env.sent_at,agent_version=env.agent_version,protocol=env.protocol,boot_id=env.boot_id,sequence=env.sequence);audit_ack=record_batches(DB,device,payload.get('audit_batches',[]));record_snapshot(DB,device,payload.get('sudo_requests',[]))
             else:
-                if not isinstance(raw,dict):raise ProtocolError('invalid-report')
                 claimed=str(raw.get('device_id') or raw.get('hostname') or device).upper()
                 if claimed!=device:raise ProtocolError('device-mismatch')
                 payload=dict(raw);command_states=payload.get('command_states',[]);DB.record_telemetry(device,payload,received_at=now,sent_at=payload.get('sent_at'),agent_version='0.4-compat',protocol=0);record_snapshot(DB,device,payload.get('sudo_requests',[]))
@@ -106,5 +203,5 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     if os.geteuid()!=0:raise SystemExit('Run as root')
-    DB.initialize();DB.migrate_legacy();export_legacy_commands();ThreadingHTTPServer((BIND,PORT),Handler).serve_forever(poll_interval=.25)
+    DB.initialize();DB.migrate_legacy();ensure_admin_token();export_legacy_commands();ThreadingHTTPServer((BIND,PORT),Handler).serve_forever(poll_interval=.25)
 if __name__=='__main__':main()
