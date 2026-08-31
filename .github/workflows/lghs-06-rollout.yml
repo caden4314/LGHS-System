@@ -61,7 +61,7 @@ jobs:
           grep -Fq "boot_id_before" controller/lghs/maintenance.py
           grep -Fq "Waiting for current boot_id before dispatch" controller/lghs/maintenance.py
           grep -Fq "Reboot verified by boot_id change" controller/lghs/maintenance.py
-          grep -Fq "'reboot'" controller/lghs/protocol.py
+          grep -Fq '"reboot"' controller/lghs/protocol.py
           grep -Fq "systemd-run" student/lghs-command-executor
           grep -Fq "deployment_recovery_controls" controller/lghs-fleet-api
           grep -Fq "maintenance_windows" controller/lghs-fleet-api
