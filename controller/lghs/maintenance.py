@@ -115,8 +115,6 @@ def _minute(value: str) -> int:
 
 
 def _policy_open(policy: Mapping[str, Any], epoch: float) -> bool:
-    if not bool(policy.get('enabled', True)):
-        return False
     zone = ZoneInfo(str(policy['timezone']))
     current = datetime.fromtimestamp(float(epoch), zone)
     weekday = current.weekday()
@@ -230,12 +228,14 @@ def effective_policies(store: Any, device_id: str) -> list[dict[str, Any]]:
     device = normalize_device_id(device_id)
     direct = _setting(store, MAINTENANCE_PREFIX + 'device:' + device)
     if direct is not None:
+        if not bool(direct.get('enabled', True)):
+            return []
         return [{'scope': 'device', 'id': device, 'policy': direct}]
     policies: list[dict[str, Any]] = []
     for group in store.list_groups(device):
         group_id = str(group['group_id'])
         policy = _setting(store, MAINTENANCE_PREFIX + 'group:' + group_id)
-        if policy is not None:
+        if policy is not None and bool(policy.get('enabled', True)):
             policies.append({'scope': 'group', 'id': group_id, 'policy': policy})
     return policies
 
@@ -245,7 +245,7 @@ def maintenance_state(store: Any, device_id: str, *, now: float | None = None, h
     device = normalize_device_id(device_id)
     policies = effective_policies(store, device)
     if not policies:
-        return {'device_id': device, 'allowed': True, 'managed': False, 'policies': [], 'next_open_at': ts, 'reason': 'no maintenance policy'}
+        return {'device_id': device, 'allowed': True, 'managed': False, 'policies': [], 'next_open_at': ts, 'reason': 'no active maintenance policy'}
 
     def open_at(epoch: float) -> bool:
         return all(_policy_open(item['policy'], epoch) for item in policies)
@@ -416,7 +416,7 @@ def cancel_reboot_schedule(store: Any, schedule_id: str, *, actor: str = 'unknow
 
 
 def _dispatch_reboot(store: Any, schedule: dict[str, Any], device: str, *, now: float) -> str:
-    command_id = store.create_command(
+    return store.create_command(
         device,
         'reboot',
         payload={'schedule_id': schedule['schedule_id'], 'reason': schedule.get('reason') or ''},
@@ -424,7 +424,6 @@ def _dispatch_reboot(store: Any, schedule: dict[str, Any], device: str, *, now: 
         now=now,
         dedupe=False,
     )
-    return command_id
 
 
 def reconcile_reboot_schedule(store: Any, schedule_id: str, *, now: float | None = None) -> dict[str, Any]:
@@ -439,7 +438,7 @@ def reconcile_reboot_schedule(store: Any, schedule_id: str, *, now: float | None
     changed = False
     actions: list[dict[str, Any]] = []
     executions = dict(schedule.get('executions') or {})
-    for device, row_raw in executions.items():
+    for device, row_raw in list(executions.items()):
         row = dict(row_raw or {})
         row_state = str(row.get('state') or 'queued')
         if row_state in TERMINAL_REBOOT_STATES:
@@ -451,23 +450,26 @@ def reconcile_reboot_schedule(store: Any, schedule_id: str, *, now: float | None
             command = store.get_command(str(command_id)) or {}
             command_state = str(command.get('state') or '').lower()
             if boot_now and boot_now != str(row.get('boot_id_before') or ''):
-                if command and command_state not in {'succeeded'}:
+                if command and command_state != 'succeeded':
                     try:
                         store.transition_command(str(command_id), 'succeeded', stage='Reboot verified', message='Device returned with a new boot_id', progress=100, now=ts, detail={'schedule_id': schedule_id, 'boot_id': boot_now})
                     except ValueError:
                         pass
                 row.update({'state': 'succeeded', 'updated_at': ts, 'completed_at': ts, 'boot_id_after': boot_now, 'message': 'Reboot verified by boot_id change'})
+                executions[device] = row
                 changed = True
                 actions.append({'device_id': device, 'action': 'verified'})
                 continue
             if command_state in FAILED_COMMAND_STATES:
                 row.update({'state': 'failed', 'updated_at': ts, 'completed_at': ts, 'message': f'reboot command {command_state}'})
+                executions[device] = row
                 changed = True
                 actions.append({'device_id': device, 'action': 'failed', 'reason': command_state})
                 continue
             dispatched_at = float(row.get('dispatched_at') or ts)
             if ts - dispatched_at > int(schedule.get('verify_timeout_seconds') or 1800):
                 row.update({'state': 'failed', 'updated_at': ts, 'completed_at': ts, 'message': 'reboot verification timed out'})
+                executions[device] = row
                 changed = True
                 actions.append({'device_id': device, 'action': 'failed', 'reason': 'verification-timeout'})
                 continue
