@@ -84,12 +84,14 @@ def sync_deployment_execution(command_id):
             if dep and str(dep['state']).lower() in LOCKED_DEPLOYMENT_STATES:
                 db.execute('UPDATE deployments SET updated_at=? WHERE deployment_id=?',(ts,did));continue
             states=[str(r['state']) for r in db.execute('SELECT state FROM deployment_executions WHERE deployment_id=?',(did,)).fetchall()]
-            if states and all(s=='succeeded' for s in states):dep_state='succeeded'
-            elif states and all(s in TERMINAL for s in states) and any(s!='succeeded' for s in states):dep_state='failed'
-            elif any(s in ACTIVE_DEPLOYMENT for s in states):dep_state='running'
+            # Command success is only the end of local execution.  Deployment
+            # success is reserved for advance_rollout() after exact-SHA and
+            # post-update health convergence are verified.
+            if states and all(s in TERMINAL for s in states) and any(s!='succeeded' for s in states):dep_state='failed'
+            elif any(s in ACTIVE_DEPLOYMENT or s=='succeeded' for s in states):dep_state='running'
             else:dep_state='queued'
             if dep_state=='running':db.execute("UPDATE deployments SET state='running',started_at=COALESCE(started_at,?),updated_at=? WHERE deployment_id=?",(ts,ts,did))
-            elif dep_state in {'succeeded','failed'}:db.execute('UPDATE deployments SET state=?,completed_at=COALESCE(completed_at,?),updated_at=? WHERE deployment_id=?',(dep_state,ts,ts,did))
+            elif dep_state=='failed':db.execute("UPDATE deployments SET state='failed',completed_at=COALESCE(completed_at,?),updated_at=? WHERE deployment_id=?",(ts,ts,did))
             else:db.execute("UPDATE deployments SET state='queued',updated_at=? WHERE deployment_id=?",(ts,did))
 def sync_delivered(commands):
     for item in commands if isinstance(commands,list) else []:
