@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Tiny privileged executor for typed LGHS 0.5 agent operations."""
+"""Tiny privileged executor for typed LGHS 0.6 agent operations."""
 from __future__ import annotations
 
 import grp
+import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -15,7 +17,9 @@ from typing import Any
 SOCK = Path('/run/lghs-command-executor/socket')
 NETQUEUE = '/usr/local/sbin/lghs-netqueue'
 SEEN = Path('/var/lib/lghs/executor-seen.json')
+REBOOT_PENDING = Path('/var/lib/lghs/reboot-pending.json')
 SUDO_DIR = Path('/var/lib/lghs/sudo-requests')
+COMMIT_RE = re.compile(r'^[0-9a-fA-F]{40}$')
 ACTIONS = {
     'lghs-update': [NETQUEUE, 'enqueue', 'local-update'],
     'os-update': [NETQUEUE, 'enqueue', 'os-update'],
@@ -49,12 +53,76 @@ def load_json(path: Path, default: Any) -> Any:
         return default
 
 
-def save_seen(value: dict[str, float]) -> None:
-    SEEN.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SEEN.with_suffix('.tmp')
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding='utf-8', errors='replace').replace('\x00', '').strip()
+    except Exception:
+        return ''
+
+
+def atomic_json(path: Path, value: Any, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(value, separators=(',', ':')) + '\n', encoding='utf-8')
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, SEEN)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def save_seen(value: dict[str, float]) -> None:
+    atomic_json(SEEN, value)
+
+
+def current_boot_id() -> str:
+    return read_text(Path('/proc/sys/kernel/random/boot_id')) or 'unknown'
+
+
+def reboot_status() -> dict[str, Any]:
+    pending = load_json(REBOOT_PENDING, {})
+    if not isinstance(pending, dict) or not pending:
+        return {}
+    before = str(pending.get('boot_id_before') or '')
+    current = current_boot_id()
+    if before and current not in {'', 'unknown'} and current != before:
+        try:
+            REBOOT_PENDING.unlink()
+        except FileNotFoundError:
+            pass
+        return {}
+    return pending
+
+
+def normalize_target_commit(value: Any) -> str:
+    commit = str(value or '').strip().lower()
+    if not COMMIT_RE.fullmatch(commit):
+        raise ValueError('target_commit must be an exact 40-character Git SHA')
+    return commit
+
+
+def action_command(action: str, payload: Any, command_id: str = '') -> list[str]:
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise ValueError('invalid-payload')
+    if action == 'reboot':
+        schedule_id = str(payload.get('schedule_id') or '').strip()
+        reason = str(payload.get('reason') or '')
+        if not schedule_id or len(schedule_id) > 96:
+            raise ValueError('invalid-reboot-schedule-id')
+        if len(reason) > 500:
+            raise ValueError('invalid-reboot-reason')
+        unit = 'lghs-reboot-' + hashlib.sha256(str(command_id).encode()).hexdigest()[:16]
+        systemd_run = shutil.which('systemd-run') or '/usr/bin/systemd-run'
+        systemctl = shutil.which('systemctl') or '/usr/bin/systemctl'
+        return [systemd_run, '--quiet', '--unit=' + unit, '--on-active=5s', systemctl, 'reboot']
+    if action not in ACTIONS:
+        raise ValueError('unsupported-action')
+    command = list(ACTIONS[action])
+    if action == 'lghs-update' and payload.get('target_commit'):
+        command += ['--commit', normalize_target_commit(payload['target_commit'])]
+    if command_id:
+        # The controller command ID is the local side-effect idempotency key.
+        command += ['--idempotency-key', command_id]
+    return command
 
 
 def service_states() -> dict[str, str]:
@@ -68,8 +136,51 @@ def service_states() -> dict[str, str]:
     return out
 
 
+def pi_inventory() -> dict[str, Any]:
+    mem_kb = 0
+    try:
+        for line in Path('/proc/meminfo').read_text(encoding='utf-8').splitlines():
+            if line.startswith('MemTotal:'):
+                mem_kb = int(line.split()[1])
+                break
+    except Exception:
+        pass
+
+    serial = read_text(Path('/sys/firmware/devicetree/base/serial-number'))
+    if not serial:
+        try:
+            for line in Path('/proc/cpuinfo').read_text(encoding='utf-8').splitlines():
+                if line.lower().startswith('serial') and ':' in line:
+                    serial = line.split(':', 1)[1].strip()
+                    break
+        except Exception:
+            pass
+
+    current_commit = read_text(Path('/var/lib/lghs/update/current-commit')) or read_text(Path('/etc/lghs/source-commit'))
+    current_commit = current_commit.lower()
+    if current_commit and not COMMIT_RE.fullmatch(current_commit):
+        current_commit = ''
+
+    out: dict[str, Any] = {
+        'hostname': socket.gethostname().upper(),
+        'role': read_text(Path('/etc/lghs/role')),
+        'model': read_text(Path('/proc/device-tree/model')),
+        'ram_mb': int(round(mem_kb / 1024)) if mem_kb else None,
+        'serial': serial,
+        'current_commit': current_commit,
+        'current_version': read_text(Path('/etc/lghs/version')),
+    }
+    return {key: value for key, value in out.items() if value not in ('', None)}
+
+
 def pi_health() -> dict[str, Any]:
-    out: dict[str, Any] = {'reboot_required': Path('/run/reboot-required').exists()}
+    out: dict[str, Any] = {
+        'reboot_required': Path('/run/reboot-required').exists(),
+        'inventory': pi_inventory(),
+    }
+    pending = reboot_status()
+    if pending:
+        out['scheduled_reboot'] = pending
     if shutil.which('vcgencmd'):
         try:
             proc = subprocess.run(['vcgencmd', 'get_throttled'], text=True, capture_output=True, timeout=3)
@@ -178,19 +289,35 @@ def handle(client: socket.socket) -> None:
 
     command_id = str(req.get('id') or '')
     action = str(req.get('action') or '')
+    payload = req.get('payload') or {}
     if not command_id or len(command_id) > 128:
         reply(client, {'ok': False, 'error': 'invalid-command-id'})
         return
-    if action not in ACTIONS:
-        reply(client, {'ok': False, 'error': 'unsupported-action'})
+    try:
+        command = action_command(action, payload, command_id)
+    except ValueError as exc:
+        reply(client, {'ok': False, 'error': str(exc)})
         return
 
     seen = load_json(SEEN, {})
     if command_id in seen:
         reply(client, {'ok': True, 'message': 'Command already accepted locally', 'accepted_at': seen[command_id]})
         return
+
+    # A reboot may have been armed successfully immediately before the executor
+    # crashed or the reply was lost. The persisted marker is authoritative for
+    # the same command ID and prevents scheduling a second reboot transaction.
+    if action == 'reboot':
+        pending = load_json(REBOOT_PENDING, {})
+        if isinstance(pending, dict) and str(pending.get('command_id') or '') == command_id:
+            accepted_at = float(pending.get('accepted_at') or time.time())
+            seen[command_id] = accepted_at
+            save_seen(seen)
+            reply(client, {'ok': True, 'message': 'Reboot already armed locally', 'accepted_at': accepted_at})
+            return
+
     try:
-        proc = subprocess.run(ACTIONS[action], text=True, capture_output=True, timeout=20)
+        proc = subprocess.run(command, text=True, capture_output=True, timeout=20)
     except Exception as exc:
         reply(client, {'ok': False, 'error': str(exc)})
         return
@@ -199,12 +326,22 @@ def handle(client: socket.socket) -> None:
         return
 
     accepted = time.time()
+    if action == 'reboot':
+        atomic_json(REBOOT_PENDING, {
+            'command_id': command_id,
+            'schedule_id': str(payload.get('schedule_id') or ''),
+            'reason': str(payload.get('reason') or '')[:500],
+            'boot_id_before': current_boot_id(),
+            'accepted_at': accepted,
+            'reboot_after_seconds': 5,
+        })
     seen[command_id] = accepted
     if len(seen) > 512:
         for key, _ in sorted(seen.items(), key=lambda item: item[1])[:-256]:
             seen.pop(key, None)
     save_seen(seen)
-    reply(client, {'ok': True, 'message': 'Queued locally', 'accepted_at': accepted})
+    message = 'Reboot armed locally' if action == 'reboot' else 'Queued locally'
+    reply(client, {'ok': True, 'message': message, 'accepted_at': accepted})
 
 
 def main() -> None:
