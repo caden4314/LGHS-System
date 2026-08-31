@@ -17,7 +17,7 @@ from lghs_bt_protocol import (PROTOCOL_VERSION, decrypt_payload, derive_key,
 CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
 TOKENS = Path(os.environ.get("LGHS_FLEET_API_TOKENS", "/etc/lghs/fleet-api-tokens.json"))
 ROLE = Path("/etc/lghs/role")
-SOCKET_TIMEOUT = 20
+SOCKET_TIMEOUT = 180
 COMMAND_TIMEOUT = 90
 SOL_BLUETOOTH = getattr(socket, "SOL_BLUETOOTH", 274)
 BT_SECURITY = getattr(socket, "BT_SECURITY", 4)
@@ -33,9 +33,6 @@ def run(cmd, timeout=None):
 
 
 def set_app_authenticated_security(sock):
-    # Bootstrap authentication/encryption is provided by the LGHS protocol
-    # (token proof + X25519/HKDF + AES-GCM). BlueZ pairing is intentionally
-    # zero-touch and supplies only the underlying RFCOMM transport.
     sock.setsockopt(SOL_BLUETOOTH, BT_SECURITY, struct.pack("BB", BT_SECURITY_LOW, 0))
 
 
