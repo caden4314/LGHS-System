@@ -20,14 +20,16 @@ jobs:
             controller/lghs-rollout-manager \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
-            tests/test_deployment_recovery.py
+            tests/test_deployment_recovery.py \
+            tests/test_fleet_api_recovery.py
 
-      - name: Frozen target, phase, and recovery tests
+      - name: Frozen target, phase, recovery, and API tests
         run: |
           python3 -m unittest -v \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
-            tests/test_deployment_recovery.py
+            tests/test_deployment_recovery.py \
+            tests/test_fleet_api_recovery.py
 
       - name: Security invariants
         run: |
@@ -40,6 +42,7 @@ jobs:
           grep -q "auto_advance" controller/lghs/rollout_manager.py
           grep -q "retry-failed" controller/lghs/recovery.py
           grep -q "current-commit-does-not-match-deployment-target" controller/lghs/recovery.py
+          grep -q "deployment_recovery_controls" controller/lghs-fleet-api
           grep -q "ReadWritePaths=/var/lib/lghs /run/lock" systemd/lghs-rollout-manager.service
           grep -q 'controller/lghs/recovery.py' install.sh
           grep -q 'controller/lghs/recovery.py' updater/lghs-0.5-install
