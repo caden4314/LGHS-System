@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json,tempfile,time,unittest
+import json,sqlite3,tempfile,time,unittest
 from pathlib import Path
 from controller.lghs.database import FleetDB
 from controller.lghs.protocol import ProtocolError,TelemetryEnvelope,normalize_command_state,state_can_advance
@@ -17,8 +17,34 @@ class FleetDBTests(unittest.TestCase):
     def tearDown(self):self.tmp.cleanup()
     def test_wal_and_schema(self):
         with self.store.connect() as db:
-            self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0].lower(),'wal');self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],'2');tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for name in {'devices','telemetry_latest','commands','command_events','warnings','warning_events','deployments','deployment_executions','sudo_requests','audit_events','notifications','settings'}:self.assertIn(name,tables)
+            self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0].lower(),'wal');self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],'3');tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for name in {'devices','device_tags','fleet_groups','group_members','telemetry_latest','commands','command_events','warnings','warning_events','deployments','deployment_executions','sudo_requests','audit_events','notifications','settings'}:self.assertIn(name,tables)
+    def test_v2_schema_upgrades_in_place(self):
+        old=self.root/'old.db';db=sqlite3.connect(old)
+        try:
+            db.executescript("""
+CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+INSERT INTO metadata VALUES('schema_version','2');
+CREATE TABLE devices(device_id TEXT PRIMARY KEY,created_at REAL NOT NULL,updated_at REAL NOT NULL,agent_version TEXT,protocol INTEGER,boot_id TEXT,last_sequence INTEGER,last_seen REAL,transport TEXT,ssh_host TEXT,labels_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE deployments(deployment_id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,target_version TEXT,target_commit TEXT,state TEXT NOT NULL,created_by TEXT,created_at REAL NOT NULL,updated_at REAL NOT NULL,policy_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE deployment_executions(deployment_id TEXT NOT NULL REFERENCES deployments(deployment_id) ON DELETE CASCADE,device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,command_id TEXT,phase INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL,updated_at REAL NOT NULL,PRIMARY KEY(deployment_id,device_id));
+""");db.commit()
+        finally:db.close()
+        migrated=FleetDB(old);migrated.initialize()
+        with migrated.connect() as db:
+            device_cols={r['name'] for r in db.execute('PRAGMA table_info(devices)')};execution_cols={r['name'] for r in db.execute('PRAGMA table_info(deployment_executions)')}
+            self.assertTrue({'hostname','role','model','ram_mb','serial','current_commit','current_version','desired_commit','health_state'} <= device_cols)
+            self.assertTrue({'stage','target_commit','previous_commit','attempt','started_at','completed_at','error_code','error_message'} <= execution_cols)
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],'3')
+    def test_inventory_tags_groups_and_deployment_foundation(self):
+        current='a'*40;target='b'*40
+        row=self.store.update_device_inventory('CS-999',hostname='CS-999',role='student',model='Raspberry Pi 5',ram_mb=8192,serial='10000000abcdef01',current_commit=current,current_version='0.6.0-dev',health_state='healthy')
+        self.assertEqual(row['role'],'student');self.assertEqual(row['current_commit'],current);self.assertEqual(row['health_state'],'healthy')
+        self.assertEqual(self.store.set_device_tags('CS-999',['room:cs-lab','ring:canary','room:cs-lab']),['ring:canary','room:cs-lab']);self.assertEqual(self.store.list_device_tags('CS-999'),['ring:canary','room:cs-lab'])
+        gid=self.store.create_group('Canary',group_id='canary');self.store.add_device_to_group('CS-999',gid);self.assertEqual(self.store.list_groups('CS-999')[0]['group_id'],'canary')
+        dep=self.store.create_deployment('0.6 canary',target,target_version='0.6.0-dev',target={'tag':'ring:canary'},strategy={'canary':1},deployment_id='dep-1',now=20);self.store.add_deployment_execution(dep,'CS-999',phase=0,previous_commit=current,now=21)
+        execution=self.store.list_deployment_executions(dep)[0];self.assertEqual(execution['target_commit'],target);self.assertEqual(execution['previous_commit'],current);self.assertEqual(execution['state'],'queued')
+        with self.assertRaises(ValueError):self.store.create_deployment('moving branch','release-0.6.0-fleet-operations')
     def test_telemetry_sequence_rejects_only_regression(self):
         self.store.record_telemetry('CS-999',{'x':1},received_at=100,sent_at=99,agent_version='0.5.0',protocol=1,boot_id='boot-a',sequence=10)
         self.store.record_telemetry('CS-999',{'x':2},received_at=101,sent_at=100,agent_version='0.5.0',protocol=1,boot_id='boot-a',sequence=10)
