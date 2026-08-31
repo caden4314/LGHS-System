@@ -23,6 +23,7 @@ jobs:
             controller/lghs-rollout-manager \
             controller/lghs-console-day2 \
             controller/lghs-console-day3 \
+            controller/lghs-console-day4 \
             student/lghs-agent \
             student/lghs-command-executor \
             tests/test_fleet_rollout.py \
@@ -95,20 +96,26 @@ jobs:
           grep -Fq "boot_id verified" controller/lghs-console-day3
           grep -Fq "A reboot already accepted locally may continue" controller/lghs-console-day3
           grep -Fq "lghs-console-day2-core" controller/lghs-console-day3
+          grep -Fq "POST-UPDATE HEALTH GATE" controller/lghs-console-day4
+          grep -Fq "blocked_checks" controller/lghs-console-day4
+          grep -Fq "lghs-console-day3-core" controller/lghs-console-day4
           grep -Fq "ReadWritePaths=/var/lib/lghs /run/lock" systemd/lghs-rollout-manager.service
+          grep -Fq 'controller/lghs/sudo_state.py' install.sh
           grep -Fq 'controller/lghs/health.py' install.sh
           grep -Fq 'controller/lghs/recovery.py' install.sh
           grep -Fq 'controller/lghs/maintenance.py' install.sh
           grep -Fq 'controller/lghs-fleet-maintenance' install.sh
           grep -Eq 'controller/lghs-console-day2.*lghs-console-day2-core' install.sh
-          grep -Eq 'controller/lghs-console-day3.*lghs-console' install.sh
+          grep -Eq 'controller/lghs-console-day3.*lghs-console-day3-core' install.sh
+          grep -Eq 'controller/lghs-console-day4.*lghs-console' install.sh
           grep -Fq 'controller/lghs/health.py' updater/lghs-0.5-install
           grep -Fq 'controller/lghs/recovery.py' updater/lghs-0.5-install
           grep -Fq 'controller/lghs/maintenance.py' updater/lghs-0.5-install
           grep -Fq 'controller/lghs-fleet-maintenance' updater/lghs-0.5-install
           grep -Eq 'controller/lghs-console-day2.*lghs-console-day2-core' updater/lghs-0.5-install
-          grep -Eq 'controller/lghs-console-day3.*lghs-console' updater/lghs-0.5-install
-          if grep -nE 'shell=True|eval\(' controller/lghs/health.py controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs/recovery.py controller/lghs/maintenance.py controller/lghs-fleet-rollout controller/lghs-fleet-maintenance controller/lghs-rollout-manager controller/lghs-console-day3 student/lghs-agent student/lghs-command-executor; then
+          grep -Eq 'controller/lghs-console-day3.*lghs-console-day3-core' updater/lghs-0.5-install
+          grep -Eq 'controller/lghs-console-day4.*lghs-console' updater/lghs-0.5-install
+          if grep -nE 'shell=True|eval\(' controller/lghs/health.py controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs/recovery.py controller/lghs/maintenance.py controller/lghs-fleet-rollout controller/lghs-fleet-maintenance controller/lghs-rollout-manager controller/lghs-console-day3 controller/lghs-console-day4 student/lghs-agent student/lghs-command-executor; then
             echo 'Fleet operations contains an arbitrary shell path.' >&2
             exit 1
           fi
