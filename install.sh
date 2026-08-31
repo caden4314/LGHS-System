@@ -80,7 +80,8 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-legacy
   install -m 0755 "$ROOT_DIR/controller/lghs-console-tunnel" /usr/local/libexec/lghs-console-base
   install -m 0755 "$ROOT_DIR/controller/lghs-console-responsive" /usr/local/libexec/lghs-console-responsive-core
-  install -m 0755 "$ROOT_DIR/controller/lghs-console-day2" /usr/local/sbin/lghs-console
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day2" /usr/local/libexec/lghs-console-day2-core
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day3" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-notify" /usr/local/sbin/lghs-fleet-notify
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
