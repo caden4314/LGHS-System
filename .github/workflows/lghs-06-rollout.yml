@@ -76,10 +76,10 @@ jobs:
           grep -Fq "respect_maintenance" controller/lghs/fleet_ui.py
           grep -Fq "idempotency key reused with different job payload" updater/lghs-netqueue
           grep -Fq "uncertain prior execution; use retry explicitly" updater/lghs-netqueue
-          grep -Fq "--idempotency-key" updater/lghs-netqueue
+          grep -Fq -- "--idempotency-key" updater/lghs-netqueue
           grep -Fq "controller command ID is the local side-effect idempotency key" student/lghs-command-executor
           grep -Fq "Reboot already armed locally" student/lghs-command-executor
-          grep -Fq "same action" controller/lghs-fleet-command || grep -Fq "different exact target commits" controller/lghs-fleet-command
+          grep -Fq "different exact target commits" controller/lghs-fleet-command
           grep -Fq "health_version': 2" student/lghs-agent
           grep -Fq "failed_systemd_units" student/lghs-agent
           grep -Fq "root_readonly" student/lghs-agent
