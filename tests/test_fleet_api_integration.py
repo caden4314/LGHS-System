@@ -65,7 +65,8 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=5) as response:
             return response.status, json.loads(response.read().decode())
 
-    def report(self, sequence, command_states=None, sudo_requests=None):
+    def report(self, sequence, command_states=None, sudo_requests=None, current_commit=None):
+        current_commit = current_commit or ('a' * 40)
         return self.request('/v1/report/CS-999', 'POST', {
             'protocol': 1,
             'agent_version': '0.6.0-dev',
@@ -75,10 +76,29 @@ class FleetAPIIntegrationTests(unittest.TestCase):
             'sent_at': time.time(),
             'payload': {
                 'metrics': {'cpu_pct': 7.5, 'disk_pct': 10.0, 'temp_c': 42.0},
-                'health': {'reboot_required': False},
+                'health': {
+                    'reboot_required': False,
+                    'inventory': {
+                        'hostname': 'CS-999',
+                        'role': 'student',
+                        'model': 'Raspberry Pi 5 Model B Rev 1.0',
+                        'ram_mb': 8192,
+                        'serial': '10000000deadbeef',
+                        'current_commit': current_commit,
+                        'current_version': '0.6.0-dev',
+                    },
+                },
+                'health_report': {
+                    'health_version': 1,
+                    'checks': [
+                        {'id': 'service.lghs-agent', 'state': 'pass', 'severity': 'critical'},
+                        {'id': 'hardware.temperature', 'state': 'pass', 'severity': 'warning'},
+                    ],
+                },
                 'command_states': command_states or [],
                 'sudo_requests': sudo_requests or [],
                 'audit_batches': [],
+                'version': '0.6.0-dev',
             },
         })
 
@@ -90,6 +110,8 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         self.assertEqual(health['command_transport'], 'long-poll')
         self.assertEqual(health['fleet_operations'], 1)
         self.assertTrue(health['exact_commit_deployments'])
+        self.assertTrue(health['inventory_reporting'])
+        self.assertTrue(health['desired_state_reconciliation'])
 
         cid = self.mod.DB.create_command('CS-999', 'lghs-update', command_id='cmd-http')
         status, first = self.report(1)
@@ -148,14 +170,9 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(row['completed_at'])
 
     def test_admin_inventory_groups_and_exact_commit_deployment(self):
-        self.report(1)
         current = 'a' * 40
         target = 'b' * 40
-        self.mod.DB.update_device_inventory(
-            'CS-999', hostname='CS-999', role='student', model='Raspberry Pi 5',
-            ram_mb=8192, current_commit=current, current_version='0.6.0-dev',
-            health_state='healthy',
-        )
+        self.report(1, current_commit=current)
 
         with self.assertRaises(urllib.error.HTTPError) as denied:
             self.request('/v1/admin/devices', token='secret')
@@ -163,8 +180,19 @@ class FleetAPIIntegrationTests(unittest.TestCase):
 
         status, inventory = self.request('/v1/admin/devices', token='admin-secret')
         self.assertEqual(status, 200)
-        self.assertEqual(inventory['devices'][0]['device_id'], 'CS-999')
-        self.assertEqual(inventory['devices'][0]['current_commit'], current)
+        device = inventory['devices'][0]
+        self.assertEqual(device['device_id'], 'CS-999')
+        self.assertEqual(device['hostname'], 'CS-999')
+        self.assertEqual(device['role'], 'student')
+        self.assertEqual(device['model'], 'Raspberry Pi 5 Model B Rev 1.0')
+        self.assertEqual(device['ram_mb'], 8192)
+        self.assertEqual(device['serial'], '10000000deadbeef')
+        self.assertEqual(device['current_commit'], current)
+        self.assertEqual(device['current_version'], '0.6.0-dev')
+        self.assertEqual(device['health_state'], 'healthy')
+        self.assertEqual(device['boot_id'], 'boot-1')
+        self.assertIsNotNone(device['last_seen'])
+        self.assertEqual(device['sync_state'], 'no_desired_state')
 
         status, tags = self.request(
             '/v1/admin/devices/CS-999/tags', 'POST',
@@ -206,30 +234,38 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         self.assertEqual(json.loads(command['payload_json'])['deployment_id'], 'dep-http')
         self.assertEqual(self.mod.DB.get_device('CS-999')['desired_commit'], target)
 
-        status, delivered = self.report(2)
+        status, pending = self.request('/v1/admin/devices/CS-999', token='admin-secret')
+        self.assertEqual(status, 200)
+        self.assertEqual(pending['device']['sync_state'], 'update_pending')
+        self.assertEqual(pending['device']['desired_version'], '0.6.0-dev')
+
+        status, delivered = self.report(2, current_commit=current)
         self.assertEqual([row['id'] for row in delivered['commands']], [cid])
         self.assertEqual(delivered['commands'][0]['payload']['target_commit'], target)
+        status, updating = self.request('/v1/admin/devices/CS-999', token='admin-secret')
+        self.assertEqual(updating['device']['sync_state'], 'updating')
+        self.assertEqual(updating['device']['latest_deployment']['execution_state'], 'delivered')
 
         accepted_at = time.time()
         self.report(3, [{
             'id': cid, 'action': 'lghs-update', 'state': 'accepted',
             'received_at': accepted_at - .1, 'accepted_at': accepted_at,
             'updated_at': accepted_at, 'stage': 'Accepted by executor', 'progress': 0,
-        }])
+        }], current_commit=current)
         run_at = time.time()
         self.report(4, [{
             'id': cid, 'action': 'lghs-update', 'state': 'running',
             'received_at': accepted_at - .1, 'accepted_at': accepted_at,
             'running_at': run_at, 'updated_at': run_at,
             'stage': 'Installing exact commit', 'progress': 50,
-        }])
+        }], current_commit=current)
         done_at = time.time()
         self.report(5, [{
             'id': cid, 'action': 'lghs-update', 'state': 'succeeded',
             'received_at': accepted_at - .1, 'accepted_at': accepted_at,
             'running_at': run_at, 'succeeded_at': done_at, 'updated_at': done_at,
             'stage': 'Complete', 'progress': 100,
-        }])
+        }], current_commit=current)
 
         status, detail = self.request('/v1/admin/deployments/dep-http', token='admin-secret')
         self.assertEqual(status, 200)
@@ -238,6 +274,17 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         self.assertEqual(detail['executions'][0]['previous_commit'], current)
         self.assertEqual(detail['executions'][0]['state'], 'succeeded')
         self.assertEqual(detail['executions'][0]['stage'], 'Complete')
+
+        status, verifying = self.request('/v1/admin/devices/CS-999', token='admin-secret')
+        self.assertEqual(verifying['device']['current_commit'], current)
+        self.assertEqual(verifying['device']['desired_commit'], target)
+        self.assertEqual(verifying['device']['sync_state'], 'verification_pending')
+
+        self.report(6, current_commit=target)
+        status, synced = self.request('/v1/admin/devices/CS-999', token='admin-secret')
+        self.assertEqual(synced['device']['current_commit'], target)
+        self.assertEqual(synced['device']['desired_commit'], target)
+        self.assertEqual(synced['device']['sync_state'], 'in_sync')
 
         with self.assertRaises(urllib.error.HTTPError) as moving:
             self.request(
