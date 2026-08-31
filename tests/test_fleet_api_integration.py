@@ -68,7 +68,7 @@ class FleetAPIIntegrationTests(unittest.TestCase):
     def report(self, sequence, command_states=None, sudo_requests=None):
         return self.request('/v1/report/CS-999', 'POST', {
             'protocol': 1,
-            'agent_version': '0.5.0',
+            'agent_version': '0.6.0-dev',
             'device_id': 'CS-999',
             'boot_id': 'boot-1',
             'sequence': sequence,
@@ -89,6 +89,7 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         self.assertEqual(health['database'], 'sqlite-wal')
         self.assertEqual(health['command_transport'], 'long-poll')
         self.assertEqual(health['fleet_operations'], 1)
+        self.assertTrue(health['exact_commit_deployments'])
 
         cid = self.mod.DB.create_command('CS-999', 'lghs-update', command_id='cmd-http')
         status, first = self.report(1)
@@ -198,14 +199,45 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.assertEqual(deployment['deployment_id'], 'dep-http')
-        self.assertFalse(deployment['dispatch_ready'])
+        self.assertTrue(deployment['dispatch_ready'])
+        cid = deployment['command_id']
+        command = self.mod.DB.get_command(cid)
+        self.assertEqual(json.loads(command['payload_json'])['target_commit'], target)
+        self.assertEqual(json.loads(command['payload_json'])['deployment_id'], 'dep-http')
         self.assertEqual(self.mod.DB.get_device('CS-999')['desired_commit'], target)
+
+        status, delivered = self.report(2)
+        self.assertEqual([row['id'] for row in delivered['commands']], [cid])
+        self.assertEqual(delivered['commands'][0]['payload']['target_commit'], target)
+
+        accepted_at = time.time()
+        self.report(3, [{
+            'id': cid, 'action': 'lghs-update', 'state': 'accepted',
+            'received_at': accepted_at - .1, 'accepted_at': accepted_at,
+            'updated_at': accepted_at, 'stage': 'Accepted by executor', 'progress': 0,
+        }])
+        run_at = time.time()
+        self.report(4, [{
+            'id': cid, 'action': 'lghs-update', 'state': 'running',
+            'received_at': accepted_at - .1, 'accepted_at': accepted_at,
+            'running_at': run_at, 'updated_at': run_at,
+            'stage': 'Installing exact commit', 'progress': 50,
+        }])
+        done_at = time.time()
+        self.report(5, [{
+            'id': cid, 'action': 'lghs-update', 'state': 'succeeded',
+            'received_at': accepted_at - .1, 'accepted_at': accepted_at,
+            'running_at': run_at, 'succeeded_at': done_at, 'updated_at': done_at,
+            'stage': 'Complete', 'progress': 100,
+        }])
 
         status, detail = self.request('/v1/admin/deployments/dep-http', token='admin-secret')
         self.assertEqual(status, 200)
         self.assertEqual(detail['deployment']['target_commit'], target)
+        self.assertEqual(detail['deployment']['state'], 'succeeded')
         self.assertEqual(detail['executions'][0]['previous_commit'], current)
-        self.assertEqual(detail['executions'][0]['state'], 'queued')
+        self.assertEqual(detail['executions'][0]['state'], 'succeeded')
+        self.assertEqual(detail['executions'][0]['stage'], 'Complete')
 
         with self.assertRaises(urllib.error.HTTPError) as moving:
             self.request(
