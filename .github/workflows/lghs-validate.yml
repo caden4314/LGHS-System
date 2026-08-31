@@ -165,6 +165,10 @@ jobs:
       - name: SQLite foundation invariants
         run: |
           grep -q 'journal_mode=WAL' controller/lghs/database.py
+          grep -q 'SCHEMA_VERSION = 3' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS device_tags' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS fleet_groups' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS group_members' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS commands' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS command_events' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS warnings' controller/lghs/database.py
@@ -174,6 +178,7 @@ jobs:
           grep -q 'PROTOCOL_VERSION = 1' controller/lghs/protocol.py
           grep -q 'evaluate_health' controller/lghs/database.py
           grep -q 'min_redelivery' controller/lghs/database.py
+          grep -q 'target_commit must be an exact 40-character Git commit SHA' controller/lghs/database.py
 
       - name: Canonical installer invariants
         run: |
@@ -206,8 +211,12 @@ jobs:
 
       - name: Release invariants
         run: |
-          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION
-          grep -q '^0\.5\.1$' VERSION
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION
+          else
+            grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-dev)?$' VERSION
+          fi
+          grep -Eq '^0\.6\.0(-dev)?$' VERSION
           grep -q 'controller/lghs-console-responsive.*lghs-console-responsive-core' install.sh
           grep -q 'controller/lghs-console-day2.*lghs-console' install.sh
           grep -q 'controller/lghs-fleet-command.*lghs-fleet-command' install.sh
