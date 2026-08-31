@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lghs.database import FleetDB
 from lghs.rollout import advance_rollout, dispatch_phase, freeze_deployment, rollout_status
+from lghs.rollout_manager import load_runtime
 
 DB = FleetDB(Path(os.environ.get('LGHS_FLEET_DB', '/var/lib/lghs/fleet.db')))
 
@@ -72,7 +73,9 @@ def main() -> int:
     create.add_argument('--failure-threshold-count', type=int, default=2)
     create.add_argument('--failure-threshold-percent', type=float, default=10.0)
     create.add_argument('--require-health', choices=['healthy', 'warning'], default='healthy')
-    create.add_argument('--dispatch', action='store_true', help='dispatch the first phase immediately')
+    mode = create.add_mutually_exclusive_group()
+    mode.add_argument('--dispatch', action='store_true', help='dispatch the first phase immediately and advance manually')
+    mode.add_argument('--auto', action='store_true', help='let lghs-rollout-manager dispatch, soak, and advance phases automatically')
 
     status = sub.add_parser('status', help='show frozen membership and phase gates')
     status.add_argument('deployment_id')
@@ -96,14 +99,18 @@ def main() -> int:
             selector=selector_from_args(args),
             created_by=args.created_by,
             strategy=strategy_from_args(args),
+            policy={'auto_advance': bool(args.auto)},
         )
+        result['auto_advance'] = bool(args.auto)
         if args.dispatch:
             first_phase = min(result['phases'])
             result['command_ids'] = dispatch_phase(DB, result['deployment_id'], first_phase)
         print_json(result)
         return 0
     if args.command == 'status':
-        print_json(rollout_status(DB, args.deployment_id))
+        result = rollout_status(DB, args.deployment_id)
+        result['runtime'] = load_runtime(DB, args.deployment_id)
+        print_json(result)
         return 0
     if args.command == 'dispatch':
         print_json({'deployment_id': args.deployment_id, 'phase': args.phase, 'command_ids': dispatch_phase(DB, args.deployment_id, args.phase)})
