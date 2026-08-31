@@ -21,6 +21,7 @@ BT_INDEX = os.environ.get("LGHS_BT_INDEX", "hci0")
 DISCOVERY_TIMEOUT = float(os.environ.get("LGHS_BT_DISCOVERY_TIMEOUT", "12"))
 RETRY_BACKOFF = float(os.environ.get("LGHS_BT_RETRY_BACKOFF", "5"))
 COMMAND_TIMEOUT = 6
+SOCKET_TIMEOUT = 180
 ALIAS_PREFIX = "LGHS-PROVISION-"
 ENABLED = Path("/etc/lghs/bluetooth-bootstrap-enabled")
 STATE_DIR = Path("/var/lib/lghs/bootstrap")
@@ -247,7 +248,7 @@ def exchange(address, dry_run=False):
     did = device_id()
     sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
     set_app_authenticated_security(sock)
-    sock.settimeout(30)
+    sock.settimeout(SOCKET_TIMEOUT)
     try:
         sock.connect((address, CHANNEL))
         hello = recv_frame(sock)
