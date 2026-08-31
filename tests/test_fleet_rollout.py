@@ -6,7 +6,6 @@ from pathlib import Path
 
 from controller.lghs.database import FleetDB
 from controller.lghs.rollout import (
-    StrategyError,
     TargetError,
     advance_rollout,
     dispatch_phase,
@@ -14,7 +13,6 @@ from controller.lghs.rollout import (
     phase_gate,
     plan_phases,
     resolve_targets,
-    rollout_status,
 )
 
 
@@ -94,9 +92,9 @@ class FleetRolloutTests(unittest.TestCase):
         )
         self.assertEqual(normalized['type'], 'phased')
         self.assertEqual(phases[0], ['CS-003'])
-        self.assertEqual(len(phases[1]), 1)  # 40% cumulative => 2/5 total after canary.
-        self.assertEqual(len(phases[2]), 1)  # 60% cumulative => 3/5 total.
-        self.assertEqual(len(phases[3]), 2)  # Remaining to 100%.
+        self.assertEqual(len(phases[1]), 1)
+        self.assertEqual(len(phases[2]), 1)
+        self.assertEqual(len(phases[3]), 2)
         flattened = [device for phase in sorted(phases) for device in phases[phase]]
         self.assertEqual(sorted(flattened), ['CS-001', 'CS-002', 'CS-003', 'CS-004', 'CS-005'])
 
@@ -192,16 +190,15 @@ class FleetRolloutTests(unittest.TestCase):
             strategy={'type': 'phased', 'canary_count': 1, 'wave_percentages': [100], 'failure_threshold_count': 2, 'failure_threshold_percent': 10},
         )
         self.assertEqual(len(result['target']['resolved_devices']), len(devices))
-        # The threshold math itself is covered by a later-wave synthetic state.
         phase = max(result['phases'])
         dispatch_phase(self.store, 'dep-threshold', phase)
         rows = [row for row in self.store.list_deployment_executions('dep-threshold') if row['phase'] == phase]
         self.assertGreaterEqual(len(rows), 20)
         failed = rows[0]
         with self.store.transaction() as db:
-            db.execute("UPDATE deployment_executions SET state='failed',command_id='synthetic-failure' WHERE deployment_id=? AND device_id=?", ('dep-threshold', failed['device_id']))
+            db.execute("UPDATE deployment_executions SET state='failed' WHERE deployment_id=? AND device_id=?", ('dep-threshold', failed['device_id']))
             for row in rows[1:]:
-                db.execute("UPDATE deployment_executions SET state='succeeded',command_id=COALESCE(command_id,'synthetic-success') WHERE deployment_id=? AND device_id=?", ('dep-threshold', row['device_id']))
+                db.execute("UPDATE deployment_executions SET state='succeeded' WHERE deployment_id=? AND device_id=?", ('dep-threshold', row['device_id']))
         for row in rows[1:]:
             self.store.update_device_inventory(row['device_id'], current_commit=self.target, health_state='healthy')
         self.assertEqual(phase_gate(self.store, 'dep-threshold', phase)['state'], 'ready')
