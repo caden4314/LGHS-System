@@ -27,6 +27,7 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0644 "$ROOT/controller/lghs/database.py" /usr/local/lib/lghs-python/lghs/database.py
   install -m 0644 "$ROOT/controller/lghs/audit.py" /usr/local/lib/lghs-python/lghs/audit.py
   install -m 0644 "$ROOT/controller/lghs/sudo_state.py" /usr/local/lib/lghs-python/lghs/sudo_state.py
+  install -m 0644 "$ROOT/controller/lghs/health.py" /usr/local/lib/lghs-python/lghs/health.py
   install -m 0644 "$ROOT/controller/lghs/rollout.py" /usr/local/lib/lghs-python/lghs/rollout.py
   install -m 0644 "$ROOT/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
   install -m 0644 "$ROOT/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
@@ -34,7 +35,8 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0755 "$ROOT/controller/lghs-console-tunnel" /usr/local/libexec/lghs-console-base
   install -m 0755 "$ROOT/controller/lghs-console-responsive" /usr/local/libexec/lghs-console-responsive-core
   install -m 0755 "$ROOT/controller/lghs-console-day2" /usr/local/libexec/lghs-console-day2-core
-  install -m 0755 "$ROOT/controller/lghs-console-day3" /usr/local/sbin/lghs-console
+  install -m 0755 "$ROOT/controller/lghs-console-day3" /usr/local/libexec/lghs-console-day3-core
+  install -m 0755 "$ROOT/controller/lghs-console-day4" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
@@ -56,7 +58,7 @@ if [[ "$ROLE" == controller ]]; then
   systemctl restart lghs-bt-provision.service
   systemctl try-restart lghs-fleet-api.service || true
   systemctl try-restart lghs-rollout-manager.service || true
-  echo 'LGHS 0.6 controller SQLite/HTTPS + Fleet Control + rollout + maintenance + Bluetooth bootstrap foundation installed.'
+  echo 'LGHS 0.6 controller SQLite/HTTPS + Fleet Control + structured health + rollout + maintenance + Bluetooth bootstrap foundation installed.'
   exit 0
 fi
 
@@ -104,4 +106,4 @@ sleep 1
 systemctl is-active --quiet lghs-command-executor.service
 systemctl is-active --quiet lghs-agent.service
 systemctl is-active --quiet lghs-discovery-advertise.service
-echo 'LGHS 0.6 unprivileged student agent + typed reboot + Bluetooth bootstrap foundation installed.'
+echo 'LGHS 0.6 unprivileged student agent + structured health v2 + typed reboot + Bluetooth bootstrap foundation installed.'
