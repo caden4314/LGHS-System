@@ -21,8 +21,9 @@ install -m 0644 "$ROOT/systemd/lghs-bt-prepare.service" /etc/systemd/system/lghs
 # The compatibility bridge must upgrade the actual queue/updater transport too;
 # otherwise enrolled 0.5.1 devices keep the pre-bridge parser and silently lose
 # exact target commits and controller command idempotency keys.
-install -m 0755 "$ROOT/updater/lghs-netqueue" /usr/local/sbin/lghs-netqueue
-install -m 0755 "$ROOT/updater/lghs-update" /usr/local/sbin/lghs-update
+getent group lghs-admin >/dev/null 2>&1 || groupadd --system lghs-admin
+install -o root -g lghs-admin -m 0750 "$ROOT/updater/lghs-netqueue" /usr/local/sbin/lghs-netqueue
+install -o root -g lghs-admin -m 0750 "$ROOT/updater/lghs-update" /usr/local/sbin/lghs-update
 [[ -f "$ROOT/systemd/lghs-netqueue.service" ]] && install -m 0644 "$ROOT/systemd/lghs-netqueue.service" /etc/systemd/system/lghs-netqueue.service
 [[ -f "$ROOT/systemd/lghs-netqueue.timer" ]] && install -m 0644 "$ROOT/systemd/lghs-netqueue.timer" /etc/systemd/system/lghs-netqueue.timer
 systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
@@ -110,4 +111,8 @@ systemctl is-active --quiet lghs-agent.service
 systemctl is-active --quiet lghs-discovery-advertise.service
 systemctl is-active --quiet lghs-netqueue.timer
 [[ "$(stat -c %a /usr/local/sbin/lghs-agent)" == "755" ]]
+[[ "$(stat -c %a /usr/local/sbin/lghs-update)" == "750" ]]
+[[ "$(stat -c %G /usr/local/sbin/lghs-update)" == "lghs-admin" ]]
+[[ "$(stat -c %a /usr/local/sbin/lghs-netqueue)" == "750" ]]
+[[ "$(stat -c %G /usr/local/sbin/lghs-netqueue)" == "lghs-admin" ]]
 echo 'LGHS 0.5 unprivileged student agent + Bluetooth bootstrap foundation installed.'
