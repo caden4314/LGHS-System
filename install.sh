@@ -73,6 +73,7 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0644 "$ROOT_DIR/controller/lghs/audit.py" /usr/local/lib/lghs-python/lghs/audit.py
   install -m 0644 "$ROOT_DIR/controller/lghs/rollout.py" /usr/local/lib/lghs-python/lghs/rollout.py
   install -m 0644 "$ROOT_DIR/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/libexec/lghsctl-real
   install -m 0755 "$ROOT_DIR/controller/lghsctl-wrapper" /usr/local/sbin/lghsctl
   install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-legacy
