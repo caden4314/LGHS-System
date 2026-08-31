@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import grp
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from typing import Any
 SOCK = Path('/run/lghs-command-executor/socket')
 NETQUEUE = '/usr/local/sbin/lghs-netqueue'
 SEEN = Path('/var/lib/lghs/executor-seen.json')
+REBOOT_PENDING = Path('/var/lib/lghs/reboot-pending.json')
 SUDO_DIR = Path('/var/lib/lghs/sudo-requests')
 COMMIT_RE = re.compile(r'^[0-9a-fA-F]{40}$')
 ACTIONS = {
@@ -58,12 +60,35 @@ def read_text(path: Path) -> str:
         return ''
 
 
-def save_seen(value: dict[str, float]) -> None:
-    SEEN.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SEEN.with_suffix('.tmp')
+def atomic_json(path: Path, value: Any, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(value, separators=(',', ':')) + '\n', encoding='utf-8')
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, SEEN)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def save_seen(value: dict[str, float]) -> None:
+    atomic_json(SEEN, value)
+
+
+def current_boot_id() -> str:
+    return read_text(Path('/proc/sys/kernel/random/boot_id')) or 'unknown'
+
+
+def reboot_status() -> dict[str, Any]:
+    pending = load_json(REBOOT_PENDING, {})
+    if not isinstance(pending, dict) or not pending:
+        return {}
+    before = str(pending.get('boot_id_before') or '')
+    current = current_boot_id()
+    if before and current not in {'', 'unknown'} and current != before:
+        try:
+            REBOOT_PENDING.unlink()
+        except FileNotFoundError:
+            pass
+        return {}
+    return pending
 
 
 def normalize_target_commit(value: Any) -> str:
@@ -73,13 +98,24 @@ def normalize_target_commit(value: Any) -> str:
     return commit
 
 
-def action_command(action: str, payload: Any) -> list[str]:
-    if action not in ACTIONS:
-        raise ValueError('unsupported-action')
+def action_command(action: str, payload: Any, command_id: str = '') -> list[str]:
     if payload is None:
         payload = {}
     if not isinstance(payload, dict):
         raise ValueError('invalid-payload')
+    if action == 'reboot':
+        schedule_id = str(payload.get('schedule_id') or '').strip()
+        reason = str(payload.get('reason') or '')
+        if not schedule_id or len(schedule_id) > 96:
+            raise ValueError('invalid-reboot-schedule-id')
+        if len(reason) > 500:
+            raise ValueError('invalid-reboot-reason')
+        unit = 'lghs-reboot-' + hashlib.sha256(str(command_id).encode()).hexdigest()[:16]
+        systemd_run = shutil.which('systemd-run') or '/usr/bin/systemd-run'
+        systemctl = shutil.which('systemctl') or '/usr/bin/systemctl'
+        return [systemd_run, '--quiet', '--unit=' + unit, '--on-active=5s', systemctl, 'reboot']
+    if action not in ACTIONS:
+        raise ValueError('unsupported-action')
     if action == 'lghs-update' and payload.get('target_commit'):
         return [NETQUEUE, 'enqueue', 'local-update', '--commit', normalize_target_commit(payload['target_commit'])]
     return list(ACTIONS[action])
@@ -138,6 +174,9 @@ def pi_health() -> dict[str, Any]:
         'reboot_required': Path('/run/reboot-required').exists(),
         'inventory': pi_inventory(),
     }
+    pending = reboot_status()
+    if pending:
+        out['scheduled_reboot'] = pending
     if shutil.which('vcgencmd'):
         try:
             proc = subprocess.run(['vcgencmd', 'get_throttled'], text=True, capture_output=True, timeout=3)
@@ -246,11 +285,12 @@ def handle(client: socket.socket) -> None:
 
     command_id = str(req.get('id') or '')
     action = str(req.get('action') or '')
+    payload = req.get('payload') or {}
     if not command_id or len(command_id) > 128:
         reply(client, {'ok': False, 'error': 'invalid-command-id'})
         return
     try:
-        command = action_command(action, req.get('payload') or {})
+        command = action_command(action, payload, command_id)
     except ValueError as exc:
         reply(client, {'ok': False, 'error': str(exc)})
         return
@@ -269,12 +309,22 @@ def handle(client: socket.socket) -> None:
         return
 
     accepted = time.time()
+    if action == 'reboot':
+        atomic_json(REBOOT_PENDING, {
+            'command_id': command_id,
+            'schedule_id': str(payload.get('schedule_id') or ''),
+            'reason': str(payload.get('reason') or '')[:500],
+            'boot_id_before': current_boot_id(),
+            'accepted_at': accepted,
+            'reboot_after_seconds': 5,
+        })
     seen[command_id] = accepted
     if len(seen) > 512:
         for key, _ in sorted(seen.items(), key=lambda item: item[1])[:-256]:
             seen.pop(key, None)
     save_seen(seen)
-    reply(client, {'ok': True, 'message': 'Queued locally', 'accepted_at': accepted})
+    message = 'Reboot armed locally' if action == 'reboot' else 'Queued locally'
+    reply(client, {'ok': True, 'message': message, 'accepted_at': accepted})
 
 
 def main() -> None:
