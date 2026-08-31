@@ -71,6 +71,8 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0644 "$ROOT_DIR/controller/lghs/protocol.py" /usr/local/lib/lghs-python/lghs/protocol.py
   install -m 0644 "$ROOT_DIR/controller/lghs/database.py" /usr/local/lib/lghs-python/lghs/database.py
   install -m 0644 "$ROOT_DIR/controller/lghs/audit.py" /usr/local/lib/lghs-python/lghs/audit.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/sudo_state.py" /usr/local/lib/lghs-python/lghs/sudo_state.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/health.py" /usr/local/lib/lghs-python/lghs/health.py
   install -m 0644 "$ROOT_DIR/controller/lghs/rollout.py" /usr/local/lib/lghs-python/lghs/rollout.py
   install -m 0644 "$ROOT_DIR/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
   install -m 0644 "$ROOT_DIR/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
@@ -81,7 +83,8 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghs-console-tunnel" /usr/local/libexec/lghs-console-base
   install -m 0755 "$ROOT_DIR/controller/lghs-console-responsive" /usr/local/libexec/lghs-console-responsive-core
   install -m 0755 "$ROOT_DIR/controller/lghs-console-day2" /usr/local/libexec/lghs-console-day2-core
-  install -m 0755 "$ROOT_DIR/controller/lghs-console-day3" /usr/local/sbin/lghs-console
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day3" /usr/local/libexec/lghs-console-day3-core
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day4" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-notify" /usr/local/sbin/lghs-fleet-notify
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
