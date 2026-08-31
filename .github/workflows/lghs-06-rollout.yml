@@ -37,6 +37,7 @@ jobs:
             tests/test_fleet_api_recovery.py \
             tests/test_fleet_api_maintenance.py \
             tests/test_fleet_api_structured_health.py \
+            tests/test_hardware_upgrade_regressions.py \
             tests/test_maintenance.py \
             tests/test_reboot_cancel_semantics.py \
             tests/test_structured_health_gate.py \
@@ -52,6 +53,7 @@ jobs:
             tests/test_fleet_api_recovery.py \
             tests/test_fleet_api_maintenance.py \
             tests/test_fleet_api_structured_health.py \
+            tests/test_hardware_upgrade_regressions.py \
             tests/test_maintenance.py \
             tests/test_reboot_cancel_semantics.py \
             tests/test_structured_health_gate.py \
@@ -80,6 +82,7 @@ jobs:
           grep -Fq "controller command ID is the local side-effect idempotency key" student/lghs-command-executor
           grep -Fq "Reboot already armed locally" student/lghs-command-executor
           grep -Fq "different exact target commits" controller/lghs-fleet-command
+          grep -Fq "Deployment success is reserved for advance_rollout()" controller/lghs-fleet-api
           grep -Fq "health_version': 2" student/lghs-agent
           grep -Fq "failed_systemd_units" student/lghs-agent
           grep -Fq "root_readonly" student/lghs-agent
