@@ -18,6 +18,13 @@ install -d -m 0755 /usr/local/lib/lghs-bt
 install -m 0644 "$ROOT/bluetooth/lghs_bt_protocol.py" /usr/local/lib/lghs-bt/lghs_bt_protocol.py
 install -m 0755 "$ROOT/bluetooth/lghs-bt-prepare" /usr/local/sbin/lghs-bt-prepare
 install -m 0644 "$ROOT/systemd/lghs-bt-prepare.service" /etc/systemd/system/lghs-bt-prepare.service
+# The compatibility bridge must upgrade the actual queue/updater transport too;
+# otherwise enrolled 0.5.1 devices keep the pre-bridge parser and silently lose
+# exact target commits and controller command idempotency keys.
+install -m 0755 "$ROOT/updater/lghs-netqueue" /usr/local/sbin/lghs-netqueue
+install -m 0755 "$ROOT/updater/lghs-update" /usr/local/sbin/lghs-update
+[[ -f "$ROOT/systemd/lghs-netqueue.service" ]] && install -m 0644 "$ROOT/systemd/lghs-netqueue.service" /etc/systemd/system/lghs-netqueue.service
+[[ -f "$ROOT/systemd/lghs-netqueue.timer" ]] && install -m 0644 "$ROOT/systemd/lghs-netqueue.timer" /etc/systemd/system/lghs-netqueue.timer
 systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
 
 if [[ "$ROLE" == controller ]]; then
@@ -37,6 +44,7 @@ if [[ "$ROLE" == controller ]]; then
   chmod 0640 /var/lib/lghs/db-migration-last.json
   systemctl daemon-reload
   systemctl enable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
+  systemctl enable --now lghs-netqueue.timer >/dev/null 2>&1 || true
   systemctl enable lghs-bt-prepare.service lghs-bt-provision.service
   systemctl reset-failed lghs-bt-prepare.service lghs-bt-provision.service >/dev/null 2>&1 || true
   systemctl restart lghs-bt-prepare.service
@@ -54,6 +62,10 @@ install -d -o lghs-agent -g lghs-agent -m 0700 /var/lib/lghs-agent
 install -d -o root -g root -m 0700 /var/lib/lghs/bootstrap
 install -m 0755 "$ROOT/student/lghs-agent" /usr/local/sbin/lghs-agent
 python3 "$ROOT/updater/patch-agent-status-guard.py" /usr/local/sbin/lghs-agent
+# Reassert executable ownership/mode after source patching. The service runs as
+# the unprivileged lghs-agent account and must be able to read/execute this file.
+chown root:root /usr/local/sbin/lghs-agent
+chmod 0755 /usr/local/sbin/lghs-agent
 install -m 0750 "$ROOT/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
 python3 "$ROOT/updater/patch-executor-netqueue-cli.py" /usr/local/sbin/lghs-command-executor
 install -m 0755 "$ROOT/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
@@ -81,6 +93,7 @@ fi
 
 systemctl daemon-reload
 systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
+systemctl enable --now lghs-netqueue.timer >/dev/null 2>&1 || true
 systemctl enable --now lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service
 # Binaries may have just been replaced while these units were already active.
 # Restart them so the running processes execute the newly installed code.
@@ -95,4 +108,6 @@ sleep 1
 systemctl is-active --quiet lghs-command-executor.service
 systemctl is-active --quiet lghs-agent.service
 systemctl is-active --quiet lghs-discovery-advertise.service
+systemctl is-active --quiet lghs-netqueue.timer
+[[ "$(stat -c %a /usr/local/sbin/lghs-agent)" == "755" ]]
 echo 'LGHS 0.5 unprivileged student agent + Bluetooth bootstrap foundation installed.'
