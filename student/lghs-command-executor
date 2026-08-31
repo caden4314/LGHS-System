@@ -116,9 +116,13 @@ def action_command(action: str, payload: Any, command_id: str = '') -> list[str]
         return [systemd_run, '--quiet', '--unit=' + unit, '--on-active=5s', systemctl, 'reboot']
     if action not in ACTIONS:
         raise ValueError('unsupported-action')
+    command = list(ACTIONS[action])
     if action == 'lghs-update' and payload.get('target_commit'):
-        return [NETQUEUE, 'enqueue', 'local-update', '--commit', normalize_target_commit(payload['target_commit'])]
-    return list(ACTIONS[action])
+        command += ['--commit', normalize_target_commit(payload['target_commit'])]
+    if command_id:
+        # The controller command ID is the local side-effect idempotency key.
+        command += ['--idempotency-key', command_id]
+    return command
 
 
 def service_states() -> dict[str, str]:
@@ -299,6 +303,19 @@ def handle(client: socket.socket) -> None:
     if command_id in seen:
         reply(client, {'ok': True, 'message': 'Command already accepted locally', 'accepted_at': seen[command_id]})
         return
+
+    # A reboot may have been armed successfully immediately before the executor
+    # crashed or the reply was lost. The persisted marker is authoritative for
+    # the same command ID and prevents scheduling a second reboot transaction.
+    if action == 'reboot':
+        pending = load_json(REBOOT_PENDING, {})
+        if isinstance(pending, dict) and str(pending.get('command_id') or '') == command_id:
+            accepted_at = float(pending.get('accepted_at') or time.time())
+            seen[command_id] = accepted_at
+            save_seen(seen)
+            reply(client, {'ok': True, 'message': 'Reboot already armed locally', 'accepted_at': accepted_at})
+            return
+
     try:
         proc = subprocess.run(command, text=True, capture_output=True, timeout=20)
     except Exception as exc:
