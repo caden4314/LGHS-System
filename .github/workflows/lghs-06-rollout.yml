@@ -18,6 +18,7 @@ jobs:
             controller/lghs/recovery.py \
             controller/lghs-fleet-rollout \
             controller/lghs-rollout-manager \
+            controller/lghs-console-day2 \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
@@ -31,7 +32,7 @@ jobs:
             tests/test_deployment_recovery.py \
             tests/test_fleet_api_recovery.py
 
-      - name: Security invariants
+      - name: Security and Fleet Control invariants
         run: |
           grep -q "target selector matched no enrolled devices" controller/lghs/rollout.py
           grep -q "resolved_devices" controller/lghs/rollout.py
@@ -43,6 +44,14 @@ jobs:
           grep -q "retry-failed" controller/lghs/recovery.py
           grep -q "current-commit-does-not-match-deployment-target" controller/lghs/recovery.py
           grep -q "deployment_recovery_controls" controller/lghs-fleet-api
+          grep -q "Deployments / Updates" controller/lghs-console-day2
+          grep -q "L Rollback" controller/lghs-console-day2
+          grep -q 'ord("l"), ord("L")' controller/lghs-console-day2
+          if grep -q "B Rollback" controller/lghs-console-day2; then
+            echo 'Fleet Control rollback hotkey conflicts with the global Back key.' >&2
+            exit 1
+          fi
+          grep -q "Rollback is planned only; it is never auto-dispatched from Fleet Control" controller/lghs-console-day2
           grep -q "ReadWritePaths=/var/lib/lghs /run/lock" systemd/lghs-rollout-manager.service
           grep -q 'controller/lghs/recovery.py' install.sh
           grep -q 'controller/lghs/recovery.py' updater/lghs-0.5-install
