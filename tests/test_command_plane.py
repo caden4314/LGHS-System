@@ -103,6 +103,16 @@ class CommandPlaneTests(unittest.TestCase):
         self.assertIn('enqueue local-update --commit "$REQUESTED_TARGET_COMMIT"', updater)
         self.assertIn('git cat-file -e "${REQUESTED_TARGET_COMMIT}^{commit}"', updater)
 
+    def test_executor_inventory_is_safe_on_non_pi_hosts(self):
+        executor = load_script('test_command_executor_inventory', 'student/lghs-command-executor')
+        inventory = executor.pi_inventory()
+        self.assertTrue(inventory['hostname'])
+        self.assertIsInstance(inventory.get('ram_mb'), int)
+        if inventory.get('current_commit'):
+            self.assertRegex(inventory['current_commit'], r'^[0-9a-f]{40}$')
+        health = executor.pi_health()
+        self.assertEqual(health['inventory']['hostname'], inventory['hostname'])
+
     def test_student_retries_received_command_after_restart_gap(self):
         mod = load_script('test_telemetry_retry', 'student/lghs-telemetry-push')
         with tempfile.TemporaryDirectory() as td:
