@@ -14,11 +14,17 @@ jobs:
         run: |
           python3 -m py_compile \
             controller/lghs/rollout.py \
+            controller/lghs/rollout_manager.py \
             controller/lghs-fleet-rollout \
-            tests/test_fleet_rollout.py
+            controller/lghs-rollout-manager \
+            tests/test_fleet_rollout.py \
+            tests/test_rollout_manager.py
 
       - name: Frozen target and phase tests
-        run: python3 -m unittest -v tests/test_fleet_rollout.py
+        run: |
+          python3 -m unittest -v \
+            tests/test_fleet_rollout.py \
+            tests/test_rollout_manager.py
 
       - name: Security invariants
         run: |
@@ -27,7 +33,10 @@ jobs:
           grep -q "canary failure" controller/lghs/rollout.py
           grep -q "failure threshold exceeded" controller/lghs/rollout.py
           grep -q "target_commit" controller/lghs/rollout.py
-          if grep -nE 'shell=True|eval\(' controller/lghs/rollout.py controller/lghs-fleet-rollout; then
+          grep -q "rollout-runtime:" controller/lghs/rollout_manager.py
+          grep -q "auto_advance" controller/lghs/rollout_manager.py
+          grep -q "ReadWritePaths=/var/lib/lghs /run/lock" systemd/lghs-rollout-manager.service
+          if grep -nE 'shell=True|eval\(' controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs-fleet-rollout controller/lghs-rollout-manager; then
             echo 'Rollout controller contains an arbitrary shell path.' >&2
             exit 1
           fi
