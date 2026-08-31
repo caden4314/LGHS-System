@@ -30,11 +30,13 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0644 "$ROOT/controller/lghs/rollout.py" /usr/local/lib/lghs-python/lghs/rollout.py
   install -m 0644 "$ROOT/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
   install -m 0644 "$ROOT/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
+  install -m 0644 "$ROOT/controller/lghs/maintenance.py" /usr/local/lib/lghs-python/lghs/maintenance.py
   install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
   install -m 0755 "$ROOT/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
   install -m 0755 "$ROOT/controller/lghs-fleet-rollout" /usr/local/sbin/lghs-fleet-rollout
+  install -m 0755 "$ROOT/controller/lghs-fleet-maintenance" /usr/local/sbin/lghs-fleet-maintenance
   install -m 0755 "$ROOT/controller/lghs-rollout-manager" /usr/local/sbin/lghs-rollout-manager
   install -m 0644 "$ROOT/systemd/lghs-rollout-manager.service" /etc/systemd/system/lghs-rollout-manager.service
   install -m 0750 "$ROOT/controller/lghs-bt-provision" /usr/local/sbin/lghs-bt-provision
@@ -50,7 +52,7 @@ if [[ "$ROLE" == controller ]]; then
   systemctl restart lghs-bt-provision.service
   systemctl try-restart lghs-fleet-api.service || true
   systemctl try-restart lghs-rollout-manager.service || true
-  echo 'LGHS 0.6 controller SQLite/HTTPS + fleet rollout + Bluetooth bootstrap foundation installed.'
+  echo 'LGHS 0.6 controller SQLite/HTTPS + fleet rollout + maintenance + Bluetooth bootstrap foundation installed.'
   exit 0
 fi
 
@@ -98,4 +100,4 @@ sleep 1
 systemctl is-active --quiet lghs-command-executor.service
 systemctl is-active --quiet lghs-agent.service
 systemctl is-active --quiet lghs-discovery-advertise.service
-echo 'LGHS 0.6 unprivileged student agent + Bluetooth bootstrap foundation installed.'
+echo 'LGHS 0.6 unprivileged student agent + typed reboot + Bluetooth bootstrap foundation installed.'
