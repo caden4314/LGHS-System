@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from controller.lghs.database import FleetDB
 
@@ -69,6 +70,38 @@ class CommandPlaneTests(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row['state'], 'timed_out')
             self.assertIsNotNone(row['completed_at'])
+
+    def test_exact_commit_payload_is_typed_through_executor_and_queue(self):
+        target = 'a' * 40
+        executor = load_script('test_command_executor_pinned', 'student/lghs-command-executor')
+        self.assertEqual(
+            executor.action_command('lghs-update', {'target_commit': target}),
+            [executor.NETQUEUE, 'enqueue', 'local-update', '--commit', target],
+        )
+        with self.assertRaises(ValueError):
+            executor.action_command('lghs-update', {'target_commit': 'release-0.6.0-fleet-operations'})
+
+        queue = load_script('test_netqueue_pinned', 'updater/lghs-netqueue')
+        job = {'kind': 'local-update', 'params': {'target_commit': target}}
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured['cmd'] = cmd
+            captured['env'] = kwargs.get('env', {})
+            return subprocess.CompletedProcess(cmd, 0, 'ok', '')
+
+        with mock.patch.object(queue.subprocess, 'run', side_effect=fake_run):
+            rc, _ = queue.run_job(job)
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured['cmd'], ['/usr/local/sbin/lghs-update'])
+        self.assertEqual(captured['env']['LGHS_TARGET_COMMIT'], target)
+        with self.assertRaises(ValueError):
+            queue.command_for({'kind': 'local-update', 'params': {'target_commit': 'main'}})
+
+        updater = (ROOT / 'updater' / 'lghs-update').read_text(encoding='utf-8')
+        self.assertIn('LGHS_TARGET_COMMIT must be an exact 40-character Git SHA', updater)
+        self.assertIn('enqueue local-update --commit "$REQUESTED_TARGET_COMMIT"', updater)
+        self.assertIn('git cat-file -e "${REQUESTED_TARGET_COMMIT}^{commit}"', updater)
 
     def test_student_retries_received_command_after_restart_gap(self):
         mod = load_script('test_telemetry_retry', 'student/lghs-telemetry-push')
