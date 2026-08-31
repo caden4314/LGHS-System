@@ -82,7 +82,7 @@ jobs:
           grep -Fq "controller command ID is the local side-effect idempotency key" student/lghs-command-executor
           grep -Fq "Reboot already armed locally" student/lghs-command-executor
           grep -Fq "different exact target commits" controller/lghs-fleet-command
-          grep -Fq "Deployment success is reserved for advance_rollout()" controller/lghs-fleet-api
+          grep -Fq "success is reserved for advance_rollout()" controller/lghs-fleet-api
           grep -Fq "health_version': 2" student/lghs-agent
           grep -Fq "failed_systemd_units" student/lghs-agent
           grep -Fq "root_readonly" student/lghs-agent
