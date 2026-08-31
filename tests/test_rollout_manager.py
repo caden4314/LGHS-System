@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from controller.lghs.database import FleetDB
+from controller.lghs.maintenance import set_device_policy
 from controller.lghs.rollout import freeze_deployment
 from controller.lghs.rollout_manager import load_runtime, reconcile_deployment
+
+
+def epoch(text):
+    return datetime.fromisoformat(text).replace(tzinfo=ZoneInfo('UTC')).timestamp()
 
 
 class RolloutManagerTests(unittest.TestCase):
@@ -141,6 +148,29 @@ class RolloutManagerTests(unittest.TestCase):
         self.assertEqual(result['action'], 'manual')
         execution = self.store.list_deployment_executions('dep-manual')[0]
         self.assertIsNone(execution['command_id'])
+
+    def test_auto_rollout_waits_for_maintenance_window(self):
+        set_device_policy(self.store, 'CS-001', {
+            'timezone': 'UTC',
+            'windows': [{'days': ['tue'], 'start': '05:00', 'end': '06:00'}],
+        }, now=500)
+        freeze_deployment(
+            self.store,
+            deployment_id='dep-maint',
+            name='Maintenance gated rollout',
+            target_commit=self.target,
+            selector={'device_id': 'CS-001'},
+            policy={'auto_advance': True, 'respect_maintenance': True},
+            strategy={'type': 'all-at-once'},
+            now=500,
+        )
+        waiting = reconcile_deployment(self.store, 'dep-maint', now=epoch('2026-09-01T04:59:00'))
+        self.assertEqual(waiting['action'], 'maintenance-wait')
+        self.assertEqual(waiting['blocked_devices'], ['CS-001'])
+        self.assertIsNone(self.store.list_deployment_executions('dep-maint')[0]['command_id'])
+        dispatched = reconcile_deployment(self.store, 'dep-maint', now=epoch('2026-09-01T05:00:00'))
+        self.assertEqual(dispatched['action'], 'dispatched')
+        self.assertIsNotNone(self.store.list_deployment_executions('dep-maint')[0]['command_id'])
 
 
 if __name__ == '__main__':
