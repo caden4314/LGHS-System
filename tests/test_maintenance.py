@@ -102,6 +102,7 @@ class MaintenanceTests(unittest.TestCase):
         dispatched = reconcile_reboot_schedule(self.db, 'reboot-test', now=1100)
         action = dispatched['actions'][0]
         self.assertEqual(action['action'], 'dispatched')
+        self.assertEqual(action['boot_id_before'], 'boot-a')
         cid = action['command_id']
         self.assertEqual(self.db.get_command(cid)['action'], 'reboot')
         self.db.transition_command(cid, 'accepted', now=1101)
@@ -113,6 +114,31 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(stored['state'], 'succeeded')
         self.assertEqual(stored['executions']['CS-001']['boot_id_after'], 'boot-b')
         self.assertEqual(self.db.get_command(cid)['state'], 'succeeded')
+
+    def test_natural_reboot_before_dispatch_does_not_verify_scheduled_reboot(self):
+        create_reboot_schedule(
+            self.db,
+            selector={'device_id': 'CS-001'},
+            mode='at',
+            scheduled_at=1100,
+            schedule_id='reboot-baseline',
+            now=1000,
+        )
+        self.db.upsert_device('CS-001', boot_id='boot-b', last_seen=1090)
+        dispatched = reconcile_reboot_schedule(self.db, 'reboot-baseline', now=1100)
+        self.assertEqual(dispatched['actions'][0]['action'], 'dispatched')
+        self.assertEqual(dispatched['actions'][0]['boot_id_before'], 'boot-b')
+        stored = get_reboot_schedule(self.db, 'reboot-baseline')
+        self.assertEqual(stored['state'], 'running')
+        self.assertEqual(stored['executions']['CS-001']['boot_id_before'], 'boot-b')
+        self.assertNotEqual(stored['executions']['CS-001']['state'], 'succeeded')
+
+        unchanged = reconcile_reboot_schedule(self.db, 'reboot-baseline', now=1101)
+        self.assertEqual(unchanged['actions'], [])
+        self.db.upsert_device('CS-001', boot_id='boot-c', last_seen=1110)
+        verified = reconcile_reboot_schedule(self.db, 'reboot-baseline', now=1110)
+        self.assertEqual(verified['actions'][0]['action'], 'verified')
+        self.assertEqual(get_reboot_schedule(self.db, 'reboot-baseline')['state'], 'succeeded')
 
     def test_cancel_before_local_acceptance(self):
         create_reboot_schedule(
