@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, '/usr/local/lib/lghs-python')
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lghs.database import FleetDB
+from lghs.rollout_manager import reconcile_all
+
+DB = FleetDB(Path(os.environ.get('LGHS_FLEET_DB', '/var/lib/lghs/fleet.db')))
+INTERVAL = max(1.0, float(os.environ.get('LGHS_ROLLOUT_RECONCILE_SECONDS', '2')))
+STOP = False
+
+
+def stop(*_args):
+    global STOP
+    STOP = True
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        raise SystemExit('Run as root')
+    DB.initialize()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while not STOP:
+        results = reconcile_all(DB)
+        for result in results:
+            action = result.get('action')
+            if action in {'paused', 'advanced', 'completed', 'error'}:
+                print(json.dumps(result, sort_keys=True, separators=(',', ':')), flush=True)
+        deadline = time.monotonic() + INTERVAL
+        while not STOP and time.monotonic() < deadline:
+            time.sleep(min(.25, max(0, deadline - time.monotonic())))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
