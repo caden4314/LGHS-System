@@ -59,9 +59,10 @@ class BluetoothSourceInvariants(unittest.TestCase):
         prepare = (ROOT / "bluetooth" / "lghs-bt-prepare").read_text(encoding="utf-8")
         prepare_unit = (ROOT / "systemd" / "lghs-bt-prepare.service").read_text(encoding="utf-8")
 
-        self.assertIn('btmgmt -i "$BT_INDEX" io-cap 3', prepare)
-        self.assertIn('btmgmt -i "$BT_INDEX" pairable on', prepare)
-        self.assertIn("script -q -e -c", prepare)
+        self.assertIn('local cmd=(/usr/bin/btmgmt -i "$BT_INDEX" "$@")', prepare)
+        self.assertIn('retry_btmgmt "NoInputNoOutput IO capability" io-cap 3', prepare)
+        self.assertIn('retry_btmgmt "pairable mode" pairable on', prepare)
+        self.assertIn('/usr/bin/script -q -e -c "$quoted" /dev/null', prepare)
         self.assertIn("Before=lghs-bt-provision.service lghs-bt-bootstrap.service", prepare_unit)
 
         for src in (student, controller):
