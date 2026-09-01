@@ -81,13 +81,97 @@ th.numeric .sort-button {
   box-sizing: border-box;
 }
 
+.telemetry-data-actions {
+  min-height: 38px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.telemetry-data-actions details {
+  min-width: 0;
+  flex: 1;
+}
+
+.telemetry-data-actions summary {
+  width: fit-content;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  color: var(--text-2);
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.telemetry-data-table-wrap {
+  max-height: 260px;
+  overflow: auto;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.telemetry-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px;
+}
+
+.telemetry-data-table caption {
+  padding: 9px 10px;
+  color: var(--text-3);
+  text-align: left;
+}
+
+.telemetry-data-table th,
+.telemetry-data-table td {
+  border-top: 1px solid var(--border);
+  padding: 7px 10px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.telemetry-data-table th:first-child,
+.telemetry-data-table td:first-child {
+  text-align: left;
+}
+
+.telemetry-data-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-2);
+  color: var(--text-3);
+  z-index: 1;
+}
+
+.telemetry-data-actions .button svg {
+  width: 12px;
+  height: 12px;
+}
+
+@media (max-width: 520px) {
+  .telemetry-data-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .telemetry-data-actions .button {
+    align-self: flex-start;
+  }
+}
+
 @media (pointer: coarse) {
   .button,
   .icon-button,
   .nav-item,
   .identity-button,
   .global-search,
-  .sort-button {
+  .sort-button,
+  .telemetry-data-actions summary {
     min-height: 44px;
   }
 }
