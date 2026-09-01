@@ -20,8 +20,9 @@ ENV_FILE=/etc/lghs/fleet-web.env
 [[ -f "$SERVICE" ]] || { echo "Missing Fleet web systemd unit" >&2; exit 2; }
 [[ -f "$TOKEN_SOURCE" ]] || { echo "Fleet API token registry not found: $TOKEN_SOURCE" >&2; exit 2; }
 
+getent group lghs-web >/dev/null 2>&1 || groupadd --system lghs-web
 if ! id lghs-web >/dev/null 2>&1; then
-  useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin lghs-web
+  useradd --system --gid lghs-web --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin lghs-web
 fi
 
 install -d -m 0755 -o root -g root /opt/lghs "$INSTALL_ROOT" "$STATIC_ROOT"
