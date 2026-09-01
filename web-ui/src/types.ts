@@ -3,6 +3,30 @@ export type ConnectivityState = 'online' | 'stale' | 'offline'
 export type Severity = 'info' | 'warning' | 'critical'
 export type DeploymentState = 'queued' | 'running' | 'paused' | 'succeeded' | 'failed' | 'canceled'
 
+export interface NetworkTelemetry {
+  active_interface?: string | null
+  state?: string | null
+  ipv4?: string[]
+  ipv6?: string[]
+  gateway?: string | null
+  source?: string | null
+  metric?: number | null
+  ssid?: string | null
+  signal_dbm?: number | null
+  rx_bitrate?: string | null
+  tx_bitrate?: string | null
+  rx_bps?: number | null
+  tx_bps?: number | null
+  rx_bytes?: number | null
+  tx_bytes?: number | null
+  rx_packets?: number | null
+  tx_packets?: number | null
+  rx_errors?: number | null
+  tx_errors?: number | null
+  rx_dropped?: number | null
+  tx_dropped?: number | null
+}
+
 export interface DeviceSummary {
   deviceId: string
   hostname: string
@@ -98,9 +122,21 @@ export interface SudoRequest {
   authorization?: string
 }
 
+export interface ControllerMetrics {
+  cpu_pct?: number | null
+  mem_pct?: number | null
+  disk_pct?: number | null
+  temp_c?: number | null
+  load1?: number | null
+  uptime_seconds?: number | null
+  network?: NetworkTelemetry
+}
+
 export interface ControllerStatus {
   services?: Record<string, string>
   report?: Record<string, string>
+  metrics?: ControllerMetrics
+  observedAt?: number
 }
 
 export interface FleetSnapshot {
