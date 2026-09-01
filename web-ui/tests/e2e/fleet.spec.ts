@@ -12,7 +12,7 @@ async function expectNoViewportOverflow(page: import('@playwright/test').Page) {
 test('overview presents actionable fleet state and branded signal art', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'Fleet overview' })).toBeVisible()
-  await expect(page.getByText('Fleet communications')).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Fleet communications status' })).toBeVisible()
   await expect(page.locator('.overview-signal canvas')).toBeVisible()
   await expect(page.getByText('Temperature is above critical threshold')).toBeVisible()
   await expect(page.getByRole('link', { name: /All alerts/ })).toBeVisible()
@@ -78,6 +78,9 @@ test('mobile shell remains usable without page-level horizontal overflow', async
 
 test('reduced-motion preference keeps the Signal Field non-essential', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'reduced-motion', 'reduced-motion-specific acceptance')
+  // Set this explicitly in the test as well as the project so the assertion
+  // verifies the application behavior, not a runner/device preset quirk.
+  await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.goto('/')
   await expect(page.locator('.overview-signal canvas')).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Fleet overview' })).toBeVisible()
