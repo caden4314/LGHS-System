@@ -1,6 +1,7 @@
 import { Activity, AlertTriangle, Bell, Boxes, ChevronDown, Command, LayoutDashboard, Search, Settings, ShieldCheck, Users } from 'lucide-react'
-import { NavLink, Navigate, Route, Routes } from 'react-router'
+import { Link, NavLink, Navigate, Route, Routes } from 'react-router'
 import { useFleetSnapshot, useSession } from './api'
+import { LoginBoundary } from './LoginBoundary'
 import { OverviewPage } from './pages/Overview'
 import { FleetPage } from './pages/Fleet'
 import { DevicePage } from './pages/Device'
@@ -21,9 +22,13 @@ export default function App() {
   const fleet = useFleetSnapshot()
   const session = useSession()
 
-  if (fleet.isLoading || session.isLoading) return <LoadingShell />
-  if (fleet.isError || !fleet.data) return <FatalState title="Fleet data unavailable" detail="The controller web gateway did not return a valid fleet snapshot." />
-  if (session.isError || !session.data?.authenticated) return <FatalState title="Session unavailable" detail="Authentication information could not be verified by the web gateway." />
+  if (session.isLoading || fleet.isLoading) return <LoginBoundary mode="loading" />
+  if (session.isError || !session.data?.authenticated) {
+    return <LoginBoundary mode="error" detail="Cloudflare Access or LGHS authorization could not verify this session." />
+  }
+  if (fleet.isError || !fleet.data) {
+    return <FatalState title="Fleet data unavailable" detail="Authentication succeeded, but the controller gateway did not return a valid fleet snapshot." />
+  }
 
   const snapshot = fleet.data
   const identity = session.data
@@ -48,23 +53,23 @@ export default function App() {
         </nav>
 
         <div className="sidebar-footer">
-          <div className="controller-status"><span className="status-dot" aria-hidden="true" /><div><strong>Controller online</strong><span>Fleet API responding</span></div></div>
+          <div className="controller-status"><span className="status-dot" aria-hidden="true" /><div><strong>Controller connected</strong><span>Gateway snapshot received</span></div></div>
           <div className="build-label">LGHS 0.6 · Web preview</div>
         </div>
       </aside>
 
       <div className="workspace">
         <header className="topbar">
-          <button className="global-search" type="button" aria-label="Open global search">
-            <Search aria-hidden="true" /><span>Search fleet</span><kbd>⌘ K</kbd>
-          </button>
+          <Link className="global-search" to="/fleet" aria-label="Open fleet search">
+            <Search aria-hidden="true" /><span>Search fleet</span>
+          </Link>
           <div className="topbar-actions">
-            <button className="icon-button" type="button" aria-label="Notifications"><Bell aria-hidden="true" />{criticalAlerts > 0 && <span className="notification-dot" />}</button>
-            <button className="identity-button" type="button" aria-label="Account menu">
+            <Link className="icon-button" to="/alerts" aria-label="Open alerts"><Bell aria-hidden="true" />{criticalAlerts > 0 && <span className="notification-dot" />}</Link>
+            <a className="identity-button" href="/cdn-cgi/access/logout" aria-label={`Signed in as ${identity.email}. Sign out of Cloudflare Access.`} title="Sign out">
               <span className="avatar" aria-hidden="true">{identity.email.charAt(0).toUpperCase()}</span>
               <span className="identity-copy"><strong>{identity.email}</strong><small>{identity.role}</small></span>
               <ChevronDown aria-hidden="true" />
-            </button>
+            </a>
           </div>
         </header>
 
@@ -86,10 +91,6 @@ export default function App() {
       </div>
     </div>
   )
-}
-
-function LoadingShell() {
-  return <div className="center-state" role="status"><div className="loading-mark" aria-hidden="true" /><strong>Loading Fleet</strong><span>Connecting to controller…</span></div>
 }
 
 function FatalState({ title, detail }: { title: string; detail: string }) {
