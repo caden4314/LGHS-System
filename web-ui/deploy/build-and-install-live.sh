@@ -31,11 +31,11 @@ npm run build
 test -f dist/index.html
 
 echo
- echo "Installing production bundle on LGCSCONT..."
-sudo "$ROOT_DIR/deploy/install-controller.sh" "$ROOT_DIR"
+echo "Installing production bundle on LGCSCONT..."
+sudo bash "$ROOT_DIR/deploy/install-controller.sh" "$ROOT_DIR"
 
 echo
- echo "=== INSTALL RESULT ==="
+echo "=== INSTALL RESULT ==="
 echo "Frontend: $ROOT_DIR/dist"
 echo "Service:  lghs-fleet-web.service"
 echo "Origin:   http://127.0.0.1:8790"
