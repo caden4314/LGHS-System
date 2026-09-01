@@ -11,23 +11,48 @@ esac
 
 id "$USER_NAME" >/dev/null 2>&1 || { echo "Missing autologin account: $USER_NAME" >&2; exit 1; }
 
-# Prefer Raspberry Pi OS's own configuration API. This lets the distro own the
-# LightDM/labwc details and is less brittle across Raspberry Pi OS updates.
-if command -v raspi-config >/dev/null 2>&1; then
+# LGHS is an appliance-style deployment. Always boot to the graphical target
+# and autologin only to the desktop. Current Raspberry Pi OS Trixie exposes
+# separate boot-target/autologin APIs; unlike the legacy B4 helper this avoids
+# creating a tty1 console-autologin override alongside the desktop session.
+if command -v raspi-config >/dev/null 2>&1 && \
+   grep -q '^do_boot_target()' /usr/bin/raspi-config 2>/dev/null && \
+   grep -q '^do_autologin()' /usr/bin/raspi-config 2>/dev/null; then
     SUDO_USER="$USER_NAME" HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)" \
-      raspi-config nonint do_boot_behaviour B4 >/dev/null
+      raspi-config nonint do_boot_target B2 >/dev/null
+    SUDO_USER="$USER_NAME" HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)" \
+      raspi-config nonint do_autologin 2 >/dev/null
 else
-    # Fallback for images where raspi-config is absent but LightDM is present.
-    install -d -m 0755 /etc/lightdm/lightdm.conf.d
-    cat > /etc/lightdm/lightdm.conf.d/90-lghs-autologin.conf <<EOF
+    # Portable fallback: force graphical.target, remove any tty1 autologin, and
+    # configure LightDM to log directly into the distro-selected desktop
+    # session. Do not hard-code a session name; Raspberry Pi OS owns that.
+    systemctl set-default graphical.target >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf
+    rmdir --ignore-fail-on-non-empty /etc/systemd/system/getty@tty1.service.d 2>/dev/null || true
+
+    if [[ -f /etc/lightdm/lightdm.conf ]]; then
+        if grep -qE '^[#[:space:]]*autologin-user=' /etc/lightdm/lightdm.conf; then
+            sed -i -E "s|^[#[:space:]]*autologin-user=.*|autologin-user=$USER_NAME|" /etc/lightdm/lightdm.conf
+        else
+            cat >> /etc/lightdm/lightdm.conf <<EOF
+
 [Seat:*]
 autologin-user=$USER_NAME
 autologin-user-timeout=0
-user-session=labwc
 EOF
-    chmod 0644 /etc/lightdm/lightdm.conf.d/90-lghs-autologin.conf
-    systemctl set-default graphical.target >/dev/null 2>&1 || true
+        fi
+    fi
 fi
+
+# Remove obsolete LGHS overrides from older images. Raspberry Pi OS's own
+# LightDM configuration selects the correct labwc session for the installed
+# desktop; forcing a stale session name can strand boot at a blinking cursor.
+rm -f /etc/lightdm/lightdm.conf.d/90-lghs-autologin.conf \
+      /etc/lightdm/lightdm.conf.d/99-lghs-autologin.conf
+
+systemctl set-default graphical.target >/dev/null 2>&1 || true
+systemctl enable lightdm.service >/dev/null 2>&1 || true
+systemctl daemon-reload >/dev/null 2>&1 || true
 
 printf '%s\n' "$USER_NAME" > /etc/lghs/autologin-user
 chmod 0644 /etc/lghs/autologin-user
