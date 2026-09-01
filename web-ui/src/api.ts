@@ -19,9 +19,6 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     credentials: 'same-origin',
     headers: {
       Accept: 'application/json',
-      // Cloudflare Access recommends this header for SPA/AJAX requests so an
-      // expired Access session is returned as 401 instead of becoming a
-      // confusing HTML/login response inside fetch().
       'X-Requested-With': 'XMLHttpRequest',
       ...(init?.headers ?? {}),
     },
@@ -34,7 +31,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
       const body = await response.json() as { detail?: string; error?: string }
       detail = body.detail || body.error || detail
     } catch {
-      // The status code is still authoritative when no JSON error body exists.
+      // Keep the HTTP status when a proxy returned a non-JSON body.
     }
     throw new ApiError(response.status, detail)
   }
@@ -45,12 +42,8 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 export async function getFleetSnapshot(): Promise<FleetSnapshot> {
   if (useMock) {
     await new Promise((resolve) => window.setTimeout(resolve, 120))
-    return {
-      ...mockSnapshot,
-      generatedAt: new Date().toISOString(),
-    }
+    return { ...mockSnapshot, generatedAt: new Date().toISOString() }
   }
-
   return requestJson<FleetSnapshot>('/api/v1/overview')
 }
 
@@ -58,12 +51,13 @@ export function useFleetSnapshot() {
   return useQuery({
     queryKey: ['fleet', 'overview'],
     queryFn: getFleetSnapshot,
-    // The managed agent reports every ~5 seconds. Until SSE invalidation is
-    // available, this keeps the UI current without polling faster than the
-    // source can provide useful state.
     refetchInterval: useMock ? false : 5_000,
     staleTime: 3_000,
-    retry: (count, error) => !(error instanceof ApiError && [401, 403].includes(error.status)) && count < 2,
+    // Keep the last successful snapshot visible while a transient controller
+    // request retries. The gateway also serves a bounded last-good snapshot.
+    placeholderData: (previousData) => previousData,
+    retry: (count, error) => !(error instanceof ApiError && [401, 403].includes(error.status)) && count < 4,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8_000),
   })
 }
 
@@ -75,13 +69,7 @@ export interface SessionInfo {
 }
 
 export async function getSession(): Promise<SessionInfo> {
-  if (useMock) {
-    return {
-      authenticated: true,
-      email: 'operator@scenicrouteservers.com',
-      role: 'owner',
-    }
-  }
+  if (useMock) return { authenticated: true, email: 'operator@scenicrouteservers.com', role: 'owner', csrfToken: 'mock' }
   return requestJson<SessionInfo>('/api/v1/session')
 }
 
@@ -89,8 +77,23 @@ export function useSession() {
   return useQuery({
     queryKey: ['session'],
     queryFn: getSession,
-    staleTime: 60_000,
-    refetchInterval: 60_000,
+    staleTime: 5 * 60_000,
+    // Do not intentionally revalidate Access every minute. Access itself
+    // enforces the session on every proxied API request.
+    refetchInterval: false,
     retry: false,
+  })
+}
+
+export async function fleetWrite<T>(path: string, csrfToken: string | undefined, method = 'POST', body?: unknown): Promise<T> {
+  if (useMock) return { ok: true } as T
+  if (!csrfToken) throw new ApiError(403, 'Missing CSRF token; refresh the authenticated session.')
+  return requestJson<T>(path, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-LGHS-CSRF': csrfToken,
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
   })
 }
