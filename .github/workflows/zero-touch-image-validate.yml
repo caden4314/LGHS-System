@@ -1,0 +1,53 @@
+name: Zero Touch Image Validate
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          bash -n image-builder/build-image.sh
+          bash -n image-builder/stage-lghs/00-install-lghs/00-run.sh
+          bash -n updater/lghs-autologin-apply
+          bash -n updater/lghs-install-success-notify
+          bash -n student/lghs-firstboot-provision
+
+      - name: Zero-touch first-run ownership
+        run: |
+          grep -q "DISABLE_FIRST_BOOT_USER_RENAME=1" image-builder/build-image.sh
+          grep -q "ENABLE_CLOUD_INIT=0" image-builder/build-image.sh
+          grep -q "FIRST_USER_PASS=" image-builder/build-image.sh
+          grep -q "rm -f /etc/xdg/autostart/piwiz.desktop" image-builder/stage-lghs/00-install-lghs/00-run.sh
+          grep -q "systemctl mask userconfig.service" image-builder/stage-lghs/00-install-lghs/00-run.sh
+          grep -q "cloud-init.disabled" image-builder/stage-lghs/00-install-lghs/00-run.sh
+
+      - name: Graphical boot invariants
+        run: |
+          grep -q "raspi-config nonint do_boot_target B2" updater/lghs-autologin-apply
+          grep -q "raspi-config nonint do_autologin 2" updater/lghs-autologin-apply
+          if grep -q "do_boot_behaviour B4" updater/lghs-autologin-apply; then
+            echo "Legacy B4 boot mode must not be used; it creates tty1 autologin." >&2
+            exit 1
+          fi
+          grep -q "systemctl set-default graphical.target" updater/lghs-autologin-apply
+          grep -q "rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf" updater/lghs-autologin-apply
+          grep -q "Before=graphical.target" systemd/lghs-firstboot-provision.service
+          grep -q "WantedBy=multi-user.target graphical.target" systemd/lghs-firstboot-provision.service
+
+      - name: Prebuilt-image completion notification invariants
+        run: |
+          grep -q "PROVISIONED=/var/lib/lghs/provisioned" updater/lghs-install-success-notify
+          grep -q 'BOOTSTRAP_COMPLETE=/var/lib/lghs/bootstrap-complete' updater/lghs-install-success-notify
+          if grep -q '^Restart=on-failure' systemd/lghs-install-success-notify.service; then
+            echo "Install success notification must not restart forever." >&2
+            exit 1
+          fi
+          grep -q "WantedBy=graphical.target" systemd/lghs-install-success-notify.service
