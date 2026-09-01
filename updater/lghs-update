@@ -151,17 +151,23 @@ fi
 write_status "preparing" "Comparing versions" 28 "Target ${TARGET_COMMIT:0:12}"
 
 if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
-    git reset --hard "$TARGET_COMMIT" >/dev/null
-    if [[ -x /usr/local/sbin/lghs-reconcile ]]; then
-        write_status "validating" "Reconciling current install" 85 "LGHS is already current"
-        /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true
-    fi
-    if [[ -x ./updater/lghs-0.5-install ]]; then
-        ./updater/lghs-0.5-install "$ROLE"
-    fi
-    write_status "complete" "LGHS is current" 100 "Already at ${TARGET_COMMIT:0:12}"
-    echo "LGHS is already current at ${TARGET_COMMIT:0:12}."
+    write_status "complete" "LGHS is current" 100 "Already at ${TARGET_COMMIT:0:12}; no changes required"
+    echo "LGHS is already current at ${TARGET_COMMIT:0:12}; no services were changed."
     exit 0
+fi
+
+# Automatic timers, normal manual update checks, and rollout fallback must not
+# silently move a machine to an older commit. An intentional rollback is an
+# explicit operation and must opt in with LGHS_ALLOW_DOWNGRADE=1.
+if [[ "$INSTALLED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] && \
+   git cat-file -e "${INSTALLED_COMMIT}^{commit}" 2>/dev/null && \
+   git merge-base --is-ancestor "$TARGET_COMMIT" "$INSTALLED_COMMIT" 2>/dev/null; then
+    if [[ "${LGHS_ALLOW_DOWNGRADE:-0}" != "1" ]]; then
+        write_status "failed" "Downgrade blocked" 100 \
+            "Refusing ${INSTALLED_COMMIT:0:12} -> ${TARGET_COMMIT:0:12}; set LGHS_ALLOW_DOWNGRADE=1 for an intentional rollback"
+        echo "LGHS updater: refusing automatic downgrade ${INSTALLED_COMMIT:0:12} -> ${TARGET_COMMIT:0:12}." >&2
+        exit 64
+    fi
 fi
 
 printf '%s\n' "$PREVIOUS_COMMIT" > "$STATE_DIR/previous-commit"
