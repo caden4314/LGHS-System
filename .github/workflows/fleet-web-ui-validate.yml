@@ -75,8 +75,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Compile gateway
-        run: python -m py_compile web-ui/gateway/app.py web-ui/gateway/test_security.py
+      - name: Compile gateway and tunnel setup
+        run: python -m py_compile web-ui/gateway/app.py web-ui/gateway/test_security.py web-ui/deploy/setup-cloudflare-tunnel.py
       - name: Validate deployment shell
         run: |
           bash -n web-ui/deploy/install-controller.sh
@@ -123,7 +123,7 @@ jobs:
           branch=${GITHUB_REF_NAME}
           workflow_run=${GITHUB_RUN_ID}
           built_utc=$(date -u +%FT%TZ)
-          validation=frontend+browser+gateway-security+live-install-shell
+          validation=frontend+browser+gateway-security+live-install-shell+tunnel-setup-compile
           EOF
           find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
       - name: Upload validated test bundle
