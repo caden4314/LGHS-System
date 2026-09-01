@@ -5,7 +5,7 @@ import { OverviewSignal } from '../OverviewSignal'
 import type { FleetSnapshot, Severity } from '../types'
 
 function severityTone(severity: Severity) {
-  return severity === 'critical' ? 'critical' : severity === 'warning' ? 'warning' : 'neutral'
+  return severity === 'critical' ? 'critical' : severity === 'warning' ? 'warning' : 'info'
 }
 
 export function OverviewPage({ snapshot }: { snapshot: FleetSnapshot }) {
