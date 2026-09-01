@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "users": {
+    "owner@example.com": {
+      "role": "owner"
+    },
+    "operator@example.com": {
+      "role": "operator"
+    },
+    "viewer@example.com": {
+      "role": "viewer"
+    }
+  }
+}
