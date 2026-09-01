@@ -2,6 +2,7 @@ import { Activity, AlertTriangle, Bell, Boxes, ChevronDown, Command, LayoutDashb
 import { Link, NavLink, Navigate, Route, Routes } from 'react-router'
 import { useFleetSnapshot, useSession } from './api'
 import { LoginBoundary } from './LoginBoundary'
+import { ThemeToggle } from './ThemeToggle'
 import { OverviewPage } from './pages/Overview'
 import { FleetPage } from './pages/Fleet'
 import { DevicePage } from './pages/Device'
@@ -64,6 +65,7 @@ export default function App() {
             <Search aria-hidden="true" /><span>Search fleet</span>
           </Link>
           <div className="topbar-actions">
+            <ThemeToggle />
             <Link className="icon-button" to="/alerts" aria-label="Open alerts"><Bell aria-hidden="true" />{criticalAlerts > 0 && <span className="notification-dot" />}</Link>
             <a className="identity-button" href="/cdn-cgi/access/logout" aria-label={`Signed in as ${identity.email}. Sign out of Cloudflare Access.`} title="Sign out">
               <span className="avatar" aria-hidden="true">{identity.email.charAt(0).toUpperCase()}</span>
