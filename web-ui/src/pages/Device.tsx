@@ -1,10 +1,13 @@
 import { Activity, Cpu, HardDrive, MemoryStick, Radio, Server, Thermometer, Wifi } from 'lucide-react'
 import { Link, useParams } from 'react-router'
+import { EmptyTelemetry } from '../EmptyTelemetry'
 import { fmtAge, fmtPercent, fmtRate, fmtSignal, fmtTemp, fmtUptime, Panel, Stat, StatusBadge } from '../components'
 import { TelemetryChart, type TelemetryPoint } from '../TelemetryChart'
 import type { DeviceSummary, FleetSnapshot, HealthState } from '../types'
 
-function historyFor(device: DeviceSummary): TelemetryPoint[] {
+const developmentHistory = import.meta.env.DEV && import.meta.env.VITE_LGHS_MOCK !== '0'
+
+function mockHistoryFor(device: DeviceSummary): TelemetryPoint[] {
   const now = Date.now()
   const baseCpu = device.cpuPct ?? 8
   const baseMem = device.memPct ?? 30
@@ -89,9 +92,9 @@ export function DevicePage({ snapshot }: { snapshot: FleetSnapshot }) {
           </div>
           <p>{device.model} · {device.group}</p>
         </div>
-        <div className="device-actions">
-          <button className="button secondary" type="button">Maintenance</button>
-          <button className="button primary" type="button">Actions</button>
+        <div className="device-actions" aria-label="Device actions are not enabled in the read-only preview">
+          <button className="button secondary" type="button" disabled title="Available after the write gateway is enabled">Maintenance</button>
+          <button className="button primary" type="button" disabled title="Available after the write gateway is enabled">Actions</button>
         </div>
       </div>
 
@@ -112,8 +115,8 @@ export function DevicePage({ snapshot }: { snapshot: FleetSnapshot }) {
       </div>
 
       <div className="dashboard-grid dashboard-grid-main">
-        <Panel title="Telemetry" description={import.meta.env.DEV ? 'Last hour · development sample until the history endpoint is connected' : 'Last hour'} className="span-2">
-          <TelemetryChart points={historyFor(device)} />
+        <Panel title="Telemetry" description={developmentHistory ? 'Last hour · development fixture' : 'Historical controller data'} className="span-2">
+          {developmentHistory ? <TelemetryChart points={mockHistoryFor(device)} /> : <EmptyTelemetry />}
         </Panel>
 
         <Panel title="Health" description={`${activeAlerts.length} active alert${activeAlerts.length === 1 ? '' : 's'}`}>
@@ -172,7 +175,7 @@ export function DevicePage({ snapshot }: { snapshot: FleetSnapshot }) {
               </div>
             ))}
           </div>
-        ) : <p className="muted">No recent device events in the current snapshot.</p>}
+        ) : <p className="muted">No recent device events are available from the current gateway read model.</p>}
       </Panel>
     </div>
   )
