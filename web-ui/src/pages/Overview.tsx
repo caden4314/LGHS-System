@@ -1,6 +1,7 @@
 import { ArrowRight, Cpu, HardDrive, MemoryStick, Radio, Server, Thermometer, Wifi } from 'lucide-react'
 import { Link } from 'react-router'
 import { EmptyState, fmtAge, fmtPercent, fmtSignal, fmtTemp, Panel, Stat, StatusBadge } from '../components'
+import { OverviewSignal } from '../OverviewSignal'
 import type { FleetSnapshot, Severity } from '../types'
 
 function severityTone(severity: Severity) {
@@ -32,6 +33,8 @@ export function OverviewPage({ snapshot }: { snapshot: FleetSnapshot }) {
         <div className="freshness" role="status">Snapshot {new Date(snapshot.generatedAt).toLocaleTimeString()}</div>
       </div>
 
+      <OverviewSignal online={online} total={devices.length} critical={critical} />
+
       <div className="stat-grid">
         <Stat label="Online" value={`${online}/${devices.length}`} detail="reporting now" tone={online === devices.length ? 'success' : 'neutral'} />
         <Stat label="Critical" value={critical} detail="requires attention" tone={critical ? 'critical' : 'success'} />
@@ -50,7 +53,7 @@ export function OverviewPage({ snapshot }: { snapshot: FleetSnapshot }) {
             <div className="attention-list">
               {attention.map((alert) => (
                 <Link to={alert.deviceId ? `/fleet/${alert.deviceId}` : '/alerts'} className="attention-row" key={alert.id}>
-                  <StatusBadge tone={alert.severity} label={alert.severity.toUpperCase()} />
+                  <StatusBadge tone={severityTone(alert.severity)} label={alert.severity.toUpperCase()} />
                   <div className="attention-copy">
                     <strong>{alert.title}</strong>
                     <span>{alert.deviceId ?? 'Fleet'} · {alert.detail}</span>
@@ -119,19 +122,21 @@ export function OverviewPage({ snapshot }: { snapshot: FleetSnapshot }) {
       </div>
 
       <Panel title="Recent activity" description="Operational events from the controller audit stream" action={<Link className="text-link" to="/activity">View activity <ArrowRight aria-hidden="true" /></Link>}>
-        <div className="activity-list">
-          {snapshot.activity.slice(0, 6).map((item) => (
-            <div className="activity-row" key={item.id}>
-              <span className={`activity-marker tone-${item.severity}`} aria-hidden="true" />
-              <div>
-                <strong>{item.deviceId ?? 'Fleet'}</strong>
-                <span>{item.message}</span>
+        {snapshot.activity.length ? (
+          <div className="activity-list">
+            {snapshot.activity.slice(0, 6).map((item) => (
+              <div className="activity-row" key={item.id}>
+                <span className={`activity-marker tone-${item.severity}`} aria-hidden="true" />
+                <div>
+                  <strong>{item.deviceId ?? 'Fleet'}</strong>
+                  <span>{item.message}</span>
+                </div>
+                {item.actor && <span className="activity-actor">{item.actor}</span>}
+                <time>{new Date(item.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
               </div>
-              {item.actor && <span className="activity-actor">{item.actor}</span>}
-              <time>{new Date(item.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        ) : <EmptyState title="No activity available" detail="The web gateway has not connected the controller audit timeline yet." />}
       </Panel>
     </div>
   )
