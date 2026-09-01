@@ -19,11 +19,26 @@ export interface DeviceSummary {
   memPct: number | null
   diskPct: number | null
   tempC: number | null
+  load1?: number | null
   wifiDbm: number | null
+  ssid?: string | null
+  activeInterface?: string | null
+  ipv4?: string[]
+  ipv6?: string[]
+  gateway?: string | null
   rxBps: number | null
   txBps: number | null
+  rxBytes?: number | null
+  txBytes?: number | null
+  rxErrors?: number | null
+  txErrors?: number | null
+  rxDropped?: number | null
+  txDropped?: number | null
   uptimeSeconds: number | null
   lastSeenSeconds: number | null
+  bootId?: string | null
+  sequence?: number | null
+  transport?: Record<string, unknown> | null
   updateState: string | null
   rebootRequired: boolean
   throttled: boolean
@@ -66,10 +81,36 @@ export interface ActivityItem {
   actor?: string
 }
 
+export interface SudoRequest {
+  request_id?: string
+  id?: string
+  device_id: string
+  state: string
+  command: string
+  requested_at: number
+  updated_at: number
+  expires_at?: number | null
+  requester?: string
+  argv?: string[]
+  cwd?: string
+  approved_by?: string
+  denied_by?: string
+  authorization?: string
+}
+
+export interface ControllerStatus {
+  services?: Record<string, string>
+  report?: Record<string, string>
+}
+
 export interface FleetSnapshot {
   devices: DeviceSummary[]
   alerts: FleetAlert[]
   deployments: DeploymentSummary[]
   activity: ActivityItem[]
+  sudoRequests?: SudoRequest[]
+  settings?: Record<string, { value: unknown; updatedAt: number }>
+  controller?: ControllerStatus
   generatedAt: string
+  degraded?: boolean
 }
