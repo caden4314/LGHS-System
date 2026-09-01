@@ -37,8 +37,45 @@ rm -f /etc/ssh/ssh_host_*
 ssh-keygen -A
 trap 'rm -f /etc/ssh/ssh_host_*' EXIT
 
+# systemd is not PID 1 inside a pi-gen chroot. The normal LGHS installer is
+# intentionally reused here, but service runtime actions (--now/start/restart)
+# must become enable/disable-only operations. This wrapper exists only for the
+# image-build process and is deleted before export.
+BUILD_BIN=/usr/local/lib/lghs-image-build-bin
+install -d -m 0755 "\$BUILD_BIN"
+cat > "\$BUILD_BIN/systemctl" <<'EOSYSTEMCTL'
+#!/bin/bash
+set -e
+REAL=/usr/bin/systemctl
+args=("$@")
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  enable|disable)
+    filtered=()
+    for arg in "$@"; do
+      [[ "$arg" == "--now" ]] && continue
+      filtered+=("$arg")
+    done
+    exec "$REAL" "$cmd" "${filtered[@]}"
+    ;;
+  start|restart|try-restart|reset-failed|daemon-reload)
+    exit 0
+    ;;
+  is-system-running)
+    echo offline
+    exit 1
+    ;;
+  *)
+    exec "$REAL" "$cmd" "$@"
+    ;;
+esac
+EOSYSTEMCTL
+chmod 0755 "\$BUILD_BIN/systemctl"
+trap 'rm -f /etc/ssh/ssh_host_*; rm -rf /usr/local/lib/lghs-image-build-bin' EXIT
+
 cd ${CHROOT_SOURCE}
-LGHS_IMAGE_BUILD=1 /bin/bash ./install.sh ${LGHS_ROLE}
+PATH="\$BUILD_BIN:\$PATH" LGHS_IMAGE_BUILD=1 /bin/bash ./install.sh ${LGHS_ROLE}
 if [[ "${LGHS_ROLE}" == "student" ]]; then
     python3 ./updater/patch-agent-root-writable.py /usr/local/sbin/lghs-agent
     chown root:root /usr/local/sbin/lghs-agent
@@ -96,8 +133,10 @@ echo "LGHS: Raspberry Pi first-run wizard disabled."
 echo "LGHS: default boot target: $(systemctl get-default)"
 EOF
 
-# Defense in depth: no SSH host key is allowed to survive image construction.
+# Defense in depth: no SSH host key or build-only systemctl wrapper is allowed
+# to survive image construction.
 rm -f "${ROOTFS_DIR}"/etc/ssh/ssh_host_*
+rm -rf "${ROOTFS_DIR}/usr/local/lib/lghs-image-build-bin"
 
 rm -f "${ROOTFS_DIR}/etc/lghs/secrets/controller_ed25519" \
       "${ROOTFS_DIR}/etc/lghs/secrets/controller_ed25519.pub" \
