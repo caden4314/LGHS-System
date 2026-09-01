@@ -22,10 +22,11 @@ export default function App() {
   const session = useSession()
 
   if (fleet.isLoading || session.isLoading) return <LoadingShell />
-  if (fleet.isError) return <FatalState title="Fleet data unavailable" detail="The controller web gateway did not return a valid fleet snapshot." />
+  if (fleet.isError || !fleet.data) return <FatalState title="Fleet data unavailable" detail="The controller web gateway did not return a valid fleet snapshot." />
   if (session.isError || !session.data?.authenticated) return <FatalState title="Session unavailable" detail="Authentication information could not be verified by the web gateway." />
 
   const snapshot = fleet.data
+  const identity = session.data
   const criticalAlerts = snapshot.alerts.filter((alert) => alert.severity === 'critical' && !alert.acknowledged).length
 
   return (
@@ -60,8 +61,8 @@ export default function App() {
           <div className="topbar-actions">
             <button className="icon-button" type="button" aria-label="Notifications"><Bell aria-hidden="true" />{criticalAlerts > 0 && <span className="notification-dot" />}</button>
             <button className="identity-button" type="button" aria-label="Account menu">
-              <span className="avatar" aria-hidden="true">{session.data.email.charAt(0).toUpperCase()}</span>
-              <span className="identity-copy"><strong>{session.data.email}</strong><small>{session.data.role}</small></span>
+              <span className="avatar" aria-hidden="true">{identity.email.charAt(0).toUpperCase()}</span>
+              <span className="identity-copy"><strong>{identity.email}</strong><small>{identity.role}</small></span>
               <ChevronDown aria-hidden="true" />
             </button>
           </div>
