@@ -1,14 +1,12 @@
 [Unit]
 Description=Show LGHS first-install success notification
-After=display-manager.service
+After=lghs-firstboot-provision.service display-manager.service
 ConditionPathExists=!/var/lib/lghs/install-success-notified
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/lghs-install-success-notify
-Restart=on-failure
-RestartSec=30
 TimeoutStartSec=20min
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
