@@ -86,6 +86,41 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn("bluetoothd --compat", install)
         self.assertIn("50-lghs-sdp-compat.conf", install)
 
+    def test_firstboot_prepares_identity_before_bt(self):
+        script = (ROOT / "student" / "lghs-firstboot-provision").read_text(encoding="utf-8")
+        firstboot_unit = (ROOT / "systemd" / "lghs-firstboot-provision.service").read_text(encoding="utf-8")
+        bt_unit = (ROOT / "systemd" / "lghs-bt-bootstrap.service").read_text(encoding="utf-8")
+
+        self.assertIn("ssh-keygen -A", script)
+        self.assertLess(script.index("ssh-keygen -A"), script.index("sshd -t"))
+        self.assertIn("/etc/cloudflared", script)
+        self.assertIn("systemctl restart lghs-bt-bootstrap.service", script)
+        self.assertIn("Before=display-manager.service getty@tty1.service lghs-policy.service lghs-agent.service lghs-bt-bootstrap.service", firstboot_unit)
+        self.assertIn("After=lghs-firstboot-provision.service", bt_unit)
+
+    def test_bt_sandbox_permits_only_needed_tunnel_install_paths(self):
+        unit = (ROOT / "systemd" / "lghs-bt-bootstrap.service").read_text(encoding="utf-8")
+        self.assertIn("ProtectSystem=strict", unit)
+        write_line = next(line for line in unit.splitlines() if line.startswith("ReadWritePaths="))
+        for path in (
+            "/var/lib/lghs",
+            "/var/lib/lghs-agent",
+            "/etc/NetworkManager/system-connections",
+            "/etc/cloudflared",
+            "/etc/systemd/system",
+            "/usr/local/bin",
+            "/run",
+        ):
+            self.assertIn(path, write_line)
+
+    def test_cloudflared_download_is_pinned_and_verified(self):
+        src = (ROOT / "student" / "lghs-cloudflare-install").read_text(encoding="utf-8")
+        self.assertIn('CLOUDFLARED_VERSION="${LGHS_CLOUDFLARED_VERSION:-2026.8.1}"', src)
+        self.assertIn("sha256sum", src)
+        self.assertIn("6d517efc10dfce17440177bd7011909166eab44bae0f6998182183df717c7dba", src)
+        self.assertNotIn("releases/latest/download", src)
+        self.assertIn("--token-file /etc/cloudflared/token", src)
+
     def test_no_static_wifi_secret_in_repository_protocol(self):
         combined = "\n".join([
             (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8"),

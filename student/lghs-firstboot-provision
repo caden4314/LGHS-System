@@ -91,7 +91,7 @@ fi
 # same per-device token for the root-owned bootstrap client and the unprivileged
 # managed-device agent, then provide the agent's HTTPS endpoint configuration.
 if [[ "$ROLE" == "student" ]]; then
-  install -d -m 0700 /etc/lghs/secrets
+  install -d -m 0700 /etc/lghs/secrets /etc/cloudflared
   printf '%s\n' "$FLEET_API_TOKEN" > /etc/lghs/secrets/fleet-api-token
   chmod 0600 /etc/lghs/secrets/fleet-api-token
   printf 'URL=%s\n' "$FLEET_API_URL" > /etc/lghs/fleet-api.conf
@@ -105,11 +105,16 @@ fi
 
 if [[ -x /usr/local/sbin/lghs-autologin-apply ]];then /usr/local/sbin/lghs-autologin-apply;fi
 if [[ "$ROLE" == "student" && -x /usr/local/sbin/lghs-dev-setup ]];then /usr/local/sbin/lghs-dev-setup || true;fi
+# Generic images deliberately contain no SSH host private keys. Generate a
+# unique set on the real Pi before validating or starting sshd.
+if command -v ssh-keygen >/dev/null 2>&1;then ssh-keygen -A;fi
 if command -v sshd >/dev/null 2>&1;then sshd -t;systemctl try-restart ssh.service >/dev/null 2>&1 || true;fi
 if [[ "$ROLE" == "student" ]]; then
   systemctl reset-failed lghs-agent.service lghs-bt-bootstrap.service >/dev/null 2>&1 || true
   systemctl try-restart lghs-agent.service >/dev/null 2>&1 || true
-  systemctl try-restart lghs-bt-bootstrap.service >/dev/null 2>&1 || true
+  # Start, rather than only try-restart, so a unit that was inactive while
+  # first-boot identity was being created does not miss zero-touch bootstrap.
+  systemctl restart lghs-bt-bootstrap.service >/dev/null 2>&1 || true
 fi
 
 install -m 0600 "$PUBLIC_CONF" "$STATE_DIR/provisioned.conf";printf '%s\n' "$(date -u +%FT%TZ)">$STAMP;chmod 0600 "$STAMP"
