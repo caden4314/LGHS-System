@@ -38,6 +38,35 @@ jobs:
       - name: Build production frontend
         run: npm run build
 
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web-ui/package.json
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run browser acceptance tests
+        run: npm run test:e2e
+      - name: Upload browser report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-web-ui-playwright-report
+          path: |
+            web-ui/playwright-report
+            web-ui/test-results
+          retention-days: 7
+
   gateway:
     runs-on: ubuntu-latest
     timeout-minutes: 10
