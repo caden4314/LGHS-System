@@ -268,8 +268,8 @@
   }
 
   .overview-signal-art {
+    left: 20%;
     opacity: 0.22;
-    inset-left: 20%;
   }
 }
 
