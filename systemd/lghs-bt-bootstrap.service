@@ -1,8 +1,8 @@
 [Unit]
 Description=LGHS Bluetooth Wi-Fi Bootstrap Client
-After=bluetooth.service lghs-bt-prepare.service NetworkManager.service
+After=lghs-firstboot-provision.service bluetooth.service lghs-bt-prepare.service NetworkManager.service
 Requires=bluetooth.service lghs-bt-prepare.service
-Wants=NetworkManager.service
+Wants=lghs-firstboot-provision.service NetworkManager.service
 PartOf=bluetooth.service
 ConditionPathExists=/etc/lghs/bluetooth-bootstrap-enabled
 ConditionPathExists=!/var/lib/lghs/bootstrap/wifi-provisioned.json
@@ -22,7 +22,10 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/lghs
-ReadWritePaths=/var/lib/lghs /var/lib/lghs-agent /etc/NetworkManager/system-connections /run
+# Bluetooth provisions Wi-Fi and then installs the device-scoped remotely
+# managed Cloudflare connector. Keep the rest of the OS read-only while
+# explicitly permitting only the persistent paths that installer owns.
+ReadWritePaths=/var/lib/lghs /var/lib/lghs-agent /etc/NetworkManager/system-connections /etc/cloudflared /etc/systemd/system /usr/local/bin /run
 
 [Install]
 WantedBy=multi-user.target
