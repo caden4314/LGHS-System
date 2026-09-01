@@ -47,17 +47,16 @@ cat > "\$BUILD_BIN/systemctl" <<'EOSYSTEMCTL'
 #!/bin/bash
 set -e
 REAL=/usr/bin/systemctl
-args=("$@")
-cmd="${1:-}"
+cmd="\${1:-}"
 shift || true
-case "$cmd" in
+case "\$cmd" in
   enable|disable)
     filtered=()
-    for arg in "$@"; do
-      [[ "$arg" == "--now" ]] && continue
-      filtered+=("$arg")
+    for arg in "\$@"; do
+      [[ "\$arg" == "--now" ]] && continue
+      filtered+=("\$arg")
     done
-    exec "$REAL" "$cmd" "${filtered[@]}"
+    exec "\$REAL" "\$cmd" "\${filtered[@]}"
     ;;
   start|restart|try-restart|reset-failed|daemon-reload)
     exit 0
@@ -67,7 +66,7 @@ case "$cmd" in
     exit 1
     ;;
   *)
-    exec "$REAL" "$cmd" "$@"
+    exec "\$REAL" "\$cmd" "\$@"
     ;;
 esac
 EOSYSTEMCTL
