@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Root-only typed operations broker for the hosted LGHS Fleet UI.
+
+The web gateway never receives controller SSH keys or direct SQLite access.
+This broker accepts a deliberately small JSON protocol over a Unix socket and
+maps requests to existing LGHS database/command/SSH primitives. No arbitrary
+shell command is accepted from the browser or gateway.
+"""
+from __future__ import annotations
+
+import grp
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+SOCK = Path('/run/lghs-web-ops/socket')
+DB_PATH = Path('/var/lib/lghs/fleet.db')
+BASE = '/usr/local/libexec/lghs-console-base'
+LIB = '/usr/local/lib/lghs-python'
+COMMAND = '/usr/local/sbin/lghs-fleet-command'
+DEVICE_RE = re.compile(r'^[A-Z0-9][A-Z0-9_-]{0,63}$')
+REQUEST_RE = re.compile(r'^[A-Za-z0-9._:-]{1,128}$')
+ALLOWED_ACTIONS = {'lghs-update', 'os-update', 'reboot', 'check', 'enforce', 'logs'}
+MAX_REQUEST = 64 * 1024
+
+if LIB not in sys.path:
+    sys.path.insert(0, LIB)
+
+
+def load_base():
+    loader = importlib.machinery.SourceFileLoader('lghs_console_base_web', BASE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise RuntimeError('unable to load LGHS console transport')
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def connect_db() -> sqlite3.Connection:
+    db = sqlite3.connect(DB_PATH, timeout=15)
+    db.row_factory = sqlite3.Row
+    db.execute('PRAGMA foreign_keys=ON')
+    db.execute('PRAGMA busy_timeout=15000')
+    return db
+
+
+def decode(value: Any, default: Any) -> Any:
+    try:
+        return json.loads(value or '')
+    except Exception:
+        return default
+
+
+def device_id(value: Any) -> str:
+    result = str(value or '').strip().upper()
+    if not DEVICE_RE.fullmatch(result):
+        raise ValueError('invalid device_id')
+    return result
+
+
+def request_id(value: Any) -> str:
+    result = str(value or '').strip()
+    if not REQUEST_RE.fullmatch(result):
+        raise ValueError('invalid request_id')
+    return result
+
+
+def telemetry_latest() -> dict[str, Any]:
+    with connect_db() as db:
+        rows = db.execute('SELECT device_id,received_at,sent_at,boot_id,sequence,payload_json FROM telemetry_latest').fetchall()
+    out: dict[str, Any] = {}
+    for row in rows:
+        payload = decode(row['payload_json'], {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload = dict(payload)
+        payload['device_id'] = row['device_id']
+        payload['received_at'] = row['received_at']
+        payload['sent_at'] = row['sent_at']
+        payload['boot_id'] = row['boot_id']
+        payload['sequence'] = row['sequence']
+        out[str(row['device_id'])] = payload
+    return out
+
+
+def sudo_rows(include_resolved: bool = False) -> list[dict[str, Any]]:
+    now = time.time()
+    with connect_db() as db:
+        query = 'SELECT * FROM sudo_requests'
+        if not include_resolved:
+            query += " WHERE state='pending'"
+        query += ' ORDER BY requested_at DESC LIMIT 256'
+        rows = db.execute(query).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        detail = decode(item.pop('detail_json', '{}'), {})
+        if isinstance(detail, dict):
+            item.update(detail)
+        expires = item.get('expires_at')
+        if item.get('state') == 'pending' and expires is not None and float(expires) < now:
+            item['state'] = 'expired'
+        result.append(item)
+    return result
+
+
+def activity_rows(limit: int = 200) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), 500))
+    with connect_db() as db:
+        rows = db.execute(
+            'SELECT id,device_id,kind,severity,created_at,detail_json FROM audit_events ORDER BY created_at DESC LIMIT ?',
+            (limit,),
+        ).fetchall()
+        warning_rows = db.execute(
+            'SELECT warning_id,device_id,state,detail,last_seen FROM warnings ORDER BY last_seen DESC LIMIT ?',
+            (min(limit, 100),),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        detail = decode(row['detail_json'], {})
+        if not isinstance(detail, dict):
+            detail = {'detail': str(detail)}
+        message = str(detail.get('message') or detail.get('detail') or detail.get('event') or row['kind'])
+        out.append({
+            'id': f"audit-{row['id']}",
+            'deviceId': row['device_id'],
+            'kind': str(row['kind']),
+            'severity': str(row['severity'] or 'info'),
+            'at': float(row['created_at']),
+            'message': message,
+            'actor': detail.get('actor') or detail.get('approved_by') or detail.get('denied_by'),
+            'detail': detail,
+        })
+    for row in warning_rows:
+        out.append({
+            'id': f"warning-{row['warning_id']}-{row['state']}",
+            'deviceId': row['device_id'],
+            'kind': 'warning',
+            'severity': 'warning',
+            'at': float(row['last_seen']),
+            'message': str(row['detail'] or row['state']),
+            'actor': None,
+        })
+    out.sort(key=lambda item: float(item.get('at') or 0), reverse=True)
+    return out[:limit]
+
+
+def controller_status() -> dict[str, Any]:
+    units = [
+        'lghs-fleet-api.service', 'lghs-rollout-manager.service',
+        'lghs-bt-provision.service', 'lghs-fleet-web.service',
+        'lghs-fleet-web-cloudflared.service', 'cloudflared.service',
+        'lghs-update.timer', 'lghs-reconcile.timer',
+    ]
+    states: dict[str, str] = {}
+    for unit in units:
+        proc = subprocess.run(['systemctl', 'is-active', unit], text=True, capture_output=True, timeout=3)
+        states[unit] = (proc.stdout or '').strip() or 'unknown'
+    report: dict[str, Any] = {}
+    try:
+        proc = subprocess.run(['/usr/local/sbin/lghs-report', 'summary'], text=True, capture_output=True, timeout=8)
+        for line in (proc.stdout or '').splitlines():
+            if '=' in line:
+                key, value = line.split('=', 1)
+                report[key.strip()] = value.strip()
+    except Exception:
+        pass
+    return {'services': states, 'report': report}
+
+
+def discover_device(did: str) -> dict[str, Any]:
+    mod = load_base()
+    rows = mod.discover_devices()
+    try:
+        rows = mod.refresh_fleet(rows)
+    except Exception:
+        pass
+    for row in rows:
+        candidate = str(row.get('device_id') or row.get('hostname') or row.get('name') or '').upper()
+        if candidate == did:
+            return row
+    raise ValueError(f'device not reachable through Fleet transport: {did}')
+
+
+def ssh_fixed(did: str, command: str) -> dict[str, Any]:
+    row = discover_device(did)
+    addr = row.get('addr') or row.get('host') or row.get('hostname')
+    if not addr:
+        raise ValueError('device has no transport address')
+    mod = load_base()
+    proc = mod.ssh_capture(addr, command)
+    return {
+        'returncode': int(proc.returncode),
+        'stdout': (proc.stdout or '')[-32768:],
+        'stderr': (proc.stderr or '')[-32768:],
+    }
+
+
+def queue_action(did: str, action: str) -> dict[str, Any]:
+    if action == 'lghs-update':
+        argv = [COMMAND, 'enqueue', did, 'lghs-update']
+    elif action == 'os-update':
+        argv = [COMMAND, 'enqueue', did, 'os-update']
+    elif action == 'reboot':
+        payload = json.dumps({'schedule_id': f'web-{uuid.uuid4().hex[:16]}', 'reason': 'Requested from LGHS Fleet web console'}, separators=(',', ':'))
+        argv = [COMMAND, 'enqueue', did, 'reboot', '--payload-json', payload]
+    elif action == 'check':
+        return ssh_fixed(did, 'sudo -n /usr/local/sbin/lghs-check')
+    elif action == 'enforce':
+        return ssh_fixed(did, 'sudo -n /usr/local/sbin/lghs-enforce && sudo -n /usr/local/sbin/lghs-check')
+    elif action == 'logs':
+        return ssh_fixed(did, 'sudo -n /usr/local/sbin/lghs-report logs all')
+    else:
+        raise ValueError('unsupported device action')
+    proc = subprocess.run(argv, text=True, capture_output=True, timeout=15)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or 'queue failed').strip()[-1000:])
+    return {'commandId': (proc.stdout or '').strip(), 'queued': True}
+
+
+def sudo_decision(did: str, rid: str, decision: str, actor: str) -> dict[str, Any]:
+    if decision not in {'approve', 'deny'}:
+        raise ValueError('invalid sudo decision')
+    result = ssh_fixed(did, f"sudo -n env LGHS_WEB_ACTOR={json.dumps(actor)} /usr/local/sbin/lghs-sudo-admin {decision} {rid}")
+    if result['returncode'] != 0:
+        raise RuntimeError(result['stderr'] or result['stdout'] or 'sudo decision failed')
+    # Record the web identity in the controller audit stream as an immutable
+    # companion event even on older student images that only log the SSH actor.
+    with connect_db() as db:
+        db.execute(
+            'INSERT INTO audit_events(device_id,kind,severity,created_at,detail_json) VALUES(?,?,?,?,?)',
+            (did, 'sudo-web-decision', 'info', time.time(), json.dumps({'request_id': rid, 'decision': decision, 'actor': actor}, separators=(',', ':'))),
+        )
+        db.commit()
+    return result
+
+
+def acknowledge_warning(wid: str, actor: str) -> dict[str, Any]:
+    with connect_db() as db:
+        row = db.execute('SELECT state FROM warnings WHERE warning_id=?', (wid,)).fetchone()
+        if not row:
+            raise ValueError('warning not found')
+        now = time.time()
+        if row['state'] == 'new':
+            db.execute("UPDATE warnings SET state='acknowledged',acknowledged_at=? WHERE warning_id=?", (now, wid))
+            db.execute('INSERT INTO warning_events(warning_id,state,detail,created_at) VALUES(?,?,?,?)', (wid, 'acknowledged', f'Acknowledged from web by {actor}', now))
+        db.commit()
+    return {'warningId': wid, 'acknowledged': True}
+
+
+def create_group(name: str, description: str, actor: str) -> dict[str, Any]:
+    clean = str(name or '').strip()
+    if not clean or len(clean) > 128:
+        raise ValueError('invalid group name')
+    gid = 'grp-' + uuid.uuid4().hex[:12]
+    now = time.time()
+    with connect_db() as db:
+        db.execute('INSERT INTO fleet_groups(group_id,name,description,created_at,updated_at) VALUES(?,?,?,?,?)', (gid, clean, str(description or '')[:500], now, now))
+        db.execute('INSERT INTO audit_events(kind,severity,created_at,detail_json) VALUES(?,?,?,?)', ('group-created', 'info', now, json.dumps({'group_id': gid, 'name': clean, 'actor': actor}, separators=(',', ':'))))
+        db.commit()
+    return {'groupId': gid, 'name': clean}
+
+
+def group_membership(did: str, gid: str, add: bool, actor: str) -> dict[str, Any]:
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', gid):
+        raise ValueError('invalid group_id')
+    now = time.time()
+    with connect_db() as db:
+        if add:
+            db.execute('INSERT OR IGNORE INTO group_members(group_id,device_id,created_at) VALUES(?,?,?)', (gid, did, now))
+        else:
+            db.execute('DELETE FROM group_members WHERE group_id=? AND device_id=?', (gid, did))
+        db.execute('INSERT INTO audit_events(device_id,kind,severity,created_at,detail_json) VALUES(?,?,?,?,?)', (did, 'group-membership', 'info', now, json.dumps({'group_id': gid, 'action': 'add' if add else 'remove', 'actor': actor}, separators=(',', ':'))))
+        db.commit()
+    return {'deviceId': did, 'groupId': gid, 'member': add}
+
+
+def settings_get() -> dict[str, Any]:
+    with connect_db() as db:
+        rows = db.execute('SELECT key,value_json,updated_at FROM settings ORDER BY key').fetchall()
+    return {str(row['key']): {'value': decode(row['value_json'], None), 'updatedAt': row['updated_at']} for row in rows}
+
+
+def settings_set(key: str, value: Any, actor: str) -> dict[str, Any]:
+    clean = str(key or '').strip()
+    allowed = {
+        'web.health_thresholds', 'web.telemetry_retention', 'web.update_defaults',
+        'web.controller_defaults',
+    }
+    if clean not in allowed:
+        raise ValueError('setting is not web-editable')
+    now = time.time()
+    raw = json.dumps(value, separators=(',', ':'), sort_keys=True)
+    if len(raw) > 8192:
+        raise ValueError('setting too large')
+    with connect_db() as db:
+        db.execute('INSERT INTO settings(key,value_json,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at', (clean, raw, now))
+        db.execute('INSERT INTO audit_events(kind,severity,created_at,detail_json) VALUES(?,?,?,?)', ('setting-changed', 'info', now, json.dumps({'key': clean, 'actor': actor}, separators=(',', ':'))))
+        db.commit()
+    return {'key': clean, 'value': value, 'updatedAt': now}
+
+
+def handle(req: dict[str, Any]) -> dict[str, Any]:
+    op = str(req.get('op') or '')
+    actor = str(req.get('actor') or 'unknown')[:320]
+    if op == 'telemetry-latest':
+        return {'ok': True, 'devices': telemetry_latest()}
+    if op == 'activity':
+        return {'ok': True, 'activity': activity_rows(int(req.get('limit') or 200))}
+    if op == 'sudo-list':
+        return {'ok': True, 'requests': sudo_rows(bool(req.get('include_resolved')))}
+    if op == 'controller-status':
+        return {'ok': True, 'controller': controller_status()}
+    if op == 'sudo-decision':
+        return {'ok': True, 'result': sudo_decision(device_id(req.get('device_id')), request_id(req.get('request_id')), str(req.get('decision') or ''), actor)}
+    if op == 'device-action':
+        action = str(req.get('action') or '')
+        if action not in ALLOWED_ACTIONS:
+            raise ValueError('unsupported device action')
+        return {'ok': True, 'result': queue_action(device_id(req.get('device_id')), action)}
+    if op == 'alert-ack':
+        return {'ok': True, 'result': acknowledge_warning(request_id(req.get('warning_id')), actor)}
+    if op == 'group-create':
+        return {'ok': True, 'result': create_group(str(req.get('name') or ''), str(req.get('description') or ''), actor)}
+    if op == 'group-member':
+        return {'ok': True, 'result': group_membership(device_id(req.get('device_id')), str(req.get('group_id') or ''), bool(req.get('add')), actor)}
+    if op == 'settings-get':
+        return {'ok': True, 'settings': settings_get()}
+    if op == 'settings-set':
+        return {'ok': True, 'result': settings_set(str(req.get('key') or ''), req.get('value'), actor)}
+    raise ValueError('unsupported operation')
+
+
+def send(client: socket.socket, value: dict[str, Any]) -> None:
+    client.sendall((json.dumps(value, separators=(',', ':')) + '\n').encode())
+
+
+def serve_client(client: socket.socket) -> None:
+    raw = b''
+    while b'\n' not in raw and len(raw) < MAX_REQUEST:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        raw += chunk
+    try:
+        req = json.loads(raw.split(b'\n', 1)[0])
+        if not isinstance(req, dict):
+            raise ValueError('request must be an object')
+        send(client, handle(req))
+    except Exception as exc:
+        send(client, {'ok': False, 'error': str(exc)[-1000:]})
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit('lghs-web-ops must run as root')
+    SOCK.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        SOCK.unlink()
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(SOCK))
+    os.chown(SOCK, 0, grp.getgrnam('lghs-web').gr_gid)
+    os.chmod(SOCK, 0o660)
+    server.listen(32)
+    while True:
+        client, _ = server.accept()
+        try:
+            serve_client(client)
+        finally:
+            client.close()
+
+
+if __name__ == '__main__':
+    main()
