@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,10 +22,10 @@ Role = Literal['owner', 'operator', 'viewer']
 ROLE_RANK: dict[Role, int] = {'viewer': 10, 'operator': 20, 'owner': 30}
 
 FLEET_API = os.environ.get('LGHS_WEB_FLEET_API', 'http://127.0.0.1:8789').rstrip('/')
-TOKEN_FILE = Path(os.environ.get('LGHS_WEB_FLEET_TOKEN_FILE', '/etc/lghs/fleet-api-tokens.json'))
-CACHE_FILE = Path(os.environ.get('LGHS_WEB_FLEET_CACHE', '/var/lib/lghs/fleet-cache.json'))
-ROLE_FILE = Path(os.environ.get('LGHS_WEB_ROLE_FILE', '/etc/lghs/web-roles.json'))
-CSRF_FILE = Path(os.environ.get('LGHS_WEB_CSRF_FILE', '/etc/lghs/web-csrf.key'))
+TOKEN_FILE = Path(os.environ.get('LGHS_WEB_FLEET_TOKEN_FILE', '/etc/lghs-web/fleet-admin-token.json'))
+ROLE_FILE = Path(os.environ.get('LGHS_WEB_ROLE_FILE', '/etc/lghs-web/roles.json'))
+CSRF_FILE = Path(os.environ.get('LGHS_WEB_CSRF_FILE', '/etc/lghs-web/csrf.key'))
+OPS_SOCKET = Path(os.environ.get('LGHS_WEB_OPS_SOCKET', '/run/lghs-web-ops/socket'))
 DIST = Path(os.environ.get('LGHS_WEB_DIST', '/usr/local/share/lghs-web-ui'))
 PUBLIC_ORIGIN = os.environ.get('LGHS_WEB_PUBLIC_ORIGIN', 'https://fleet.scenicrouteservers.com').rstrip('/')
 CF_TEAM_DOMAIN = os.environ.get('LGHS_WEB_CF_TEAM_DOMAIN', '').rstrip('/')
@@ -100,7 +101,7 @@ def jwks_client() -> PyJWKClient:
 def verify_access_token(token: str) -> dict[str, Any]:
     try:
         key = jwks_client().get_signing_key_from_jwt(token)
-        claims = jwt.decode(
+        return jwt.decode(
             token,
             key.key,
             algorithms=['RS256'],
@@ -110,7 +111,6 @@ def verify_access_token(token: str) -> dict[str, Any]:
         )
     except Exception as exc:
         raise HTTPException(status_code=401, detail='invalid Cloudflare Access identity') from exc
-    return claims
 
 
 async def current_identity(
@@ -136,8 +136,11 @@ def allow(minimum: Role):
 
 async def fleet_get(path: str) -> dict[str, Any]:
     headers = {'Authorization': f'Bearer {admin_token()}', 'Accept': 'application/json'}
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        response = await client.get(f'{FLEET_API}{path}', headers=headers)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=1.5)) as client:
+            response = await client.get(f'{FLEET_API}{path}', headers=headers)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail='Fleet API is temporarily unavailable') from exc
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail=f'Fleet API returned {response.status_code}')
     try:
@@ -145,6 +148,38 @@ async def fleet_get(path: str) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=502, detail='Fleet API returned invalid JSON') from exc
     return value if isinstance(value, dict) else {}
+
+
+def _ops_call_sync(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = (json.dumps(payload, separators=(',', ':')) + '\n').encode()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(8)
+    try:
+        client.connect(str(OPS_SOCKET))
+        client.sendall(raw)
+        data = b''
+        while b'\n' not in data and len(data) < 1024 * 1024:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        client.close()
+    if not data:
+        raise RuntimeError('Fleet operations broker returned no response')
+    value = json.loads(data.split(b'\n', 1)[0])
+    if not isinstance(value, dict):
+        raise RuntimeError('Fleet operations broker returned invalid data')
+    if not value.get('ok'):
+        raise RuntimeError(str(value.get('error') or 'Fleet operation failed'))
+    return value
+
+
+async def ops_call(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(_ops_call_sync, payload)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def connectivity(age: float | None) -> str:
@@ -164,12 +199,13 @@ def first_group(groups: Any) -> str:
     return str(row)
 
 
-def build_device(row: dict[str, Any], cached: dict[str, Any], now: float) -> dict[str, Any]:
-    metrics = cached.get('metrics', {}) if isinstance(cached.get('metrics'), dict) else {}
-    health = cached.get('health', {}) if isinstance(cached.get('health'), dict) else {}
+def build_device(row: dict[str, Any], live: dict[str, Any], now: float) -> dict[str, Any]:
+    metrics = live.get('metrics', {}) if isinstance(live.get('metrics'), dict) else {}
+    health = live.get('health', {}) if isinstance(live.get('health'), dict) else {}
     inventory = health.get('inventory', {}) if isinstance(health.get('inventory'), dict) else {}
     wifi = metrics.get('wifi', {}) if isinstance(metrics.get('wifi'), dict) else {}
-    received = cached.get('received_at')
+    network = metrics.get('network', {}) if isinstance(metrics.get('network'), dict) else {}
+    received = live.get('received_at') or row.get('last_seen')
     try:
         age = max(0.0, now - float(received)) if received is not None else None
     except (TypeError, ValueError):
@@ -180,12 +216,14 @@ def build_device(row: dict[str, Any], cached: dict[str, Any], now: float) -> dic
         health_state = 'unknown'
     tags = row.get('tags') if isinstance(row.get('tags'), list) else []
     groups = row.get('groups') if isinstance(row.get('groups'), list) else []
+    ipv4 = network.get('ipv4') if isinstance(network.get('ipv4'), list) else []
+    ipv6 = network.get('ipv6') if isinstance(network.get('ipv6'), list) else []
     return {
-        'deviceId': str(row.get('device_id') or cached.get('device_id') or '?'),
+        'deviceId': str(row.get('device_id') or live.get('device_id') or '?'),
         'hostname': str(row.get('hostname') or inventory.get('hostname') or row.get('device_id') or '?'),
         'health': health_state if health_state in {'healthy', 'warning', 'critical', 'maintenance', 'unknown'} else 'unknown',
         'connectivity': state,
-        'version': str(row.get('current_version') or cached.get('version') or row.get('agent_version') or 'unknown'),
+        'version': str(row.get('current_version') or live.get('version') or row.get('agent_version') or 'unknown'),
         'commit': str(row.get('current_commit') or inventory.get('current_commit') or 'unknown'),
         'role': str(row.get('role') or inventory.get('role') or 'student'),
         'group': first_group(groups),
@@ -196,27 +234,42 @@ def build_device(row: dict[str, Any], cached: dict[str, Any], now: float) -> dic
         'memPct': metrics.get('mem_pct'),
         'diskPct': metrics.get('disk_pct'),
         'tempC': metrics.get('temp_c'),
-        'wifiDbm': wifi.get('signal_dbm'),
-        'rxBps': metrics.get('rx_bps'),
-        'txBps': metrics.get('tx_bps'),
-        'uptimeSeconds': cached.get('uptime_seconds'),
+        'load1': metrics.get('load1'),
+        'wifiDbm': network.get('signal_dbm', wifi.get('signal_dbm')),
+        'ssid': network.get('ssid'),
+        'activeInterface': network.get('active_interface') or wifi.get('interface'),
+        'ipv4': [str(x) for x in ipv4],
+        'ipv6': [str(x) for x in ipv6],
+        'gateway': network.get('gateway'),
+        'rxBps': network.get('rx_bps', metrics.get('rx_bps')),
+        'txBps': network.get('tx_bps', metrics.get('tx_bps')),
+        'rxBytes': network.get('rx_bytes', metrics.get('rx_bytes')),
+        'txBytes': network.get('tx_bytes', metrics.get('tx_bytes')),
+        'rxErrors': network.get('rx_errors'),
+        'txErrors': network.get('tx_errors'),
+        'rxDropped': network.get('rx_dropped'),
+        'txDropped': network.get('tx_dropped'),
+        'uptimeSeconds': live.get('uptime_seconds'),
         'lastSeenSeconds': age,
-        'updateState': ((cached.get('lghs_update') or {}).get('state') if isinstance(cached.get('lghs_update'), dict) else None),
+        'bootId': live.get('boot_id'),
+        'sequence': live.get('sequence'),
+        'transport': live.get('transport'),
+        'updateState': ((live.get('lghs_update') or {}).get('state') if isinstance(live.get('lghs_update'), dict) else None),
         'rebootRequired': bool(health.get('reboot_required')),
         'throttled': bool(health.get('throttled_now')),
         'undervoltage': bool(health.get('undervoltage_now')),
     }
 
 
-def build_alerts(cache_devices: dict[str, Any], now: float) -> list[dict[str, Any]]:
+def build_alerts(live_devices: dict[str, Any], now: float) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    for device_id, cached in cache_devices.items():
-        if not isinstance(cached, dict):
+    for device_id, live in live_devices.items():
+        if not isinstance(live, dict):
             continue
-        for warning in cached.get('warnings', []) if isinstance(cached.get('warnings'), list) else []:
+        for warning in live.get('warnings', []) if isinstance(live.get('warnings'), list) else []:
             if not isinstance(warning, dict):
                 continue
-            if str(warning.get('state') or 'open').lower() in {'resolved', 'closed'}:
+            if str(warning.get('state') or '').lower() == 'resolved':
                 continue
             seen = warning.get('last_seen') or warning.get('first_seen') or now
             try:
@@ -224,7 +277,7 @@ def build_alerts(cache_devices: dict[str, Any], now: float) -> list[dict[str, An
             except (TypeError, ValueError):
                 age = 0.0
             result.append({
-                'id': str(warning.get('warning_id') or warning.get('id') or f'{device_id}:{warning.get("kind", "warning")}'),
+                'id': str(warning.get('warning_id') or f'{device_id}:{warning.get("kind", "warning")}'),
                 'deviceId': str(warning.get('device_id') or device_id),
                 'severity': str(warning.get('severity') or 'warning').lower(),
                 'kind': str(warning.get('kind') or 'health'),
@@ -233,13 +286,13 @@ def build_alerts(cache_devices: dict[str, Any], now: float) -> list[dict[str, An
                 'observed': None,
                 'expected': None,
                 'ageSeconds': age,
-                'acknowledged': warning.get('acknowledged_at') is not None,
+                'acknowledged': warning.get('acknowledged_at') is not None or str(warning.get('state')) == 'acknowledged',
             })
     return result
 
 
 async def build_deployments(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selected = rows[:8]
+    selected = rows[:12]
 
     async def detail(row: dict[str, Any]) -> dict[str, Any]:
         deployment_id = str(row.get('deployment_id') or '')
@@ -268,12 +321,7 @@ async def build_deployments(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [item for item in await asyncio.gather(*(detail(row) for row in selected)) if item]
 
 
-app = FastAPI(
-    title='LGHS Fleet Web Gateway',
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None,
-)
+app = FastAPI(title='LGHS Fleet Web Gateway', docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS, www_redirect=False)
 
 
@@ -295,7 +343,6 @@ async def security_middleware(request: Request, call_next):
             return middleware_error(503, 'CSRF protection is not configured')
         if not access_token or not supplied or not hmac.compare_digest(supplied, expected):
             return middleware_error(403, 'CSRF validation failed')
-
     response = await call_next(request)
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Referrer-Policy'] = 'no-referrer'
@@ -322,35 +369,103 @@ async def healthz():
 
 @app.get('/api/v1/session')
 async def session(identity: Identity = Depends(allow('viewer'))):
-    return {
-        'authenticated': True,
-        'email': identity.email,
-        'role': identity.role,
-        'csrfToken': csrf_token(identity.access_token),
-    }
+    return {'authenticated': True, 'email': identity.email, 'role': identity.role, 'csrfToken': csrf_token(identity.access_token)}
+
+
+_last_overview: dict[str, Any] | None = None
+_last_overview_at = 0.0
 
 
 @app.get('/api/v1/overview')
 async def overview(_identity: Identity = Depends(allow('viewer'))):
+    global _last_overview, _last_overview_at
     now = time.time()
-    devices_response, deployments_response = await asyncio.gather(
-        fleet_get('/v1/admin/devices'),
-        fleet_get('/v1/admin/deployments'),
-    )
-    admin_devices = devices_response.get('devices', []) if isinstance(devices_response.get('devices'), list) else []
-    deployments = deployments_response.get('deployments', []) if isinstance(deployments_response.get('deployments'), list) else []
-    cache = load_json(CACHE_FILE, {})
-    cache_devices = cache.get('devices', {}) if isinstance(cache, dict) and isinstance(cache.get('devices'), dict) else {}
-    device_rows = [build_device(row, cache_devices.get(str(row.get('device_id')), {}), now) for row in admin_devices if isinstance(row, dict)]
-    return {
-        'devices': device_rows,
-        'alerts': build_alerts(cache_devices, now),
-        'deployments': await build_deployments([row for row in deployments if isinstance(row, dict)]),
-        'activity': [],
-        'generatedAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now)),
-    }
+    try:
+        devices_response, deployments_response, live, controller = await asyncio.gather(
+            fleet_get('/v1/admin/devices'), fleet_get('/v1/admin/deployments'),
+            ops_call({'op': 'live-state'}), ops_call({'op': 'controller-status'}),
+        )
+        admin_devices = devices_response.get('devices', []) if isinstance(devices_response.get('devices'), list) else []
+        deployments = deployments_response.get('deployments', []) if isinstance(deployments_response.get('deployments'), list) else []
+        live_devices = live.get('devices', {}) if isinstance(live.get('devices'), dict) else {}
+        activity = live.get('activity', []) if isinstance(live.get('activity'), list) else []
+        normalized_activity = []
+        for item in activity:
+            if not isinstance(item, dict):
+                continue
+            normalized_activity.append({
+                **item,
+                'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(float(item.get('at') or now))),
+                'severity': str(item.get('severity') or 'info') if str(item.get('severity') or 'info') in {'info', 'warning', 'critical'} else 'info',
+            })
+        value = {
+            'devices': [build_device(row, live_devices.get(str(row.get('device_id')), {}), now) for row in admin_devices if isinstance(row, dict)],
+            'alerts': build_alerts(live_devices, now),
+            'deployments': await build_deployments([row for row in deployments if isinstance(row, dict)]),
+            'activity': normalized_activity,
+            'sudoRequests': live.get('sudo', []),
+            'settings': live.get('settings', {}),
+            'controller': controller.get('controller', {}),
+            'generatedAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now)),
+            'degraded': False,
+        }
+        _last_overview, _last_overview_at = value, now
+        return value
+    except HTTPException:
+        if _last_overview is not None and now - _last_overview_at <= 120:
+            return {**_last_overview, 'degraded': True, 'generatedAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))}
+        raise
 
 
-# FastAPI's frontend helper serves an already-built Vite application and falls
-# back to index.html for client-side routes. API routes above take precedence.
+@app.get('/api/v1/sudo')
+async def sudo_list(_identity: Identity = Depends(allow('viewer'))):
+    live = await ops_call({'op': 'live-state'})
+    return {'requests': live.get('sudo', [])}
+
+
+@app.post('/api/v1/sudo/{request_id}/{decision}')
+async def sudo_decide(request_id: str, decision: str, identity: Identity = Depends(allow('operator'))):
+    if decision not in {'approve', 'deny'}:
+        raise HTTPException(status_code=400, detail='decision must be approve or deny')
+    live = await ops_call({'op': 'live-state'})
+    rows = live.get('sudo', []) if isinstance(live.get('sudo'), list) else []
+    match = next((row for row in rows if isinstance(row, dict) and str(row.get('request_id') or row.get('id')) == request_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail='sudo request not found')
+    device_id = str(match.get('device_id') or '')
+    return await ops_call({'op': 'sudo-decision', 'device_id': device_id, 'request_id': request_id, 'decision': decision, 'actor': identity.email})
+
+
+@app.post('/api/v1/devices/{device_id}/actions/{action}')
+async def device_action(device_id: str, action: str, identity: Identity = Depends(allow('operator'))):
+    return await ops_call({'op': 'device-action', 'device_id': device_id, 'action': action, 'actor': identity.email})
+
+
+@app.post('/api/v1/alerts/{warning_id}/ack')
+async def alert_ack(warning_id: str, identity: Identity = Depends(allow('operator'))):
+    return await ops_call({'op': 'alert-ack', 'warning_id': warning_id, 'actor': identity.email})
+
+
+@app.post('/api/v1/groups')
+async def group_create(request: Request, identity: Identity = Depends(allow('operator'))):
+    body = await request.json()
+    return await ops_call({'op': 'group-create', 'name': body.get('name'), 'description': body.get('description'), 'actor': identity.email})
+
+
+@app.post('/api/v1/groups/{group_id}/members/{device_id}')
+async def group_add(group_id: str, device_id: str, identity: Identity = Depends(allow('operator'))):
+    return await ops_call({'op': 'group-member', 'group_id': group_id, 'device_id': device_id, 'add': True, 'actor': identity.email})
+
+
+@app.delete('/api/v1/groups/{group_id}/members/{device_id}')
+async def group_remove(group_id: str, device_id: str, identity: Identity = Depends(allow('operator'))):
+    return await ops_call({'op': 'group-member', 'group_id': group_id, 'device_id': device_id, 'add': False, 'actor': identity.email})
+
+
+@app.put('/api/v1/settings/{key:path}')
+async def setting_set(key: str, request: Request, identity: Identity = Depends(allow('owner'))):
+    body = await request.json()
+    return await ops_call({'op': 'settings-set', 'key': key, 'value': body.get('value'), 'actor': identity.email})
+
+
 app.frontend('/', directory=str(DIST), fallback='index.html', check_dir=False)
