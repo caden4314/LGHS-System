@@ -6,23 +6,53 @@ set -euo pipefail
 CLOUDFLARED=/usr/local/bin/cloudflared
 TOKEN_FILE=/etc/cloudflared/token
 SERVICE_FILE=/etc/systemd/system/lghs-cloudflared.service
+CLOUDFLARED_VERSION="${LGHS_CLOUDFLARED_VERSION:-2026.8.1}"
 
 install_cloudflared() {
   if [[ -x "$CLOUDFLARED" ]]; then
     return 0
   fi
-  local arch url tmp
+
+  local arch asset expected url tmp actual
   arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
   case "$arch" in
-    arm64|aarch64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
-    amd64|x86_64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+    arm64|aarch64)
+      asset="cloudflared-linux-arm64"
+      expected="6d517efc10dfce17440177bd7011909166eab44bae0f6998182183df717c7dba"
+      ;;
+    amd64|x86_64)
+      asset="cloudflared-linux-amd64"
+      expected="98d8eadbfdf8c7ec994e08260599c9be991e7833c746f98692b18bdf71c9b9dc"
+      ;;
     *) echo "Unsupported architecture for cloudflared: $arch" >&2; exit 2 ;;
   esac
+
+  # Checksums above are the published GitHub asset digests for 2026.8.1.
+  # Refuse arbitrary LGHS_CLOUDFLARED_VERSION overrides unless the caller also
+  # deliberately supplies the expected digest for that artifact.
+  if [[ "$CLOUDFLARED_VERSION" != "2026.8.1" ]]; then
+    expected="${LGHS_CLOUDFLARED_SHA256:-}"
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || {
+      echo "LGHS_CLOUDFLARED_SHA256 is required for cloudflared version overrides" >&2
+      exit 2
+    }
+  fi
+
+  url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/${asset}"
   tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' RETURN
-  curl -fsSL "$url" -o "$tmp"
-  chmod 0755 "$tmp"
+  if ! curl --fail --show-error --location --proto '=https' --tlsv1.2 "$url" -o "$tmp"; then
+    rm -f "$tmp"
+    echo "Failed to download cloudflared ${CLOUDFLARED_VERSION}" >&2
+    exit 1
+  fi
+  actual="$(sha256sum "$tmp" | awk '{print $1}')"
+  if [[ "$actual" != "$expected" ]]; then
+    rm -f "$tmp"
+    echo "cloudflared checksum verification failed" >&2
+    exit 1
+  fi
   install -m 0755 "$tmp" "$CLOUDFLARED"
+  rm -f "$tmp"
 }
 
 if [[ "${1:-}" == "--disable" ]]; then
