@@ -31,6 +31,8 @@ EVENT_POLL = float(os.environ.get('LGHS_AGENT_EVENT_SECONDS', '1'))
 TIMEOUT = 35
 
 LOCK = threading.RLock()
+NETWORK_LOCK = threading.RLock()
+NETWORK_PREVIOUS: dict[str, dict[str, float | int]] = {}
 STOP = threading.Event()
 WAKE = threading.Event()
 ACTIVE_UPDATE_STATES = {
@@ -184,18 +186,178 @@ def wifi_signal() -> dict[str, Any]:
     return {}
 
 
+def run_text(argv: list[str], timeout: float = 2.0) -> str:
+    try:
+        proc = subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+        return (proc.stdout or '').strip() if proc.returncode == 0 else ''
+    except Exception:
+        return ''
+
+
+def default_route() -> dict[str, Any]:
+    text = run_text(['ip', '-j', 'route', 'show', 'default'])
+    if text:
+        try:
+            rows = json.loads(text)
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                row = rows[0]
+                return {
+                    'interface': row.get('dev'),
+                    'gateway': row.get('gateway'),
+                    'source': row.get('prefsrc'),
+                    'metric': row.get('metric'),
+                }
+        except Exception:
+            pass
+    text = run_text(['ip', 'route', 'show', 'default'])
+    if not text:
+        return {}
+    parts = text.split()
+    out: dict[str, Any] = {}
+    for key, token_name in (('gateway', 'via'), ('interface', 'dev'), ('source', 'src'), ('metric', 'metric')):
+        try:
+            value = parts[parts.index(token_name) + 1]
+            out[key] = int(value) if key == 'metric' else value
+        except Exception:
+            pass
+    return out
+
+
+def interface_addresses() -> dict[str, dict[str, Any]]:
+    text = run_text(['ip', '-j', 'address', 'show'])
+    try:
+        rows = json.loads(text) if text else []
+    except Exception:
+        rows = []
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get('ifname') or '')
+        if not name:
+            continue
+        ipv4: list[str] = []
+        ipv6: list[str] = []
+        for address in row.get('addr_info', []):
+            if not isinstance(address, dict) or not address.get('local'):
+                continue
+            if address.get('family') == 'inet':
+                ipv4.append(str(address['local']))
+            elif address.get('family') == 'inet6':
+                ipv6.append(str(address['local']))
+        result[name] = {
+            'state': row.get('operstate'),
+            'mtu': row.get('mtu'),
+            'ipv4': ipv4,
+            'ipv6': ipv6,
+        }
+    return result
+
+
+def interface_counters(interface: str) -> dict[str, int]:
+    base = Path('/sys/class/net') / interface / 'statistics'
+    names = ('rx_bytes', 'tx_bytes', 'rx_packets', 'tx_packets', 'rx_errors', 'tx_errors', 'rx_dropped', 'tx_dropped')
+    result: dict[str, int] = {}
+    for name in names:
+        try:
+            result[name] = int((base / name).read_text().strip())
+        except Exception:
+            result[name] = 0
+    return result
+
+
+def wifi_details(interface: str | None) -> dict[str, Any]:
+    if not interface:
+        return {}
+    result: dict[str, Any] = {'interface': interface}
+    ssid = run_text(['iwgetid', interface, '--raw'])
+    if not ssid:
+        nm = run_text(['nmcli', '-t', '-f', 'GENERAL.CONNECTION', 'device', 'show', interface])
+        if ':' in nm:
+            ssid = nm.split(':', 1)[1]
+    if ssid and ssid != '--':
+        result['ssid'] = ssid.strip()
+    link = run_text(['iw', 'dev', interface, 'link'])
+    if link:
+        for line in link.splitlines():
+            line = line.strip()
+            if line.startswith('signal:'):
+                try:
+                    result['signal_dbm'] = float(line.split(':', 1)[1].strip().split()[0])
+                except Exception:
+                    pass
+            elif line.startswith('rx bitrate:'):
+                result['rx_bitrate'] = line.split(':', 1)[1].strip()
+            elif line.startswith('tx bitrate:'):
+                result['tx_bitrate'] = line.split(':', 1)[1].strip()
+    if 'signal_dbm' not in result:
+        legacy = wifi_signal()
+        if legacy.get('interface') == interface:
+            result.update(legacy)
+    return result
+
+
+def network_metrics() -> dict[str, Any]:
+    now = time.monotonic()
+    route = default_route()
+    interfaces = interface_addresses()
+    active = str(route.get('interface') or '')
+    if not active:
+        for name, row in interfaces.items():
+            if name != 'lo' and row.get('state') == 'UP':
+                active = name
+                break
+    counters = interface_counters(active) if active else {}
+    rx_bps = None
+    tx_bps = None
+    if active:
+        with NETWORK_LOCK:
+            previous = NETWORK_PREVIOUS.get(active)
+            if previous:
+                elapsed = now - float(previous.get('time') or 0)
+                rx_delta = int(counters.get('rx_bytes', 0)) - int(previous.get('rx_bytes') or 0)
+                tx_delta = int(counters.get('tx_bytes', 0)) - int(previous.get('tx_bytes') or 0)
+                if elapsed > 0 and rx_delta >= 0:
+                    rx_bps = round(rx_delta * 8 / elapsed, 1)
+                if elapsed > 0 and tx_delta >= 0:
+                    tx_bps = round(tx_delta * 8 / elapsed, 1)
+            NETWORK_PREVIOUS[active] = {
+                'time': now,
+                'rx_bytes': int(counters.get('rx_bytes', 0)),
+                'tx_bytes': int(counters.get('tx_bytes', 0)),
+            }
+    active_info = interfaces.get(active, {})
+    network: dict[str, Any] = {
+        'active_interface': active or None,
+        'state': active_info.get('state'),
+        'ipv4': active_info.get('ipv4', []),
+        'ipv6': active_info.get('ipv6', []),
+        'gateway': route.get('gateway'),
+        'source': route.get('source'),
+        'metric': route.get('metric'),
+        **counters,
+        'rx_bps': rx_bps,
+        'tx_bps': tx_bps,
+    }
+    wifi = wifi_details(active)
+    if wifi:
+        network.update({
+            'ssid': wifi.get('ssid'),
+            'signal_dbm': wifi.get('signal_dbm'),
+            'rx_bitrate': wifi.get('rx_bitrate'),
+            'tx_bitrate': wifi.get('tx_bitrate'),
+        })
+        network['wifi'] = wifi
+    return network
+
+
 def clock_synced() -> bool:
     return Path('/run/systemd/timesync/synchronized').exists()
 
 
 def failed_systemd_units() -> list[str]:
     try:
-        proc = subprocess.run(
-            ['systemctl', '--failed', '--no-legend', '--plain'],
-            text=True,
-            capture_output=True,
-            timeout=3,
-        )
+        proc = subprocess.run(['systemctl', '--failed', '--no-legend', '--plain'], text=True, capture_output=True, timeout=3)
         rows: list[str] = []
         for line in (proc.stdout or '').splitlines():
             parts = line.split()
@@ -230,7 +392,6 @@ def metrics() -> dict[str, Any]:
         if ':' in line:
             key, value = line.split(':', 1)
             mem[key] = int(value.strip().split()[0]) * 1024
-
     stat = os.statvfs('/')
     total = stat.f_blocks * stat.f_frsize
     free = stat.f_bavail * stat.f_frsize
@@ -241,7 +402,6 @@ def metrics() -> dict[str, Any]:
         temp = round(int(Path('/sys/class/thermal/thermal_zone0/temp').read_text()) / 1000, 1)
     except Exception:
         temp = None
-
     return {
         'cpu_pct': cpu_sample(),
         'mem_pct': round(100 * (mem.get('MemTotal', 1) - mem.get('MemAvailable', 0)) / max(mem.get('MemTotal', 1), 1), 1),
@@ -251,6 +411,7 @@ def metrics() -> dict[str, Any]:
         'temp_c': temp,
         'load1': os.getloadavg()[0],
         'wifi': wifi_signal(),
+        'network': network_metrics(),
     }
 
 
@@ -262,42 +423,25 @@ def executor_status() -> dict[str, Any]:
 
 
 def health_check(check_id: str, state: str, severity: str, observed: Any, expected: Any, remediation: str = '') -> dict[str, Any]:
-    return {
-        'id': check_id,
-        'state': state,
-        'severity': severity,
-        'observed': observed,
-        'expected': expected,
-        'remediation': remediation,
-    }
+    return {'id': check_id, 'state': state, 'severity': severity, 'observed': observed, 'expected': expected, 'remediation': remediation}
 
 
 def structured_health(status: dict[str, Any], sample: dict[str, Any]) -> dict[str, Any]:
     raw = dict(status.get('health') or {})
     services = dict(status.get('services') or {})
     checks: list[dict[str, Any]] = []
-    critical = {
-        'NetworkManager.service', 'ssh.service', 'lghs-policy.service',
-        'lghs-agent.service', 'lghs-command-executor.service',
-    }
+    critical = {'NetworkManager.service', 'ssh.service', 'lghs-policy.service', 'lghs-agent.service', 'lghs-command-executor.service'}
     for unit, observed in sorted(services.items()):
-        checks.append(health_check(
-            'service.' + unit.removesuffix('.service').removesuffix('.timer'),
-            'pass' if observed == 'active' else 'fail',
-            'critical' if unit in critical else 'warning',
-            observed, 'active', 'restart:' + unit,
-        ))
-
+        checks.append(health_check('service.' + unit.removesuffix('.service').removesuffix('.timer'), 'pass' if observed == 'active' else 'fail', 'critical' if unit in critical else 'warning', observed, 'active', 'restart:' + unit))
     temp = sample.get('temp_c')
     disk = sample.get('disk_pct')
     inode = sample.get('inode_pct')
     memory = sample.get('mem_pct')
-    wifi = sample.get('wifi', {}) if isinstance(sample.get('wifi'), dict) else {}
-    signal = wifi.get('signal_dbm')
+    network = sample.get('network', {}) if isinstance(sample.get('network'), dict) else {}
+    signal = network.get('signal_dbm')
     root_readonly = bool(sample.get('root_readonly'))
     failed_units = failed_systemd_units()
     transport = controller_transport_state()
-
     checks.append(health_check('hardware.temperature', 'pass' if not isinstance(temp, (int, float)) or temp < 75 else 'fail', 'critical' if isinstance(temp, (int, float)) and temp >= 85 else 'warning', temp, '<75 C', 'inspect:cooling'))
     checks.append(health_check('memory.pressure', 'pass' if not isinstance(memory, (int, float)) or memory < 92 else 'fail', 'critical' if isinstance(memory, (int, float)) and memory >= 98 else 'warning', memory, '<92%', 'inspect:memory'))
     checks.append(health_check('storage.root', 'pass' if not isinstance(disk, (int, float)) or disk < 90 else 'fail', 'critical' if isinstance(disk, (int, float)) and disk >= 97 else 'warning', disk, '<90%', 'cleanup:disk'))
@@ -305,7 +449,6 @@ def structured_health(status: dict[str, Any], sample: dict[str, Any]) -> dict[st
     checks.append(health_check('storage.inodes', 'pass' if not isinstance(inode, (int, float)) or inode < 90 else 'fail', 'warning', inode, '<90%', 'cleanup:inodes'))
     synced = clock_synced()
     checks.append(health_check('clock.synchronized', 'pass' if synced else 'fail', 'warning', synced, True, 'restart:time-sync'))
-
     undervoltage_now = bool(raw.get('undervoltage_now'))
     undervoltage_history = bool(raw.get('undervoltage_occurred')) and not undervoltage_now
     throttled_now = bool(raw.get('throttled_now'))
@@ -384,13 +527,7 @@ def audit_batches() -> list[dict[str, Any]]:
             except Exception:
                 continue
         if chunk.get('text'):
-            batches.append({
-                'kind': kind,
-                'inode': int(chunk.get('inode') or 0),
-                'offset': int(chunk.get('offset') or 0),
-                'next_offset': int(chunk.get('next_offset') or 0),
-                'text': chunk.get('text', ''),
-            })
+            batches.append({'kind': kind, 'inode': int(chunk.get('inode') or 0), 'offset': int(chunk.get('offset') or 0), 'next_offset': int(chunk.get('next_offset') or 0), 'text': chunk.get('text', '')})
     return batches
 
 
@@ -402,10 +539,7 @@ def apply_audit_ack(acks: Any) -> None:
         for kind, ack in acks.items():
             if kind not in AUDIT_KINDS or not isinstance(ack, dict):
                 continue
-            state[kind] = {
-                'inode': int(ack.get('inode') or 0),
-                'offset': int(ack.get('next_offset') or 0),
-            }
+            state[kind] = {'inode': int(ack.get('inode') or 0), 'offset': int(ack.get('next_offset') or 0)}
         save()
 
 
@@ -423,30 +557,14 @@ def envelope() -> dict[str, Any]:
         'audit_batches': audit_batches(),
         'version': version(),
         'uptime_seconds': time.clock_gettime(time.CLOCK_BOOTTIME),
+        'transport': controller_transport_state(),
     }
-    return {
-        'protocol': 1,
-        'agent_version': version(),
-        'device_id': device(),
-        'boot_id': boot_id(),
-        'sequence': next_sequence(),
-        'sent_at': time.time(),
-        'payload': payload,
-    }
+    return {'protocol': 1, 'agent_version': version(), 'device_id': device(), 'boot_id': boot_id(), 'sequence': next_sequence(), 'sent_at': time.time(), 'payload': payload}
 
 
 def request(url: str, method: str = 'GET', body: dict[str, Any] | None = None) -> dict[str, Any]:
     data = None if body is None else json.dumps(body, separators=(',', ':')).encode()
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={
-            'Authorization': 'Bearer ' + token(),
-            'Content-Type': 'application/json',
-            'User-Agent': 'LGHS-Agent/0.6',
-        },
-    )
+    req = urllib.request.Request(url, data=data, method=method, headers={'Authorization': 'Bearer ' + token(), 'Content-Type': 'application/json', 'User-Agent': 'LGHS-Agent/0.6'})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
         return json.loads(response.read().decode() or '{}')
 
@@ -465,16 +583,7 @@ def accept(commands: Any) -> None:
             if row and row.get('state') != 'received':
                 continue
             if row is None:
-                row = {
-                    'id': command_id,
-                    'action': command['action'],
-                    'state': 'received',
-                    'received_at': time.time(),
-                    'updated_at': time.time(),
-                    'stage': 'Received',
-                    'message': 'Command received over HTTPS',
-                    'progress': 0,
-                }
+                row = {'id': command_id, 'action': command['action'], 'state': 'received', 'received_at': time.time(), 'updated_at': time.time(), 'stage': 'Received', 'message': 'Command received over HTTPS', 'progress': 0}
                 STATE_DATA['commands'].append(row)
                 by_id[command_id] = row
                 save()
@@ -530,7 +639,6 @@ def longpoll() -> None:
 
 
 def sudo_event_watcher() -> None:
-    """Wake telemetry immediately when the privileged sudo snapshot changes."""
     previous = ''
     while not STOP.is_set():
         try:
