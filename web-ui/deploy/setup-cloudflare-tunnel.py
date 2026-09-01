@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import grp
 import json
 import os
 import pwd
-import grp
 import shutil
 import subprocess
 import sys
@@ -62,14 +62,28 @@ def api(token: str, method: str, path: str, body=None):
 
 def ensure_user() -> tuple[int, int]:
     try:
+        group = grp.getgrnam(SERVICE_USER)
+    except KeyError:
+        subprocess.run(["groupadd", "--system", SERVICE_USER], check=True)
+        group = grp.getgrnam(SERVICE_USER)
+
+    try:
         account = pwd.getpwnam(SERVICE_USER)
     except KeyError:
         subprocess.run(
-            ["useradd", "--system", "--no-create-home", "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", SERVICE_USER],
+            [
+                "useradd",
+                "--system",
+                "--gid", SERVICE_USER,
+                "--no-create-home",
+                "--home-dir", "/nonexistent",
+                "--shell", "/usr/sbin/nologin",
+                SERVICE_USER,
+            ],
             check=True,
         )
         account = pwd.getpwnam(SERVICE_USER)
-    return account.pw_uid, grp.getgrnam(SERVICE_USER).gr_gid
+    return account.pw_uid, group.gr_gid
 
 
 def atomic_secret(path: Path, value: str, uid: int, gid: int) -> None:
