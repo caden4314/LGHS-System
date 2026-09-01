@@ -12,6 +12,7 @@ on:
       - 'student/lghs-firstboot-provision'
       - 'controller/lghs-bt-provision'
       - 'controller/lghs-cloudflare-provision'
+      - 'controller/lghs-cloudflare-token-check'
       - 'systemd/lghs-bt-*'
       - 'systemd/lghs-firstboot-provision.service'
       - 'tests/test_bt_bootstrap.py'
@@ -36,11 +37,13 @@ jobs:
             bluetooth/lghs_bt_protocol.py \
             student/lghs-bt-bootstrap \
             controller/lghs-bt-provision \
-            controller/lghs-cloudflare-provision
+            controller/lghs-cloudflare-provision \
+            controller/lghs-cloudflare-token-check
       - name: Validate shell bootstrap components
         run: |
           bash -n student/lghs-cloudflare-install
           bash -n student/lghs-firstboot-provision
+          bash -n bluetooth/install-live-test.sh
       - name: Run Bluetooth protocol and lifecycle tests
         run: python -m unittest -v tests.test_bt_bootstrap
 
@@ -60,10 +63,10 @@ jobs:
             "$OUT/controller" \
             "$OUT/systemd" \
             "$OUT/tests"
-          cp bluetooth/lghs_bt_protocol.py bluetooth/HARDWARE-TESTING.md "$OUT/bluetooth/"
+          cp bluetooth/lghs_bt_protocol.py bluetooth/HARDWARE-TESTING.md bluetooth/install-live-test.sh "$OUT/bluetooth/"
           cp student/lghs-bt-bootstrap student/lghs-cloudflare-install student/lghs-firstboot-provision "$OUT/student/"
-          cp controller/lghs-bt-provision controller/lghs-cloudflare-provision "$OUT/controller/"
-          cp systemd/lghs-bt-bootstrap.service systemd/lghs-bt-prepare.service systemd/lghs-firstboot-provision.service "$OUT/systemd/"
+          cp controller/lghs-bt-provision controller/lghs-cloudflare-provision controller/lghs-cloudflare-token-check "$OUT/controller/"
+          cp systemd/lghs-bt-bootstrap.service systemd/lghs-bt-prepare.service systemd/lghs-bt-provision.service systemd/lghs-firstboot-provision.service "$OUT/systemd/"
           cp tests/test_bt_bootstrap.py "$OUT/tests/"
           cat > "$OUT/BUILD-METADATA.txt" <<EOF
           LGHS Bluetooth zero-touch pre-release hardware test kit
@@ -73,6 +76,7 @@ jobs:
           built_utc=$(date -u +%FT%TZ)
           validation=crypto+python-compile+shell-syntax+lifecycle-invariants
           authorized_hardware=LGCSCONT+CS-999
+          tomorrow_first_fresh_flash=CS-01
           EOF
           find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
       - name: Upload validated Bluetooth test kit
