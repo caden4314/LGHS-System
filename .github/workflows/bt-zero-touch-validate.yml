@@ -1,0 +1,45 @@
+name: Bluetooth Zero-Touch Validate
+
+on:
+  push:
+    branches:
+      - feature/bt-zero-touch-hardening
+  pull_request:
+    paths:
+      - 'bluetooth/**'
+      - 'student/lghs-bt-*'
+      - 'student/lghs-cloudflare-install'
+      - 'student/lghs-firstboot-provision'
+      - 'controller/lghs-bt-provision'
+      - 'controller/lghs-cloudflare-provision'
+      - 'systemd/lghs-bt-*'
+      - 'systemd/lghs-firstboot-provision.service'
+      - 'tests/test_bt_bootstrap.py'
+      - '.github/workflows/bt-zero-touch-validate.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install protocol dependency
+        run: python -m pip install --disable-pip-version-check 'cryptography>=45,<47'
+      - name: Compile Python bootstrap components
+        run: |
+          python -m py_compile \
+            bluetooth/lghs_bt_protocol.py \
+            student/lghs-bt-bootstrap \
+            controller/lghs-bt-provision \
+            controller/lghs-cloudflare-provision
+      - name: Validate shell bootstrap components
+        run: |
+          bash -n student/lghs-cloudflare-install
+          bash -n student/lghs-firstboot-provision
+      - name: Run Bluetooth protocol and lifecycle tests
+        run: python -m unittest -v tests.test_bt_bootstrap
