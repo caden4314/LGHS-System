@@ -1,0 +1,71 @@
+html[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+  --surface-3: #e8ebef;
+  --border: #d9dee5;
+  --border-strong: #c5ccd5;
+  --text: #1b2027;
+  --text-2: #4f5966;
+  --text-3: #707b88;
+  --accent: #245db5;
+  --accent-strong: #17498f;
+  --success: #287a44;
+  --success-bg: #edf8f0;
+  --warning: #8a621e;
+  --warning-bg: #fff7e8;
+  --critical: #b33b47;
+  --critical-bg: #fff0f1;
+  --info: #245db5;
+  --focus: #155fc3;
+  --shadow-dialog: 0 18px 60px rgb(30 38 48 / 0.18);
+  --signal-quiet: rgb(36 93 181 / 0.15);
+  --signal-line: rgb(36 93 181 / 0.11);
+  --signal-warm: rgb(138 98 30 / 0.52);
+}
+
+html[data-theme='light'] body {
+  background: var(--bg);
+}
+
+html[data-theme='light'] .sidebar {
+  background: #fbfcfd;
+}
+
+html[data-theme='light'] .topbar {
+  background: rgb(246 247 249 / 0.94);
+}
+
+html[data-theme='light'] .auth-boundary {
+  background:
+    radial-gradient(circle at 70% 38%, rgb(36 93 181 / 0.09), transparent 38%),
+    var(--bg);
+}
+
+html[data-theme='light'] .auth-art::before {
+  background: linear-gradient(90deg, var(--bg) 0%, rgb(246 247 249 / 0.78) 34%, transparent 68%);
+}
+
+html[data-theme='light'] .auth-panel {
+  background: rgb(255 255 255 / 0.94);
+  box-shadow: var(--shadow-dialog);
+}
+
+html[data-theme='light'] .overview-signal {
+  background: linear-gradient(100deg, var(--surface) 0%, var(--surface) 42%, #eef3fb 100%);
+}
+
+html[data-theme='light'] .button.primary {
+  border-color: #2459a8;
+  background: #2d63b5;
+}
+
+html[data-theme='light'] .button.primary:hover {
+  background: #2459a8;
+}
+
+html[data-theme='light'] ::selection {
+  background: #c9dcfb;
+  color: #14243b;
+}
