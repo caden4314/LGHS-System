@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-COMPLETE=/var/lib/lghs/bootstrap-complete
+BOOTSTRAP_COMPLETE=/var/lib/lghs/bootstrap-complete
+PROVISIONED=/var/lib/lghs/provisioned
 NOTIFIED=/var/lib/lghs/install-success-notified
 
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 [[ -f "$NOTIFIED" ]] && exit 0
 
-# The installer starts this helper before the outer stock-bootstrap wrapper can
-# write bootstrap-complete. Wait for that marker so the message can only mean
-# the entire LGHS installation finished successfully.
+# LGHS has two valid completion paths:
+#  * legacy/install/update bootstrap writes bootstrap-complete
+#  * prebuilt zero-touch images finish lghs-firstboot-provision and write
+#    provisioned. Either means LGHS owns the device and the Raspberry Pi first
+#    run wizard is no longer part of the boot path.
 for _ in $(seq 1 300); do
-    [[ -f "$COMPLETE" ]] && break
+    [[ -f "$BOOTSTRAP_COMPLETE" || -f "$PROVISIONED" ]] && break
     sleep 2
 done
-[[ -f "$COMPLETE" ]] || { echo 'LGHS completion marker not available yet.' >&2; exit 1; }
+[[ -f "$BOOTSTRAP_COMPLETE" || -f "$PROVISIONED" ]] || {
+    echo 'LGHS completion marker not available yet.' >&2
+    exit 1
+}
 
 ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
 VERSION="$(cat /etc/lghs/version 2>/dev/null || echo unknown)"
@@ -39,9 +45,8 @@ mark_system_notified() {
     chmod 0640 "$NOTIFIED"
 }
 
-# The progress window and the panel notification are intentionally independent:
-# the window provides continuous first-boot feedback, while this service emits
-# one passive completion notification after the whole install succeeds.
+# Wait for the actual desktop session. A notification failure is cosmetic and
+# must not trigger an endless systemd restart loop on a classroom device.
 for _ in $(seq 1 150); do
     [[ -S "$BUS" ]] && break
     sleep 2
@@ -53,9 +58,6 @@ DETAIL="LGHS V${VERSION} installed successfully. ${HOST} is ready."
 [[ "$MEMORY" == 4 || "$MEMORY" == 8 ]] && DETAIL="LGHS V${VERSION} installed successfully. ${HOST} (Pi 5 ${MEMORY} GB) is ready."
 MESSAGE="LGHS Setup Complete — All Good: $DETAIL"
 
-# Raspberry Pi OS Trixie/labwc uses wf-panel-pi for native panel notifications.
-# Prefer wfpanelctl because a standard org.freedesktop.Notifications daemon is
-# not guaranteed to exist. notify-send remains a fallback for other desktops.
 DELIVERED=0
 if command -v wfpanelctl >/dev/null 2>&1; then
     if runuser -u "$USER_NAME" -- env \
@@ -78,8 +80,6 @@ if [[ $DELIVERED -eq 0 ]] && command -v notify-send >/dev/null 2>&1; then
 fi
 [[ $DELIVERED -eq 1 ]] || { echo 'No supported desktop notification path succeeded.' >&2; exit 1; }
 
-# Also create the per-user marker used by the XDG progress launcher to avoid
-# reopening the first-boot progress window on later logins.
 runuser -u "$USER_NAME" -- mkdir -p "$USER_STATE"
 runuser -u "$USER_NAME" -- touch "$USER_NOTIFIED"
 mark_system_notified
