@@ -29,9 +29,10 @@ printf '%s\n' "$LGHS_ROLE" > "${ROOTFS_DIR}/etc/lghs/build-role"
 on_chroot <<EOF
 set -e
 # The stock cached rootfs may intentionally contain no SSH host keys. LGHS
-# validates sshd during install, so create temporary build-only keys and remove
-# them on every exit. lghs-firstboot-provision will generate unique host keys
-# on the real Pi before SSH is exposed.
+# validates sshd during install, so create temporary build-only keys and the
+# normal privilege-separation runtime directory, then remove the keys on exit.
+# lghs-firstboot-provision generates unique keys on the real Pi.
+install -d -m 0755 /run/sshd
 rm -f /etc/ssh/ssh_host_*
 ssh-keygen -A
 trap 'rm -f /etc/ssh/ssh_host_*' EXIT
@@ -46,11 +47,21 @@ if [[ "${LGHS_ROLE}" == "student" ]]; then
 fi
 EOF
 
-# Keep the classroom development environment available in both roles.
+# Keep the classroom development environment available in both roles. Avoid a
+# second apt update on fast retries when these packages are already present.
 on_chroot <<'EOF'
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    code python3 python3-pip python3-venv python3-dev pipx git build-essential
+set -e
+DEV_PKGS=(code python3 python3-pip python3-venv python3-dev pipx git build-essential)
+MISSING=()
+for pkg in "${DEV_PKGS[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'ok installed' || MISSING+=("$pkg")
+done
+if (( ${#MISSING[@]} )); then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING[@]}"
+else
+    echo 'LGHS: development packages already present; skipping apt.'
+fi
 /usr/local/sbin/lghs-dev-setup || true
 EOF
 
@@ -69,22 +80,16 @@ systemctl disable userconfig.service >/dev/null 2>&1 || true
 systemctl mask userconfig.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/multi-user.target.wants/userconfig.service
 
-# Cloud-init is useful for generic Pi images but LGHS has its own deterministic
-# first-boot provisioner. Disable it here too so a cached rootfs cannot revive
-# an independent first-boot workflow.
 install -d -m 0755 /etc/cloud
 touch /etc/cloud/cloud-init.disabled
 systemctl disable cloud-init-local.service cloud-init-network.service \
     cloud-config.service cloud-final.service cloud-init.target >/dev/null 2>&1 || true
 
-# Never allow a legacy console-autologin override to win at tty1. LGHS should
-# proceed from its firstboot provisioner directly into the graphical desktop.
 rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf
 rmdir --ignore-fail-on-non-empty /etc/systemd/system/getty@tty1.service.d 2>/dev/null || true
 systemctl set-default graphical.target
 systemctl enable lightdm.service >/dev/null 2>&1 || true
 
-# Re-apply the canonical LGHS desktop policy after stripping the distro wizard.
 /usr/local/sbin/lghs-autologin-apply
 
 echo "LGHS: Raspberry Pi first-run wizard disabled."
@@ -94,7 +99,6 @@ EOF
 # Defense in depth: no SSH host key is allowed to survive image construction.
 rm -f "${ROOTFS_DIR}"/etc/ssh/ssh_host_*
 
-# Ensure no deployment secret accidentally survives image creation.
 rm -f "${ROOTFS_DIR}/etc/lghs/secrets/controller_ed25519" \
       "${ROOTFS_DIR}/etc/lghs/secrets/controller_ed25519.pub" \
       "${ROOTFS_DIR}/etc/lghs/controller_ed25519.pub"
