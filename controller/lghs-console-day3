@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""LGHS Fleet Control v0.6 operations UI layer.
+
+Extends the validated day-2 deployment/recovery console with maintenance-window
+inspection/editing and typed scheduled reboot controls. The day-2 console stays
+installed as a fallback core.
+"""
+from __future__ import annotations
+
+import curses
+import importlib.machinery
+import importlib.util
+import json
+import subprocess
+import time
+from pathlib import Path
+
+BASE = "/usr/local/libexec/lghs-console-day2-core"
+MAINTENANCE_HELPER = Path("/usr/local/sbin/lghs-fleet-maintenance")
+
+
+def load_base():
+    loader = importlib.machinery.SourceFileLoader("lghs_console_day2", BASE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+day2 = load_base()
+ui = day2.ui
+
+
+def clip(text, width):
+    return str(text)[:max(0, width)]
+
+
+def maintenance_call(*args, timeout=10):
+    if not MAINTENANCE_HELPER.exists():
+        raise RuntimeError(f"Missing {MAINTENANCE_HELPER}")
+    proc = subprocess.run([str(MAINTENANCE_HELPER), *map(str, args)], text=True, capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "maintenance command failed").strip()[-1200:])
+    try:
+        return json.loads(proc.stdout or "{}")
+    except Exception as exc:
+        raise RuntimeError("maintenance helper returned invalid JSON") from exc
+
+
+def selected_device(state):
+    devices = state.get("devices", [])
+    index = int(state.get("selected", 0) or 0)
+    if not devices or index < 0 or index >= len(devices):
+        return None
+    return devices[index]
+
+
+def local_timezone():
+    try:
+        value = Path("/etc/timezone").read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return "UTC"
+
+
+def format_epoch(value):
+    try:
+        stamp = float(value)
+    except Exception:
+        return "-"
+    if stamp <= 0:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp))
+
+
+def policy_lines(result):
+    state = result.get("maintenance", result) if isinstance(result, dict) else {}
+    policies = state.get("policies", []) if isinstance(state, dict) else []
+    lines = [
+        f"Device: {state.get('device_id','?')}",
+        f"Managed: {'YES' if state.get('managed') else 'NO'}",
+        f"Window open now: {'YES' if state.get('allowed') else 'NO'}",
+        f"Next open: {format_epoch(state.get('next_open_at'))}",
+        f"Reason: {state.get('reason','')}",
+        "",
+    ]
+    if not policies:
+        lines.append("No active maintenance policy. Maintenance-gated operations are unrestricted.")
+        return lines
+    for item in policies:
+        policy = item.get("policy", {}) if isinstance(item, dict) else {}
+        lines.append(f"{str(item.get('scope','?')).upper()} {item.get('id','?')}  timezone={policy.get('timezone','?')}")
+        for window in policy.get("windows", []) if isinstance(policy, dict) else []:
+            days = ",".join(str(x) for x in window.get("days", []))
+            lines.append(f"  days={days}  {window.get('start','?')}-{window.get('end','?')}")
+    return lines
+
+
+def schedule_summary(row):
+    executions = row.get("executions", {}) if isinstance(row, dict) else {}
+    states = {}
+    for value in executions.values() if isinstance(executions, dict) else []:
+        name = str((value or {}).get("state") or "queued").lower()
+        states[name] = states.get(name, 0) + 1
+    summary = " ".join(f"{key[:4].upper()}:{states[key]}" for key in sorted(states))
+    return summary or "no devices"
+
+
+def reboot_rows(state, force=False):
+    now = time.monotonic()
+    if not force and now - state.get("reboots_loaded", 0.0) < 1.0:
+        return state.get("reboots_cache", [])
+    try:
+        data = maintenance_call("reboot", "list")
+        rows = data.get("reboots", []) if isinstance(data, dict) else []
+        rows = rows if isinstance(rows, list) else []
+        state["reboots_cache"] = rows
+        state["reboots_error"] = ""
+    except Exception as exc:
+        rows = state.get("reboots_cache", [])
+        state["reboots_error"] = str(exc)
+    state["reboots_loaded"] = now
+    return rows
+
+
+def reboot_detail_lines(row):
+    executions = row.get("executions", {}) if isinstance(row, dict) else {}
+    lines = [
+        f"Schedule: {row.get('schedule_id','?')}",
+        f"State: {str(row.get('state','?')).upper()}    Mode: {str(row.get('mode','?')).upper()}",
+        f"Scheduled: {format_epoch(row.get('scheduled_at'))}",
+        f"Not before: {format_epoch(row.get('not_before'))}",
+        f"Reason: {row.get('reason') or '-'}",
+        "",
+        "DEVICE           STATE           BEFORE BOOT        AFTER BOOT         MESSAGE",
+    ]
+    for device, value in sorted(executions.items()) if isinstance(executions, dict) else []:
+        value = value or {}
+        lines.append(
+            f"{str(device)[:16]:16} {str(value.get('state','?')).upper()[:15]:15} "
+            f"{str(value.get('boot_id_before','-'))[:18]:18} {str(value.get('boot_id_after','-'))[:18]:18} "
+            f"{str(value.get('message',''))[:44]}"
+        )
+    return lines
+
+
+def reboot_detail_screen(stdscr, state, schedule_id):
+    while True:
+        ui.maintenance(stdscr, state)
+        try:
+            row = maintenance_call("reboot", "status", schedule_id)
+            error = ""
+        except Exception as exc:
+            row, error = {}, str(exc)
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        ui.header(stdscr, state, "Scheduled reboot detail", "X cancel remaining reboot work | F refresh | Back return")
+        lines = reboot_detail_lines(row) if row else [error or "Unable to load reboot schedule."]
+        for pos, line in enumerate(lines[:max(1, h - 6)]):
+            ui.safe(stdscr, 3 + pos, 2, clip(line, w - 4), curses.A_BOLD if pos < 5 else 0)
+        ui.safe(stdscr, h - 2, 1, "X Cancel | F Refresh | Back return", curses.A_DIM)
+        ui.safe(stdscr, h - 1, 1, "A reboot already accepted locally may continue; cancellation never pretends otherwise.", curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if ui.is_back(key):
+            return "reboots"
+        if key in (ord("f"), ord("F")):
+            continue
+        if key in (ord("x"), ord("X")):
+            current = str(row.get("state") or "").lower()
+            if current in {"succeeded", "failed", "canceled"}:
+                ui.popup(stdscr, state, "Scheduled reboot", f"Schedule is already {current}.")
+                continue
+            if not ui.confirm(stdscr, state, "Cancel reboot work that has not already been accepted locally?"):
+                continue
+            try:
+                result = maintenance_call("reboot", "cancel", schedule_id, "--actor", "fleet-control")
+                state["reboots_loaded"] = 0.0
+                ui.popup(stdscr, state, "Scheduled reboot", json.dumps(result, indent=2, sort_keys=True))
+            except Exception as exc:
+                ui.popup(stdscr, state, "Scheduled reboot failed", str(exc))
+
+
+def reboots_screen(stdscr, state):
+    state["context"] = "reboots"
+    sel = 0
+    while True:
+        ui.maintenance(stdscr, state)
+        rows_data = reboot_rows(state)
+        sel = min(sel, max(0, len(rows_data) - 1))
+        h, w = stdscr.getmaxyx()
+        rows = max(1, h - 8)
+        start = max(0, sel - rows + 1) if sel >= rows else 0
+        ui.header(stdscr, state, "Scheduled reboots", f"{len(rows_data)} schedule(s) | Enter detail | F refresh")
+        ui.safe(stdscr, 3, 1, "# STATE      MODE        DEV WHEN                 ID / EXECUTIONS", curses.A_BOLD | curses.A_UNDERLINE)
+        for pos, item in enumerate(rows_data[start:start + rows]):
+            devices = item.get("resolved_devices", []) if isinstance(item, dict) else []
+            when = "next window" if item.get("mode") == "maintenance" else format_epoch(item.get("scheduled_at"))
+            line = (
+                f"{pos + 1 if pos < 9 else ' ':>1} {str(item.get('state','?')).upper()[:10]:10} "
+                f"{str(item.get('mode','?')).upper()[:10]:10} {len(devices):3d} {when[:20]:20} "
+                f"{str(item.get('schedule_id','?'))[:24]}  {schedule_summary(item)}"
+            )
+            ui.safe(stdscr, 4 + pos, 1, clip(line, w - 2), curses.A_REVERSE if start + pos == sel else 0)
+        if not rows_data:
+            ui.safe(stdscr, 5, 3, clip(state.get("reboots_error") or "No scheduled reboots.", w - 6), curses.A_DIM)
+        ui.safe(stdscr, h - 2, 1, "Enter open | F refresh | Back return", curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if ui.is_back(key):
+            return "maintenance"
+        if key in (ord("f"), ord("F"), ord("r")):
+            reboot_rows(state, True); continue
+        sel, opened = ui.list_nav(key, sel, len(rows_data), start, rows)
+        if opened and rows_data:
+            result = reboot_detail_screen(stdscr, state, str(rows_data[sel].get("schedule_id")))
+            if result not in {"reboots", None}:
+                return result
+            reboot_rows(state, True)
+
+
+def show_selected_policy(stdscr, state):
+    device = selected_device(state)
+    if not device:
+        ui.popup(stdscr, state, "Maintenance", "No selected Pi.")
+        return
+    did = ui.device_id(device)
+    try:
+        result = maintenance_call("policy", "status", did)
+        ui.popup(stdscr, state, f"Maintenance - {did}", "\n".join(policy_lines(result)))
+    except Exception as exc:
+        ui.popup(stdscr, state, "Maintenance failed", str(exc))
+
+
+def set_selected_policy(stdscr, state):
+    device = selected_device(state)
+    if not device:
+        ui.popup(stdscr, state, "Maintenance", "No selected Pi.")
+        return
+    did = ui.device_id(device)
+    timezone = ui.prompt_text(stdscr, state, "MAINTENANCE", "IANA timezone:", local_timezone())
+    if timezone is None:
+        return
+    days = ui.prompt_text(stdscr, state, "MAINTENANCE", "Days, comma separated (mon,tue,...):", "mon,tue,wed,thu,fri")
+    if days is None:
+        return
+    start = ui.prompt_text(stdscr, state, "MAINTENANCE", "Start HH:MM:", "15:30")
+    if start is None:
+        return
+    end = ui.prompt_text(stdscr, state, "MAINTENANCE", "End HH:MM (cross-midnight allowed):", "06:30")
+    if end is None:
+        return
+    if not ui.confirm(stdscr, state, f"Set {did} maintenance override to {days} {start}-{end} {timezone}?"):
+        return
+    try:
+        result = maintenance_call(
+            "policy", "set-device", did,
+            "--timezone", timezone,
+            "--window", f"{days}@{start}-{end}",
+            "--actor", "fleet-control",
+        )
+        ui.popup(stdscr, state, "Maintenance saved", json.dumps(result, indent=2, sort_keys=True))
+    except Exception as exc:
+        ui.popup(stdscr, state, "Maintenance failed", str(exc))
+
+
+def clear_selected_policy(stdscr, state):
+    device = selected_device(state)
+    if not device:
+        ui.popup(stdscr, state, "Maintenance", "No selected Pi.")
+        return
+    did = ui.device_id(device)
+    if not ui.confirm(stdscr, state, f"Clear the device-specific maintenance override for {did}?"):
+        return
+    try:
+        result = maintenance_call("policy", "clear-device", did, "--actor", "fleet-control")
+        ui.popup(stdscr, state, "Maintenance cleared", json.dumps(result, indent=2, sort_keys=True))
+    except Exception as exc:
+        ui.popup(stdscr, state, "Maintenance failed", str(exc))
+
+
+def schedule_selected_reboot(stdscr, state, mode):
+    device = selected_device(state)
+    if not device:
+        ui.popup(stdscr, state, "Scheduled reboot", "No selected Pi.")
+        return
+    did = ui.device_id(device)
+    if ui.cache_state(device) == "OFFLINE":
+        ui.popup(stdscr, state, "Scheduled reboot", f"{did} is offline; schedule it after fresh telemetry is available.")
+        return
+    wording = "reboot now" if mode == "at" else "reboot at its next maintenance window"
+    if not ui.confirm(stdscr, state, f"Schedule {did} to {wording}?"):
+        return
+    try:
+        result = maintenance_call(
+            "reboot", "create", "--device", did, "--mode", mode,
+            "--reason", f"Fleet Control: {wording}", "--actor", "fleet-control",
+        )
+        state["reboots_loaded"] = 0.0
+        ui.popup(stdscr, state, "Scheduled reboot", json.dumps(result, indent=2, sort_keys=True))
+    except Exception as exc:
+        ui.popup(stdscr, state, "Scheduled reboot failed", str(exc))
+
+
+def show_policy_list(stdscr, state):
+    try:
+        result = maintenance_call("policy", "list")
+        policies = result.get("policies", []) if isinstance(result, dict) else []
+        lines = []
+        for item in policies:
+            policy = item.get("policy", {}) if isinstance(item, dict) else {}
+            lines.append(f"{str(item.get('scope','?')).upper()} {item.get('id','?')}  {policy.get('timezone','?')}")
+            for window in policy.get("windows", []) if isinstance(policy, dict) else []:
+                lines.append(f"  days={','.join(str(x) for x in window.get('days', []))} {window.get('start','?')}-{window.get('end','?')}")
+        ui.popup(stdscr, state, "Maintenance policies", "\n".join(lines) or "No maintenance policies configured.")
+    except Exception as exc:
+        ui.popup(stdscr, state, "Maintenance failed", str(exc))
+
+
+def maintenance_screen(stdscr, state):
+    state["context"] = "maintenance"
+    opts = [
+        "Selected Pi: view effective maintenance",
+        "Selected Pi: set maintenance override",
+        "Selected Pi: clear maintenance override",
+        "Selected Pi: reboot now",
+        "Selected Pi: reboot at next maintenance window",
+        "Scheduled reboot manager",
+        "View all maintenance policies",
+    ]
+    sel = 0
+    while True:
+        ui.maintenance(stdscr, state)
+        device = selected_device(state)
+        selected = ui.device_id(device) if device else "none"
+        ui.header(stdscr, state, "Maintenance / Reboots", f"Selected {selected} | typed reboot commands | boot_id verified")
+        for index, label in enumerate(opts):
+            ui.safe(stdscr, 3 + index, 4, f"{index + 1}. {label}", curses.A_REVERSE if index == sel else 0)
+        h, _ = stdscr.getmaxyx()
+        ui.safe(stdscr, h - 2, 1, "Maintenance-gated deployments wait automatically; manual deployment dispatch remains an admin override.", curses.A_DIM)
+        ui.safe(stdscr, h - 1, 1, "Reboot success requires the Pi to return with a different boot_id. Back returns.", curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if ui.is_back(key):
+            return "updates"
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(opts) - 1, sel + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel - 1)
+        elif ord("1") <= key <= ord("7"):
+            sel = key - ord("1"); key = 10
+        if key not in (10, 13):
+            continue
+        if sel == 0:
+            show_selected_policy(stdscr, state)
+        elif sel == 1:
+            set_selected_policy(stdscr, state)
+        elif sel == 2:
+            clear_selected_policy(stdscr, state)
+        elif sel == 3:
+            schedule_selected_reboot(stdscr, state, "at")
+        elif sel == 4:
+            schedule_selected_reboot(stdscr, state, "maintenance")
+        elif sel == 5:
+            result = reboots_screen(stdscr, state)
+            if result not in {"maintenance", "reboots", None}:
+                return result
+        else:
+            show_policy_list(stdscr, state)
+
+
+def operations_hub_screen(stdscr, state):
+    state["context"] = "updates"
+    opts = ["Deployment manager", "Maintenance / Reboots", "Direct / legacy Pi updates"]
+    sel = 0
+    while True:
+        ui.maintenance(stdscr, state)
+        ui.header(stdscr, state, "Fleet Operations", "Exact-commit deployments, maintenance windows, scheduled reboots, and direct updates.")
+        for index, label in enumerate(opts):
+            ui.safe(stdscr, 3 + index, 4, f"{index + 1}. {label}", curses.A_REVERSE if index == sel else 0)
+        h, _ = stdscr.getmaxyx()
+        ui.safe(stdscr, h - 2, 1, "Deployment manager: frozen targets, canaries, waves, recovery and rollback planning", curses.A_DIM)
+        ui.safe(stdscr, h - 1, 1, "Maintenance / Reboots: windows, typed reboot scheduling and boot verification", curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if ui.is_back(key):
+            return "main"
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(opts) - 1, sel + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel - 1)
+        elif key in (ord("1"), ord("2"), ord("3")):
+            sel = key - ord("1"); key = 10
+        if key not in (10, 13):
+            continue
+        if sel == 0:
+            result = day2.deployments_screen(stdscr, state)
+            if result not in {"updates", "deployments", None}:
+                return result
+        elif sel == 1:
+            result = maintenance_screen(stdscr, state)
+            if result not in {"updates", "maintenance", None}:
+                return result
+        else:
+            result = day2._original_updates_screen(stdscr, state)
+            if result != "main":
+                return result
+
+
+ui.updates_screen = operations_hub_screen
+
+
+def main():
+    ui.mod.ensure_root()
+    ui.mod.ensure_dirs()
+    try:
+        curses.wrapper(ui.app)
+    finally:
+        ui.workers.shutdown(wait=False, cancel_futures=True)
+
+
+if __name__ == "__main__":
+    main()

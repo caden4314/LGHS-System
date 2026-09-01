@@ -34,6 +34,8 @@ install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-report" /usr/l
 install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-firstboot-provision" /usr/local/sbin/lghs-firstboot-provision
 install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-dev-setup" /usr/local/sbin/lghs-dev-setup
 install -m 0644 "$ROOT_DIR/bluetooth/lghs_bt_protocol.py" /usr/local/lib/lghs-bt/lghs_bt_protocol.py
+install -m 0755 "$ROOT_DIR/bluetooth/lghs-bt-prepare" /usr/local/sbin/lghs-bt-prepare
+install -m 0644 "$ROOT_DIR/systemd/lghs-bt-prepare.service" /etc/systemd/system/lghs-bt-prepare.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.service" /etc/systemd/system/lghs-update.service
 install -m 0644 "$ROOT_DIR/systemd/lghs-update.timer" /etc/systemd/system/lghs-update.timer
 install -m 0644 "$ROOT_DIR/systemd/lghs-firstboot-provision.service" /etc/systemd/system/lghs-firstboot-provision.service
@@ -69,16 +71,29 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0644 "$ROOT_DIR/controller/lghs/protocol.py" /usr/local/lib/lghs-python/lghs/protocol.py
   install -m 0644 "$ROOT_DIR/controller/lghs/database.py" /usr/local/lib/lghs-python/lghs/database.py
   install -m 0644 "$ROOT_DIR/controller/lghs/audit.py" /usr/local/lib/lghs-python/lghs/audit.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/sudo_state.py" /usr/local/lib/lghs-python/lghs/sudo_state.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/health.py" /usr/local/lib/lghs-python/lghs/health.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/fleet_ui.py" /usr/local/lib/lghs-python/lghs/fleet_ui.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/rollout.py" /usr/local/lib/lghs-python/lghs/rollout.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/maintenance.py" /usr/local/lib/lghs-python/lghs/maintenance.py
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/libexec/lghsctl-real
   install -m 0755 "$ROOT_DIR/controller/lghsctl-wrapper" /usr/local/sbin/lghsctl
   install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-legacy
   install -m 0755 "$ROOT_DIR/controller/lghs-console-tunnel" /usr/local/libexec/lghs-console-base
   install -m 0755 "$ROOT_DIR/controller/lghs-console-responsive" /usr/local/libexec/lghs-console-responsive-core
-  install -m 0755 "$ROOT_DIR/controller/lghs-console-day2" /usr/local/sbin/lghs-console
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day2" /usr/local/libexec/lghs-console-day2-core
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day3" /usr/local/libexec/lghs-console-day3-core
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day4" /usr/local/libexec/lghs-console-day4-core
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day5" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-notify" /usr/local/sbin/lghs-fleet-notify
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
   install -m 0755 "$ROOT_DIR/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
+  install -m 0755 "$ROOT_DIR/controller/lghs-fleet-rollout" /usr/local/sbin/lghs-fleet-rollout
+  install -m 0755 "$ROOT_DIR/controller/lghs-fleet-maintenance" /usr/local/sbin/lghs-fleet-maintenance
+  install -m 0755 "$ROOT_DIR/controller/lghs-rollout-manager" /usr/local/sbin/lghs-rollout-manager
   install -m 0755 "$ROOT_DIR/controller/lghs-cloudflare-provision" /usr/local/sbin/lghs-cloudflare-provision
   install -m 0644 "$ROOT_DIR/systemd/lghs-fleet-notify.service" /etc/systemd/system/lghs-fleet-notify.service
   install -m 0755 "$ROOT_DIR/controller/lghs-audit-sync" /usr/local/sbin/lghs-audit-sync
@@ -88,6 +103,7 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-api-cloudflare" /usr/local/sbin/lghs-fleet-api-cloudflare
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-api-provision" /usr/local/sbin/lghs-fleet-api-provision
   install -m 0644 "$ROOT_DIR/systemd/lghs-fleet-api.service" /etc/systemd/system/lghs-fleet-api.service
+  install -m 0644 "$ROOT_DIR/systemd/lghs-rollout-manager.service" /etc/systemd/system/lghs-rollout-manager.service
   install -m 0750 "$ROOT_DIR/controller/lghs-bt-provision" /usr/local/sbin/lghs-bt-provision
   install -m 0644 "$ROOT_DIR/systemd/lghs-bt-provision.service" /etc/systemd/system/lghs-bt-provision.service
 
@@ -221,20 +237,26 @@ if [[ "$ROLE" == "controller" ]]; then
   # next reboot, so the provisioning service can publish its SDP record.
   systemctl restart bluetooth.service
 fi
+systemctl enable lghs-bt-prepare.service
+systemctl reset-failed lghs-bt-prepare.service >/dev/null 2>&1 || true
+systemctl restart lghs-bt-prepare.service
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
   systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
   systemctl enable --now lghs-policy.service lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service ssh.service
   systemctl enable lghs-bt-bootstrap.service
+  systemctl reset-failed lghs-bt-bootstrap.service >/dev/null 2>&1 || true
   if [[ -f /etc/lghs/bluetooth-bootstrap-enabled && ! -f /var/lib/lghs/bootstrap/wifi-provisioned.json ]]; then
     systemctl start lghs-bt-bootstrap.service || true
   fi
   systemctl restart lghs-policy.service lghs-command-executor.service lghs-agent.service
   systemctl try-restart ssh.service >/dev/null 2>&1 || true
 else
-  systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service lghs-fleet-api.service lghs-bt-provision.service
+  systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service lghs-fleet-api.service lghs-rollout-manager.service lghs-bt-provision.service
+  systemctl reset-failed lghs-bt-provision.service lghs-rollout-manager.service >/dev/null 2>&1 || true
   systemctl try-restart lghs-fleet-notify.service
   systemctl try-restart lghs-fleet-api.service
+  systemctl try-restart lghs-rollout-manager.service
   systemctl try-restart lghs-bt-provision.service
 fi
 systemctl enable lghs-install-success-notify.service

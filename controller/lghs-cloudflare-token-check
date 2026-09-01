@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API = "https://api.cloudflare.com/client/v4"
+TOKEN_FILE = Path("/etc/lghs/secrets/cloudflare-api-token")
+CONF_FILE = Path("/etc/lghs/cloudflare.conf")
+
+
+def load_conf():
+    out = {}
+    if CONF_FILE.exists():
+        for raw in CONF_FILE.read_text(encoding="utf-8").splitlines():
+            raw = raw.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            k, v = raw.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def request(token, path):
+    req = urllib.request.Request(
+        API + path,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.load(exc)
+        except Exception:
+            payload = {"success": False, "errors": [{"message": f"HTTP {exc.code}"}]}
+    if not payload.get("success"):
+        raise RuntimeError(str(payload.get("errors") or "Cloudflare API request failed"))
+    return payload.get("result")
+
+
+def main():
+    if not TOKEN_FILE.exists() or not TOKEN_FILE.read_text(encoding="utf-8").strip():
+        raise RuntimeError(f"missing {TOKEN_FILE}")
+    conf = load_conf()
+    account_id = conf.get("ACCOUNT_ID", "").strip()
+    zone = conf.get("ZONE", "scenicrouteservers.com").strip()
+    if not account_id:
+        raise RuntimeError(f"ACCOUNT_ID is not set in {CONF_FILE}")
+
+    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    zones = request(token, "/zones?" + urllib.parse.urlencode({"name": zone}))
+    if not zones:
+        raise RuntimeError(f"token cannot resolve configured zone {zone}")
+    tunnels = request(token, f"/accounts/{account_id}/cfd_tunnel?is_deleted=false")
+
+    print("Cloudflare credential readable: OK")
+    print(f"Account tunnel read access: OK ({len(tunnels or [])} visible tunnel(s))")
+    print(f"Zone read access: OK ({zone})")
+    print("Secret disclosure check: OK (token was not printed)")
+    print("NOTE: this is a read-only credential probe; the live CS-999 provisioning test verifies tunnel/DNS write permissions.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

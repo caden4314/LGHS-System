@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""LGHS Fleet Control v0.6 structured deployment-health UI layer.
+
+Extends the day-3 maintenance/reboot console without replacing its validated
+navigation. Deployment detail gains reason-aware post-update health gate output.
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+
+BASE = '/usr/local/libexec/lghs-console-day3-core'
+
+
+def load_base():
+    loader = importlib.machinery.SourceFileLoader('lghs_console_day3', BASE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+day3 = load_base()
+day2 = day3.day2
+ui = day3.ui
+_original_detail_lines = day2.deployment_detail_lines
+
+
+def _short(value, width=48):
+    text = str(value if value is not None else '-')
+    return text if len(text) <= width else text[:max(0, width - 3)] + '...'
+
+
+def deployment_detail_lines(detail):
+    lines = list(_original_detail_lines(detail))
+    rollout = detail.get('rollout', {}) if isinstance(detail, dict) else {}
+    phases = rollout.get('phases', []) if isinstance(rollout, dict) else []
+    active = rollout.get('active_phase') if isinstance(rollout, dict) else None
+    gate = None
+    if isinstance(phases, list):
+        if active is not None:
+            gate = next((row for row in phases if isinstance(row, dict) and row.get('phase') == active), None)
+        if gate is None:
+            gate = next((row for row in phases if isinstance(row, dict) and row.get('health_blocked')), None)
+    if not isinstance(gate, dict):
+        return lines
+
+    details = gate.get('health_details', {}) if isinstance(gate.get('health_details'), dict) else {}
+    blocked_devices = list(gate.get('health_blocked') or [])
+    if not details and not blocked_devices:
+        return lines
+
+    lines.extend(['', 'POST-UPDATE HEALTH GATE'])
+    lines.append(f"Gate: {str(gate.get('state','?')).upper()}  {gate.get('reason','')}")
+    for device in blocked_devices:
+        health = details.get(device, {}) if isinstance(details.get(device), dict) else {}
+        lines.append(f"{device}: BLOCKED  mode={health.get('mode','?')}  report_age={health.get('report_age_seconds','?')}s")
+        blocked = health.get('blocked_checks', []) if isinstance(health.get('blocked_checks'), list) else []
+        for check in blocked:
+            if not isinstance(check, dict):
+                continue
+            lines.append(
+                f"  {check.get('id','?')} [{str(check.get('severity','?')).upper()}] "
+                f"observed={_short(check.get('observed'), 30)} expected={_short(check.get('expected'), 30)}"
+            )
+            remediation = str(check.get('remediation') or '')
+            reason = str(check.get('reason') or '')
+            if reason:
+                lines.append(f"    reason: {_short(reason, 80)}")
+            if remediation:
+                lines.append(f"    remediation: {_short(remediation, 80)}")
+    advisories = []
+    for device, health in sorted(details.items()):
+        if not isinstance(health, dict):
+            continue
+        for check in health.get('advisories', []) if isinstance(health.get('advisories'), list) else []:
+            if isinstance(check, dict):
+                advisories.append((device, check))
+    if advisories:
+        lines.append('')
+        lines.append('ADVISORIES (do not block this wave)')
+        for device, check in advisories[:12]:
+            lines.append(f"  {device} {check.get('id','?')}: {_short(check.get('observed'), 48)}")
+    return lines
+
+
+day2.deployment_detail_lines = deployment_detail_lines
+
+
+def main():
+    day3.main()
+
+
+if __name__ == '__main__':
+    main()

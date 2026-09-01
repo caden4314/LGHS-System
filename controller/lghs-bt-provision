@@ -17,11 +17,12 @@ from lghs_bt_protocol import (PROTOCOL_VERSION, decrypt_payload, derive_key,
 CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
 TOKENS = Path(os.environ.get("LGHS_FLEET_API_TOKENS", "/etc/lghs/fleet-api-tokens.json"))
 ROLE = Path("/etc/lghs/role")
-SOCKET_TIMEOUT = 20
-COMMAND_TIMEOUT = 6
+SOCKET_TIMEOUT = 180
+COMMAND_TIMEOUT = 90
 SOL_BLUETOOTH = getattr(socket, "SOL_BLUETOOTH", 274)
 BT_SECURITY = getattr(socket, "BT_SECURITY", 4)
 BT_SECURITY_LOW = 1
+CLOUDFLARE_PROVISION = "/usr/local/sbin/lghs-cloudflare-provision"
 
 
 def run(cmd, timeout=None):
@@ -32,9 +33,6 @@ def run(cmd, timeout=None):
 
 
 def set_app_authenticated_security(sock):
-    # Bootstrap authentication/encryption is provided by the LGHS protocol
-    # (token proof + X25519/HKDF + AES-GCM). BlueZ pairing is intentionally
-    # zero-touch and supplies only the underlying RFCOMM transport.
     sock.setsockopt(SOL_BLUETOOTH, BT_SECURITY, struct.pack("BB", BT_SECURITY_LOW, 0))
 
 
@@ -95,10 +93,29 @@ def active_wifi_profile():
     }
 
 
+def cloudflare_prepare(device_id):
+    p = run([CLOUDFLARE_PROVISION, device_id, "--bootstrap-json"], timeout=COMMAND_TIMEOUT)
+    if p.returncode != 0:
+        raise RuntimeError("Cloudflare bootstrap preparation failed: " + (p.stderr or p.stdout or "unknown error").strip()[-500:])
+    try:
+        data = json.loads((p.stdout or "").strip())
+    except Exception as exc:
+        raise RuntimeError(f"Cloudflare bootstrap returned invalid JSON: {exc}")
+    token = str(data.get("tunnel_token") or "")
+    host = str(data.get("ssh_host") or "")
+    if not token or not host:
+        raise RuntimeError("Cloudflare bootstrap response is missing tunnel token or SSH hostname")
+    return data
+
+
+def cloudflare_finalize(device_id, host_key):
+    p = run([CLOUDFLARE_PROVISION, device_id, "--finalize-host-key", host_key], timeout=COMMAND_TIMEOUT)
+    if p.returncode != 0:
+        raise RuntimeError("Cloudflare bootstrap finalization failed: " + (p.stderr or p.stdout or "unknown error").strip()[-500:])
+    return json.loads((p.stdout or "{}").strip())
+
+
 def ensure_sdp_record():
-    # BlueZ does not publish an SDP record merely because a raw RFCOMM socket
-    # is bound. The installer enables bluetoothd --compat so sdptool can make
-    # channel 17 discoverable. Avoid duplicate records on service restarts.
     browse = run(["sdptool", "browse", "local"], timeout=COMMAND_TIMEOUT)
     marker = f"Channel: {CHANNEL}"
     if browse.returncode == 0 and marker in browse.stdout:
@@ -133,6 +150,7 @@ def handle_client(conn, address):
     client_nonce = str(hello.get("client_nonce") or "")
     client_pub = str(hello.get("client_pub") or "")
     supplied = str(hello.get("proof") or "")
+    dry_run = bool(hello.get("dry_run"))
     if not device_id or len(device_id) > 64:
         raise ValueError("invalid device id")
 
@@ -145,17 +163,47 @@ def handle_client(conn, address):
 
     key = derive_key(server_private, client_pub, token, tx)
     wifi = active_wifi_profile()
-    encrypted = encrypt_payload(key, tx, {"type": "wifi_profile", "wifi": wifi, "issued_at": time.time()})
+    payload = {"type": "wifi_profile", "wifi": wifi, "issued_at": time.time()}
+    cloudflare = None
+    if not dry_run:
+        cloudflare = cloudflare_prepare(device_id)
+        payload["cloudflare"] = {
+            "ssh_host": cloudflare["ssh_host"],
+            "tunnel_token": cloudflare["tunnel_token"],
+        }
+
+    encrypted = encrypt_payload(key, tx, payload)
     send_frame(conn, {
         "v": PROTOCOL_VERSION,
         "type": "provision",
         "controller_proof": proof(token, "controller", tx),
         **encrypted,
     })
+
     result = recv_frame(conn)
-    if result.get("type") == "result":
-        status = str(result.get("status") or "unknown")
-        print(f"Bluetooth bootstrap {device_id} from {address[0]}: {status}", flush=True)
+    if result.get("type") != "result":
+        raise ValueError("student did not return provisioning result")
+    status = str(result.get("status") or "unknown")
+
+    if dry_run:
+        print(f"Bluetooth bootstrap dry-run {device_id} from {address[0]}: {status}", flush=True)
+        return
+
+    if status != "ready":
+        raise RuntimeError(f"student provisioning did not become ready: {status}")
+    host_key = str(result.get("ssh_host_key") or "")
+    ssh_host = str(result.get("ssh_host") or "")
+    if cloudflare is None or ssh_host != cloudflare.get("ssh_host"):
+        raise RuntimeError("student Cloudflare hostname does not match controller allocation")
+
+    finalized = cloudflare_finalize(device_id, host_key)
+    send_frame(conn, {
+        "v": PROTOCOL_VERSION,
+        "type": "complete",
+        "status": "ready",
+        "ssh_host": finalized.get("ssh_host") or ssh_host,
+    })
+    print(f"Bluetooth zero-touch bootstrap READY {device_id}: {ssh_host}", flush=True)
 
 
 def client_thread(conn, address):
@@ -175,9 +223,6 @@ def main():
         raise SystemExit("Run as root")
     if ROLE.read_text(encoding="utf-8").strip() != "controller":
         raise SystemExit("Bluetooth provisioning server is controller-only")
-    # Adapter power, IO capability, pairability, alias and discoverability are
-    # prepared by lghs-bt-prepare.service outside this hardened long-running
-    # service. Some BlueZ management commands can block inside this sandbox.
     if not hasattr(socket, "AF_BLUETOOTH"):
         raise SystemExit("Python lacks AF_BLUETOOTH support")
     server = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)

@@ -124,6 +124,10 @@ def install_student_tunnel(target, tunnel_token, cloudflare=False):
 
 
 def add_known_host_alias(public_host, key):
+    parts = str(key or "").strip().split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise RuntimeError("invalid student ED25519 SSH host public key")
+    key = f"{parts[0]} {parts[1]}"
     KNOWN_HOSTS.parent.mkdir(parents=True, exist_ok=True)
     KNOWN_HOSTS.touch(exist_ok=True)
     existing = KNOWN_HOSTS.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -131,6 +135,71 @@ def add_known_host_alias(public_host, key):
     existing.append(f"{public_host} {key}")
     KNOWN_HOSTS.write_text("\n".join(existing) + "\n", encoding="utf-8")
     os.chmod(KNOWN_HOSTS, 0o644)
+
+
+def cloudflare_context(device, include_token=False):
+    if not TOKEN_FILE.exists():
+        raise RuntimeError(f"Missing {TOKEN_FILE}")
+    conf = load_conf()
+    account_id = conf.get("ACCOUNT_ID")
+    zone = conf.get("ZONE", "scenicrouteservers.com")
+    if not account_id:
+        raise RuntimeError(f"Set ACCOUNT_ID in {CONF_FILE}")
+
+    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    device = device.upper()
+    slug = device.lower()
+    tunnel_name = f"LGHS-{device}"
+    public_host = f"ssh-{slug}.{zone}"
+
+    zones = api(token, "GET", "/zones?" + urllib.parse.urlencode({"name": zone}))
+    if not zones:
+        raise RuntimeError(f"Zone not found: {zone}")
+    zone_id = zones[0]["id"]
+
+    tunnels = api(token, "GET", f"/accounts/{account_id}/cfd_tunnel?is_deleted=false")
+    tunnel = next((t for t in tunnels if t.get("name") == tunnel_name), None)
+    if tunnel is None:
+        tunnel = api(token, "POST", f"/accounts/{account_id}/cfd_tunnel", {"name": tunnel_name, "config_src": "cloudflare"})
+    tunnel_id = tunnel["id"]
+
+    api(token, "PUT", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations", {
+        "config": {
+            "ingress": [
+                {"hostname": public_host, "service": "ssh://localhost:22"},
+                {"service": "http_status:404"},
+            ]
+        }
+    })
+
+    records = api(token, "GET", f"/zones/{zone_id}/dns_records?" + urllib.parse.urlencode({"type": "CNAME", "name": public_host}))
+    record = {"type": "CNAME", "name": public_host, "content": f"{tunnel_id}.cfargotunnel.com", "proxied": True}
+    if records:
+        api(token, "PUT", f"/zones/{zone_id}/dns_records/{records[0]['id']}", record)
+    else:
+        api(token, "POST", f"/zones/{zone_id}/dns_records", record)
+
+    result = {
+        "device": device,
+        "ssh_host": public_host,
+        "tunnel_id": tunnel_id,
+        "tunnel_name": tunnel_name,
+    }
+    if include_token:
+        result["tunnel_token"] = api(token, "GET", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token")
+    return result
+
+
+def finalize_registry(ctx, host_key):
+    add_known_host_alias(ctx["ssh_host"], host_key)
+    reg = load_registry()
+    reg["devices"][ctx["device"]] = {
+        "transport": "cloudflare",
+        "ssh_host": ctx["ssh_host"],
+        "tunnel_id": ctx["tunnel_id"],
+        "tunnel_name": ctx["tunnel_name"],
+    }
+    save_registry(reg)
 
 
 def main():
@@ -142,29 +211,37 @@ def main():
         help="trusted local hostname/IP for first enrollment; omit for an already-registered Cloudflare device",
     )
     ap.add_argument("--no-install", action="store_true", help="create/update Cloudflare and registry only; do not reinstall student tunnel")
+    ap.add_argument("--bootstrap-json", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--finalize-host-key", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if os.geteuid() != 0:
         raise SystemExit("Run with sudo")
-    if not TOKEN_FILE.exists():
-        raise SystemExit(f"Missing {TOKEN_FILE}")
 
-    conf = load_conf()
-    account_id = conf.get("ACCOUNT_ID")
-    zone = conf.get("ZONE", "scenicrouteservers.com")
-    if not account_id:
-        raise SystemExit(f"Set ACCOUNT_ID in {CONF_FILE}")
-
-    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
     device = args.device.upper()
-    slug = device.lower()
-    tunnel_name = f"LGHS-{device}"
-    public_host = f"ssh-{slug}.{zone}"
-    reg = load_registry()
 
-    # Fresh devices are reached locally once. Existing devices can be repaired
-    # and reprovisioned entirely through their current Cloudflare SSH tunnel.
+    # Bluetooth bootstrap mode creates/reuses Cloudflare resources and returns
+    # the tunnel token only to the authenticated provisioning process. It never
+    # places the token in argv, logs, or persistent controller registry state.
+    if args.bootstrap_json:
+        ctx = cloudflare_context(device, include_token=True)
+        print(json.dumps(ctx, separators=(",", ":")))
+        return
+
+    # Bluetooth finalization happens only after the student reports that
+    # cloudflared registered successfully and returns its SSH host public key.
+    if args.finalize_host_key is not None:
+        ctx = cloudflare_context(device, include_token=False)
+        finalize_registry(ctx, args.finalize_host_key)
+        print(json.dumps({"ready": True, **ctx}, separators=(",", ":")))
+        return
+
+    reg = load_registry()
+    conf = load_conf()
     existing = reg.get("devices", {}).get(device, {})
+    ctx = cloudflare_context(device, include_token=not args.no_install)
+    public_host = ctx["ssh_host"]
+
     if args.target:
         bootstrap_target = args.target
         bootstrap_cloudflare = args.target == existing.get("ssh_host") or args.target == public_host
@@ -181,54 +258,21 @@ def main():
         raise RuntimeError(f"Expected hostname {device}, got {got}")
     host_key = get_remote_host_key(bootstrap_target, cloudflare=bootstrap_cloudflare)
 
-    print("[2/7] Resolving Cloudflare zone")
-    zones = api(token, "GET", "/zones?" + urllib.parse.urlencode({"name": zone}))
-    if not zones:
-        raise RuntimeError(f"Zone not found: {zone}")
-    zone_id = zones[0]["id"]
-
-    print(f"[3/7] Creating/reusing tunnel {tunnel_name}")
-    tunnels = api(token, "GET", f"/accounts/{account_id}/cfd_tunnel?is_deleted=false")
-    tunnel = next((t for t in tunnels if t.get("name") == tunnel_name), None)
-    if tunnel is None:
-        tunnel = api(token, "POST", f"/accounts/{account_id}/cfd_tunnel", {"name": tunnel_name, "config_src": "cloudflare"})
-    tunnel_id = tunnel["id"]
-
-    print(f"[4/7] Configuring {public_host} -> ssh://localhost:22")
-    api(token, "PUT", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations", {
-        "config": {
-            "ingress": [
-                {"hostname": public_host, "service": "ssh://localhost:22"},
-                {"service": "http_status:404"},
-            ]
-        }
-    })
-
-    print("[5/7] Creating/updating DNS")
-    records = api(token, "GET", f"/zones/{zone_id}/dns_records?" + urllib.parse.urlencode({"type": "CNAME", "name": public_host}))
-    record = {"type": "CNAME", "name": public_host, "content": f"{tunnel_id}.cfargotunnel.com", "proxied": True}
-    if records:
-        api(token, "PUT", f"/zones/{zone_id}/dns_records/{records[0]['id']}", record)
-    else:
-        api(token, "POST", f"/zones/{zone_id}/dns_records", record)
+    print("[2/7] Cloudflare zone resolved")
+    print(f"[3/7] Tunnel ready: {ctx['tunnel_name']}")
+    print(f"[4/7] Ingress ready: {public_host} -> ssh://localhost:22")
+    print("[5/7] DNS ready")
 
     print("[6/7] Installing per-device tunnel")
     if not args.no_install:
-        tunnel_token = api(token, "GET", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token")
+        tunnel_token = ctx.pop("tunnel_token")
         install_student_tunnel(bootstrap_target, tunnel_token, cloudflare=bootstrap_cloudflare)
         del tunnel_token
     else:
         print("Skipped (--no-install)")
 
     print("[7/7] Updating controller fleet registry and SSH host trust")
-    add_known_host_alias(public_host, host_key)
-    reg["devices"][device] = {
-        "transport": "cloudflare",
-        "ssh_host": public_host,
-        "tunnel_id": tunnel_id,
-        "tunnel_name": tunnel_name,
-    }
-    save_registry(reg)
+    finalize_registry(ctx, host_key)
 
     print(f"READY {device}: ssh={public_host}")
     print(f"Test: sudo lghsctl info {device}")

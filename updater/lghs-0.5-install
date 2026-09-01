@@ -21,28 +21,46 @@ install -m 0644 "$ROOT/systemd/lghs-bt-prepare.service" /etc/systemd/system/lghs
 systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
 
 if [[ "$ROLE" == controller ]]; then
-  install -d -m 0755 /usr/local/lib/lghs-python/lghs
+  install -d -m 0755 /usr/local/lib/lghs-python/lghs /usr/local/libexec
   install -m 0644 "$ROOT/controller/lghs/__init__.py" /usr/local/lib/lghs-python/lghs/__init__.py
   install -m 0644 "$ROOT/controller/lghs/protocol.py" /usr/local/lib/lghs-python/lghs/protocol.py
   install -m 0644 "$ROOT/controller/lghs/database.py" /usr/local/lib/lghs-python/lghs/database.py
   install -m 0644 "$ROOT/controller/lghs/audit.py" /usr/local/lib/lghs-python/lghs/audit.py
   install -m 0644 "$ROOT/controller/lghs/sudo_state.py" /usr/local/lib/lghs-python/lghs/sudo_state.py
+  install -m 0644 "$ROOT/controller/lghs/health.py" /usr/local/lib/lghs-python/lghs/health.py
+  install -m 0644 "$ROOT/controller/lghs/fleet_ui.py" /usr/local/lib/lghs-python/lghs/fleet_ui.py
+  install -m 0644 "$ROOT/controller/lghs/rollout.py" /usr/local/lib/lghs-python/lghs/rollout.py
+  install -m 0644 "$ROOT/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
+  install -m 0644 "$ROOT/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
+  install -m 0644 "$ROOT/controller/lghs/maintenance.py" /usr/local/lib/lghs-python/lghs/maintenance.py
+  install -m 0755 "$ROOT/controller/lghs-console-tunnel" /usr/local/libexec/lghs-console-base
+  install -m 0755 "$ROOT/controller/lghs-console-responsive" /usr/local/libexec/lghs-console-responsive-core
+  install -m 0755 "$ROOT/controller/lghs-console-day2" /usr/local/libexec/lghs-console-day2-core
+  install -m 0755 "$ROOT/controller/lghs-console-day3" /usr/local/libexec/lghs-console-day3-core
+  install -m 0755 "$ROOT/controller/lghs-console-day4" /usr/local/libexec/lghs-console-day4-core
+  install -m 0755 "$ROOT/controller/lghs-console-day5" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
   install -m 0755 "$ROOT/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
+  install -m 0755 "$ROOT/controller/lghs-fleet-rollout" /usr/local/sbin/lghs-fleet-rollout
+  install -m 0755 "$ROOT/controller/lghs-fleet-maintenance" /usr/local/sbin/lghs-fleet-maintenance
+  install -m 0755 "$ROOT/controller/lghs-rollout-manager" /usr/local/sbin/lghs-rollout-manager
+  install -m 0644 "$ROOT/systemd/lghs-rollout-manager.service" /etc/systemd/system/lghs-rollout-manager.service
   install -m 0750 "$ROOT/controller/lghs-bt-provision" /usr/local/sbin/lghs-bt-provision
   install -m 0644 "$ROOT/systemd/lghs-bt-provision.service" /etc/systemd/system/lghs-bt-provision.service
   /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
   chmod 0640 /var/lib/lghs/db-migration-last.json
   systemctl daemon-reload
   systemctl enable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
+  systemctl enable --now lghs-rollout-manager.service >/dev/null 2>&1 || true
   systemctl enable lghs-bt-prepare.service lghs-bt-provision.service
-  systemctl reset-failed lghs-bt-prepare.service lghs-bt-provision.service >/dev/null 2>&1 || true
+  systemctl reset-failed lghs-bt-prepare.service lghs-bt-provision.service lghs-rollout-manager.service >/dev/null 2>&1 || true
   systemctl restart lghs-bt-prepare.service
   systemctl restart lghs-bt-provision.service
   systemctl try-restart lghs-fleet-api.service || true
-  echo 'LGHS 0.5 controller SQLite/HTTPS + Bluetooth bootstrap foundation installed.'
+  systemctl try-restart lghs-rollout-manager.service || true
+  echo 'LGHS 0.6 controller SQLite/HTTPS + Fleet Control + structured health + rollout + maintenance + Bluetooth bootstrap foundation installed.'
   exit 0
 fi
 
@@ -53,6 +71,7 @@ fi
 install -d -o lghs-agent -g lghs-agent -m 0700 /var/lib/lghs-agent
 install -d -o root -g root -m 0700 /var/lib/lghs/bootstrap
 install -m 0755 "$ROOT/student/lghs-agent" /usr/local/sbin/lghs-agent
+python3 "$ROOT/updater/patch-agent-status-guard.py" /usr/local/sbin/lghs-agent
 install -m 0750 "$ROOT/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
 install -m 0755 "$ROOT/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
 install -m 0750 "$ROOT/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap
@@ -80,6 +99,9 @@ fi
 systemctl daemon-reload
 systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
 systemctl enable --now lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service
+# Binaries may have just been replaced while these units were already active.
+# Restart them so the running processes execute the newly installed code.
+systemctl restart lghs-command-executor.service lghs-agent.service
 systemctl enable lghs-bt-prepare.service lghs-bt-bootstrap.service
 systemctl reset-failed lghs-bt-prepare.service lghs-bt-bootstrap.service >/dev/null 2>&1 || true
 systemctl restart lghs-bt-prepare.service
@@ -90,4 +112,4 @@ sleep 1
 systemctl is-active --quiet lghs-command-executor.service
 systemctl is-active --quiet lghs-agent.service
 systemctl is-active --quiet lghs-discovery-advertise.service
-echo 'LGHS 0.5 unprivileged student agent + Bluetooth bootstrap foundation installed.'
+echo 'LGHS 0.6 unprivileged student agent + structured health v2 + typed reboot + Bluetooth bootstrap foundation installed.'

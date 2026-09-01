@@ -1,0 +1,22 @@
+[Unit]
+Description=LGHS Fleet Rollout Manager
+After=network-online.target lghs-fleet-api.service
+Wants=network-online.target
+ConditionPathExists=/etc/lghs/role
+ConditionPathExists=/var/lib/lghs/fleet.db
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/lghs-rollout-manager
+Restart=always
+RestartSec=2
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/lghs /run/lock
+
+[Install]
+WantedBy=multi-user.target

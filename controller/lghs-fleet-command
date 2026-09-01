@@ -1,39 +1,113 @@
 #!/usr/bin/env python3
-"""Canonical LGHS 0.5 controller command writer backed by SQLite."""
-import argparse,json,os,sys,time
+"""Canonical LGHS controller command writer backed by SQLite."""
+import argparse
+import json
+import os
+import sys
+import time
 from pathlib import Path
-sys.path.insert(0,'/usr/local/lib/lghs-python')
-sys.path.insert(0,str(Path(__file__).resolve().parent))
-from lghs.database import FleetDB
-from lghs.protocol import ALLOWED_COMMANDS,normalize_device_id
 
-REGISTRY=Path('/etc/lghs/fleet.json'); DB=FleetDB()
+sys.path.insert(0, '/usr/local/lib/lghs-python')
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lghs.database import FleetDB
+from lghs.protocol import ALLOWED_COMMANDS, normalize_device_id
+
+REGISTRY = Path('/etc/lghs/fleet.json')
+DB = FleetDB()
+OPEN_STATES = {'queued', 'delivered', 'received', 'accepted', 'running'}
+
 
 def known_devices():
-    try:data=json.loads(REGISTRY.read_text(encoding='utf-8'))
-    except Exception:return set()
-    d=data.get('devices',{}) if isinstance(data,dict) else {}; return {str(x).upper() for x in d} if isinstance(d,dict) else set()
+    try:
+        data = json.loads(REGISTRY.read_text(encoding='utf-8'))
+    except Exception:
+        return set()
+    devices = data.get('devices', {}) if isinstance(data, dict) else {}
+    return {str(item).upper() for item in devices} if isinstance(devices, dict) else set()
 
-def enqueue(device,action,payload=None,deadline=None):
-    d=normalize_device_id(device); known=known_devices()
-    if known and d not in known: raise SystemExit(f'Unknown fleet device: {d}')
-    DB.initialize(); cid=DB.create_command(d,action,payload=payload or {},deadline_at=deadline); DB.export_legacy_commands(); print(cid)
+
+def canonical_payload(value):
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError('command payload must be an object')
+    return json.dumps(value, separators=(',', ':'), sort_keys=True)
+
+
+def matching_open_command(device, action, payload):
+    wanted = canonical_payload(payload)
+    for row in DB.list_commands(device, 256):
+        if str(row.get('action') or '') != action or str(row.get('state') or '') not in OPEN_STATES:
+            continue
+        try:
+            existing = canonical_payload(json.loads(row.get('payload_json') or '{}'))
+        except Exception:
+            continue
+        if existing == wanted:
+            return str(row['command_id'])
+    return None
+
+
+def enqueue(device, action, payload=None, deadline=None):
+    d = normalize_device_id(device)
+    known = known_devices()
+    if known and d not in known:
+        raise SystemExit(f'Unknown fleet device: {d}')
+    payload = payload or {}
+    canonical_payload(payload)
+    DB.initialize()
+    existing = matching_open_command(d, action, payload)
+    if existing:
+        cid = existing
+    else:
+        # Do not use the older action-only database dedupe path. Two update
+        # commands with different exact target commits are distinct work.
+        cid = DB.create_command(d, action, payload=payload, deadline_at=deadline, dedupe=False)
+    DB.export_legacy_commands()
+    print(cid)
+
 
 def show(device=None):
-    DB.initialize(); rows=DB.list_commands(device,64); print(json.dumps(rows,indent=2,sort_keys=True))
+    DB.initialize()
+    rows = DB.list_commands(device, 64)
+    print(json.dumps(rows, indent=2, sort_keys=True))
+
 
 def main():
-    if os.geteuid()!=0: raise SystemExit('Run as root')
-    p=argparse.ArgumentParser(description='LGHS SQLite-backed fleet command manager'); s=p.add_subparsers(dest='cmd')
-    q=s.add_parser('enqueue'); q.add_argument('device'); q.add_argument('action',choices=sorted(ALLOWED_COMMANDS)); q.add_argument('--payload-json',default='{}'); q.add_argument('--timeout',type=float,default=86400)
-    st=s.add_parser('status'); st.add_argument('device',nargs='?')
-    c=s.add_parser('cancel'); c.add_argument('command_id')
-    args=p.parse_args()
-    if args.cmd=='enqueue':
-        try: payload=json.loads(args.payload_json)
-        except Exception: raise SystemExit('Invalid --payload-json')
-        enqueue(args.device,args.action,payload,time.time()+max(1,args.timeout)); return
-    if args.cmd=='status': show(args.device); return
-    if args.cmd=='cancel': DB.initialize(); DB.transition_command(args.command_id,'canceled',stage='Canceled by administrator',message='Command canceled before completion'); DB.export_legacy_commands(); print(args.command_id); return
-    p.print_help(); raise SystemExit(2)
-if __name__=='__main__':main()
+    if os.geteuid() != 0:
+        raise SystemExit('Run as root')
+    parser = argparse.ArgumentParser(description='LGHS SQLite-backed fleet command manager')
+    sub = parser.add_subparsers(dest='cmd')
+    queue = sub.add_parser('enqueue')
+    queue.add_argument('device')
+    queue.add_argument('action', choices=sorted(ALLOWED_COMMANDS))
+    queue.add_argument('--payload-json', default='{}')
+    queue.add_argument('--timeout', type=float, default=86400)
+    status = sub.add_parser('status')
+    status.add_argument('device', nargs='?')
+    cancel = sub.add_parser('cancel')
+    cancel.add_argument('command_id')
+    args = parser.parse_args()
+    if args.cmd == 'enqueue':
+        try:
+            payload = json.loads(args.payload_json)
+            canonical_payload(payload)
+        except Exception as exc:
+            raise SystemExit(f'Invalid --payload-json: {exc}') from None
+        enqueue(args.device, args.action, payload, time.time() + max(1, args.timeout))
+        return
+    if args.cmd == 'status':
+        show(args.device)
+        return
+    if args.cmd == 'cancel':
+        DB.initialize()
+        DB.transition_command(args.command_id, 'canceled', stage='Canceled by administrator', message='Command canceled before completion')
+        DB.export_legacy_commands()
+        print(args.command_id)
+        return
+    parser.print_help()
+    raise SystemExit(2)
+
+
+if __name__ == '__main__':
+    main()

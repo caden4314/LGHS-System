@@ -2,12 +2,13 @@
 """Day-to-day LGHS Fleet Control dashboard.
 
 Stable navigation stays on the left. Live cache-backed fleet state, command
-acknowledgements, update progress, jobs, and warnings stay visible on the right.
-Existing screens and centered popups come from lghs-console-responsive.
+acknowledgements, update progress, jobs, warnings, and deployment recovery stay
+visible without requiring SSH for passive fleet operations.
 """
 import curses
 import importlib.machinery
 import importlib.util
+import json
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ from pathlib import Path
 
 BASE = "/usr/local/libexec/lghs-console-responsive-core"
 COMMAND_HELPER = Path("/usr/local/sbin/lghs-fleet-command")
+ROLLOUT_HELPER = Path("/usr/local/sbin/lghs-fleet-rollout")
 
 
 def load_base():
@@ -27,6 +29,7 @@ def load_base():
 
 ui = load_base()
 _original_start_job = ui.start_job
+_original_updates_screen = ui.updates_screen
 
 
 def clip(text, width):
@@ -107,6 +110,230 @@ def start_job_network_aware(state, title, targets, command=None, runner=None, po
 ui.start_job = start_job_network_aware
 
 
+def rollout_call(*args, timeout=10):
+    if not ROLLOUT_HELPER.exists():
+        raise RuntimeError(f"Missing {ROLLOUT_HELPER}")
+    proc = subprocess.run([str(ROLLOUT_HELPER), *map(str, args)], text=True, capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "rollout command failed").strip()[-1000:])
+    try:
+        return json.loads(proc.stdout or "{}")
+    except Exception as exc:
+        raise RuntimeError("rollout helper returned invalid JSON") from exc
+
+
+def deployment_rows(state, force=False):
+    now = time.monotonic()
+    if not force and now - state.get("deployments_loaded", 0.0) < 1.0:
+        return state.get("deployments_cache", [])
+    try:
+        data = rollout_call("list")
+        rows = data.get("deployments", []) if isinstance(data, dict) else []
+        rows = rows if isinstance(rows, list) else []
+        state["deployments_cache"] = rows
+        state["deployments_error"] = ""
+    except Exception as exc:
+        rows = state.get("deployments_cache", [])
+        state["deployments_error"] = str(exc)
+    state["deployments_loaded"] = now
+    return rows
+
+
+def deployment_counts(row):
+    counts = row.get("execution_counts") if isinstance(row, dict) else {}
+    return counts if isinstance(counts, dict) else {}
+
+
+def deployment_summary(row):
+    counts = deployment_counts(row)
+    ordered = []
+    for key in ("running", "accepted", "delivered", "queued", "succeeded", "failed", "timed_out", "rejected", "canceled"):
+        if counts.get(key):
+            ordered.append(f"{key[:4].upper()}:{counts[key]}")
+    return " ".join(ordered) or "no executions"
+
+
+def deployment_detail_lines(detail):
+    dep = detail.get("deployment", {}) if isinstance(detail, dict) else {}
+    rollout = detail.get("rollout", {}) if isinstance(detail, dict) else {}
+    runtime = detail.get("runtime", {}) if isinstance(detail, dict) else {}
+    executions = detail.get("executions", []) if isinstance(detail, dict) else []
+    target = str(dep.get("target_commit") or "")
+    lines = [
+        f"Name: {dep.get('name','')}",
+        f"ID: {dep.get('deployment_id','')}",
+        f"State: {str(dep.get('state','')).upper()}    Target: {target[:12] or '?'}",
+        f"Paused: {dep.get('paused_reason') or '-'}",
+        f"Active phase: {rollout.get('active_phase')}    Next phase: {rollout.get('next_phase')}",
+    ]
+    next_at = runtime.get("next_action_at") if isinstance(runtime, dict) else None
+    if next_at:
+        lines.append(f"Next automatic action: {time.strftime('%H:%M:%S', time.localtime(float(next_at)))}")
+    lines.extend(["", "DEVICE           PHASE STATE          TRY STAGE / ERROR"])
+    for row in executions if isinstance(executions, list) else []:
+        detail_text = row.get("error_message") or row.get("stage") or ""
+        lines.append(
+            f"{str(row.get('device_id','?'))[:16]:16} {int(row.get('phase') or 0):5d} "
+            f"{str(row.get('state','?')).upper()[:14]:14} {int(row.get('attempt') or 0):3d} {str(detail_text)[:52]}"
+        )
+    return lines
+
+
+def deployment_action(stdscr, state, deployment_id, action):
+    labels = {
+        "retry-failed": "Retry failed devices with new command attempts?",
+        "resume": "Resume this deployment? Active failure gates are NOT overridden.",
+        "cancel-remaining": "Cancel undispatched and not-yet-accepted deployment work?",
+        "rollback": "Create safe rollback deployment(s) from recorded previous commits?",
+        "advance": "Advance this manual rollout only if the current phase passes its gates?",
+    }
+    if not ui.confirm(stdscr, state, labels[action]):
+        return
+    try:
+        args = [action, deployment_id]
+        if action in {"retry-failed", "resume", "cancel-remaining", "rollback"}:
+            args += ["--actor", "fleet-control"]
+        result = rollout_call(*args)
+        state["deployments_loaded"] = 0.0
+        if action == "rollback":
+            rollbacks = result.get("rollbacks", []) if isinstance(result, dict) else []
+            text = "Created rollback deployment(s):\n" + "\n".join(
+                f"{x.get('deployment_id')} -> {str(x.get('target_commit',''))[:12]} ({len(x.get('devices',[]))} device(s))"
+                for x in rollbacks
+            )
+            skipped = result.get("skipped", {}) if isinstance(result, dict) else {}
+            if skipped:
+                text += "\n\nSkipped:\n" + "\n".join(f"{k}: {v}" for k, v in sorted(skipped.items()))
+        else:
+            text = json.dumps(result, indent=2, sort_keys=True)
+        ui.popup(stdscr, state, "Deployment action", text or "Completed")
+    except Exception as exc:
+        ui.popup(stdscr, state, "Deployment action failed", str(exc))
+
+
+def deployment_detail_screen(stdscr, state, deployment_id):
+    while True:
+        ui.maintenance(stdscr, state)
+        try:
+            detail = rollout_call("status", deployment_id)
+            error = ""
+        except Exception as exc:
+            detail, error = {}, str(exc)
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        ui.header(stdscr, state, "Deployment detail", "R retry failed | C continue/resume | X cancel remaining | L rollback | A advance")
+        lines = deployment_detail_lines(detail) if detail else [error or "Unable to load deployment."]
+        for pos, line in enumerate(lines[:max(1, h - 6)]):
+            ui.safe(stdscr, 3 + pos, 2, clip(line, w - 4), curses.A_BOLD if pos < 5 else 0)
+        ui.safe(stdscr, h - 2, 1, "Back return | R Retry Failed | C Continue | X Cancel Remaining | L Rollback | A Advance | F refresh", curses.A_DIM)
+        ui.safe(stdscr, h - 1, 1, "Rollback is planned only; it is never auto-dispatched from Fleet Control.", curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        global_action = ui.global_action(key)
+        if global_action == "help":
+            ui.contextual_help(stdscr, state); continue
+        if global_action:
+            return global_action
+        if ui.is_back(key):
+            return "deployments"
+        if key in (ord("f"), ord("F")):
+            continue
+        if key in (ord("r"), ord("R")):
+            deployment_action(stdscr, state, deployment_id, "retry-failed"); continue
+        if key in (ord("c"), ord("C")):
+            deployment_action(stdscr, state, deployment_id, "resume"); continue
+        if key in (ord("x"), ord("X")):
+            deployment_action(stdscr, state, deployment_id, "cancel-remaining"); continue
+        if key in (ord("l"), ord("L")):
+            deployment_action(stdscr, state, deployment_id, "rollback"); continue
+        if key in (ord("a"), ord("A")):
+            deployment_action(stdscr, state, deployment_id, "advance"); continue
+
+
+def deployments_screen(stdscr, state):
+    state["context"] = "deployments"
+    sel = 0
+    while True:
+        ui.maintenance(stdscr, state)
+        rows_data = deployment_rows(state)
+        sel = min(sel, max(0, len(rows_data) - 1))
+        h, w = stdscr.getmaxyx()
+        rows = max(1, h - 8)
+        start = max(0, sel - rows + 1) if sel >= rows else 0
+        ui.header(stdscr, state, "Deployments", f"{len(rows_data)} deployment(s) | Enter details/recovery | F refresh")
+        ui.safe(stdscr, 3, 1, "# STATE      DEV TARGET        NAME / EXECUTIONS", curses.A_BOLD | curses.A_UNDERLINE)
+        for pos, dep in enumerate(rows_data[start:start + rows]):
+            state_name = str(dep.get("state") or "?").upper()[:10]
+            device_count = int(dep.get("device_count") or 0)
+            target = str(dep.get("target_commit") or "")[:12]
+            name = str(dep.get("name") or dep.get("deployment_id") or "")
+            summary = deployment_summary(dep)
+            line = f"{pos + 1 if pos < 9 else ' ':>1} {state_name:10} {device_count:3d} {target:12} {name[:32]}  {summary}"
+            ui.safe(stdscr, 4 + pos, 1, clip(line, w - 2), curses.A_REVERSE if start + pos == sel else 0)
+        if not rows_data:
+            message = state.get("deployments_error") or "No deployments yet. Create one with lghs-fleet-rollout or Fleet API."
+            ui.safe(stdscr, 5, 3, clip(message, w - 6), curses.A_DIM)
+        ui.safe(stdscr, h - 2, 1, "Enter open | Up/Down select | F refresh | Back return", curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if ui.is_back(key):
+            return "updates"
+        if key in (ord("f"), ord("F"), ord("r")):
+            deployment_rows(state, True); continue
+        sel, opened = ui.list_nav(key, sel, len(rows_data), start, rows)
+        if opened and rows_data:
+            result = deployment_detail_screen(stdscr, state, str(rows_data[sel].get("deployment_id")))
+            if result not in {"deployments", None}:
+                return result
+            deployment_rows(state, True)
+
+
+def updates_hub_screen(stdscr, state):
+    state["context"] = "updates"
+    opts = ["Deployment manager", "Direct / legacy Pi updates"]
+    sel = 0
+    while True:
+        ui.maintenance(stdscr, state)
+        ui.header(stdscr, state, "Deployments / Updates", "Fleet Operations deployments are exact-commit and recovery-aware.")
+        for index, label in enumerate(opts):
+            ui.safe(stdscr, 3 + index, 4, f"{index + 1}. {label}", curses.A_REVERSE if index == sel else 0)
+        h, _ = stdscr.getmaxyx()
+        ui.safe(stdscr, h - 2, 1, "Deployment manager: frozen targets, phases, recovery, rollback planning", curses.A_DIM)
+        ui.safe(stdscr, h - 1, 1, "Direct updates preserve the existing single-Pi/all-online update controls.", curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if ui.is_back(key):
+            return "main"
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(opts) - 1, sel + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel - 1)
+        elif key in (ord("1"), ord("2")):
+            sel = key - ord("1"); key = 10
+        if key in (10, 13):
+            if sel == 0:
+                result = deployments_screen(stdscr, state)
+                if result not in {"updates", "deployments", None}:
+                    return result
+            else:
+                result = _original_updates_screen(stdscr, state)
+                if result != "main":
+                    return result
+
+
+ui.updates_screen = updates_hub_screen
+
+
 def draw_progress(win, y, x, width, progress):
     if width < 8:
         return
@@ -128,7 +355,9 @@ def draw_nav(stdscr, state, items, selected, y, x, h, w):
         elif target == "attention": count = str(len(ui.issues(devices, state)))
         elif target == "sudo": count = str(len(ui.pending_requests(devices)))
         elif target == "updates":
-            n = len(command_rows(state, True)) + sum(bool(ui.operation_label(ui.operation_for_device(d))) for d in devices)
+            deployments = deployment_rows(state)
+            active_deployments = sum(str(x.get("state") or "").lower() in {"queued", "running", "paused"} for x in deployments)
+            n = active_deployments + len(command_rows(state, True)) + sum(bool(ui.operation_label(ui.operation_for_device(d))) for d in devices)
             count = str(n) if n else ""
         line = f"{i+1}. {name}"
         if count:
@@ -229,7 +458,7 @@ def dashboard_main_menu(stdscr, state):
     state["context"] = "main"
     items = [
         ("Fleet", "fleet"), ("Telemetry", "telemetry"), ("Sudo requests", "sudo"),
-        ("Updates", "updates"), ("Needs Attention", "attention"), ("Activity", "activity"),
+        ("Deployments / Updates", "updates"), ("Needs Attention", "attention"), ("Activity", "activity"),
         ("Notifications", "notices"), ("Audit & logs", "logs"), ("Controller", "controller"),
     ]
     sel = min(state.get("menu_selected", 0), len(items) - 1)
@@ -262,7 +491,7 @@ def dashboard_main_menu(stdscr, state):
         if right_w - lower_w - 1 >= 20:
             draw_recent(stdscr, state, body_y + live_h + jobs_h + 2, right_x + lower_w + 1, lower_h, right_w - lower_w - 1)
         ui.safe(stdscr, h - 2, 1, "Enter open | Up/Down menu | J jobs | F9 notices | / search | G group | R refresh", curses.A_DIM)
-        ui.safe(stdscr, h - 1, 1, "Updates: QUEUED > DELIVERED > ACCEPTED > RUNNING > COMPLETE | F10 quit", curses.A_DIM)
+        ui.safe(stdscr, h - 1, 1, "Fleet Ops: frozen deployments + recovery | Commands: QUEUED > DELIVERED > ACCEPTED > RUNNING > COMPLETE", curses.A_DIM)
         ui.draw_toast(stdscr, state)
         stdscr.refresh()
         key = ui.read_key(stdscr, state)
@@ -282,7 +511,7 @@ def dashboard_main_menu(stdscr, state):
         if key in (ord("g"), ord("G")):
             ui.cycle_group(state); continue
         if key in (ord("r"), ord("R")):
-            ui.refresh_cache(state, True); continue
+            ui.refresh_cache(state, True); state["deployments_loaded"] = 0.0; continue
         if key in (curses.KEY_DOWN, ord("j")): sel = min(len(items) - 1, sel + 1)
         elif key in (curses.KEY_UP, ord("k")): sel = max(0, sel - 1)
         elif ord("1") <= key <= ord("9"):

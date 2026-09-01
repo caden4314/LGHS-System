@@ -1,5 +1,5 @@
 [Unit]
-Description=LGHS Bluetooth Wi-Fi Provisioning Server
+Description=LGHS Bluetooth Wi-Fi + Cloudflare Provisioning Server
 After=bluetooth.service lghs-bt-prepare.service NetworkManager.service
 Requires=bluetooth.service lghs-bt-prepare.service
 Wants=NetworkManager.service
@@ -21,7 +21,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/lghs
-ReadWritePaths=/var/lib/lghs /run
+ReadWritePaths=/var/lib/lghs /run /etc/lghs/fleet.json
 
 [Install]
 WantedBy=multi-user.target

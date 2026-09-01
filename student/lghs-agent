@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LGHS 0.5 unprivileged managed-device agent.
+"""LGHS 0.6 unprivileged managed-device agent.
 
 The agent owns network-facing telemetry, long-poll command delivery, event
 publication, and persistent local cursors. Privileged reads/actions are routed
@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import threading
 import time
 import urllib.request
@@ -97,6 +98,9 @@ def initial_state() -> dict[str, Any]:
     old.setdefault('commands', [])
     old.setdefault('sequence', 0)
     old.setdefault('audit', {})
+    old.setdefault('controller_last_success_at', 0.0)
+    old.setdefault('controller_last_error_at', 0.0)
+    old.setdefault('controller_last_error', '')
     return old
 
 
@@ -112,6 +116,20 @@ def next_sequence() -> int:
         STATE_DATA['sequence'] = int(STATE_DATA.get('sequence', 0)) + 1
         save()
         return int(STATE_DATA['sequence'])
+
+
+def mark_controller_success() -> None:
+    with LOCK:
+        STATE_DATA['controller_last_success_at'] = time.time()
+        STATE_DATA['controller_last_error'] = ''
+        save()
+
+
+def mark_controller_error(exc: Exception) -> None:
+    with LOCK:
+        STATE_DATA['controller_last_error_at'] = time.time()
+        STATE_DATA['controller_last_error'] = str(exc)[-300:]
+        save()
 
 
 def rpc(obj: dict[str, Any]) -> dict[str, Any]:
@@ -170,6 +188,42 @@ def clock_synced() -> bool:
     return Path('/run/systemd/timesync/synchronized').exists()
 
 
+def failed_systemd_units() -> list[str]:
+    try:
+        proc = subprocess.run(
+            ['systemctl', '--failed', '--no-legend', '--plain'],
+            text=True,
+            capture_output=True,
+            timeout=3,
+        )
+        rows: list[str] = []
+        for line in (proc.stdout or '').splitlines():
+            parts = line.split()
+            if parts:
+                rows.append(parts[0])
+        return sorted(set(rows))[:64]
+    except Exception:
+        return []
+
+
+def controller_transport_state() -> dict[str, Any]:
+    with LOCK:
+        success_at = float(STATE_DATA.get('controller_last_success_at') or 0)
+        error_at = float(STATE_DATA.get('controller_last_error_at') or 0)
+        error = str(STATE_DATA.get('controller_last_error') or '')
+    now = time.time()
+    max_age = max(30.0, REPORT_INTERVAL * 3.0)
+    age = (now - success_at) if success_at else None
+    return {
+        'last_success_at': success_at or None,
+        'last_error_at': error_at or None,
+        'last_error': error,
+        'age_seconds': round(age, 3) if age is not None else None,
+        'fresh': bool(age is not None and age <= max_age),
+        'max_age_seconds': max_age,
+    }
+
+
 def metrics() -> dict[str, Any]:
     mem: dict[str, int] = {}
     for line in Path('/proc/meminfo').read_text().splitlines():
@@ -182,6 +236,7 @@ def metrics() -> dict[str, Any]:
     free = stat.f_bavail * stat.f_frsize
     inode_total = stat.f_files
     inode_free = stat.f_favail
+    root_readonly = bool(stat.f_flag & getattr(os, 'ST_RDONLY', 1))
     try:
         temp = round(int(Path('/sys/class/thermal/thermal_zone0/temp').read_text()) / 1000, 1)
     except Exception:
@@ -192,6 +247,7 @@ def metrics() -> dict[str, Any]:
         'mem_pct': round(100 * (mem.get('MemTotal', 1) - mem.get('MemAvailable', 0)) / max(mem.get('MemTotal', 1), 1), 1),
         'disk_pct': round(100 * (total - free) / max(total, 1), 1),
         'inode_pct': round(100 * (inode_total - inode_free) / max(inode_total, 1), 1),
+        'root_readonly': root_readonly,
         'temp_c': temp,
         'load1': os.getloadavg()[0],
         'wifi': wifi_signal(),
@@ -235,14 +291,34 @@ def structured_health(status: dict[str, Any], sample: dict[str, Any]) -> dict[st
     temp = sample.get('temp_c')
     disk = sample.get('disk_pct')
     inode = sample.get('inode_pct')
+    memory = sample.get('mem_pct')
+    wifi = sample.get('wifi', {}) if isinstance(sample.get('wifi'), dict) else {}
+    signal = wifi.get('signal_dbm')
+    root_readonly = bool(sample.get('root_readonly'))
+    failed_units = failed_systemd_units()
+    transport = controller_transport_state()
+
     checks.append(health_check('hardware.temperature', 'pass' if not isinstance(temp, (int, float)) or temp < 75 else 'fail', 'critical' if isinstance(temp, (int, float)) and temp >= 85 else 'warning', temp, '<75 C', 'inspect:cooling'))
+    checks.append(health_check('memory.pressure', 'pass' if not isinstance(memory, (int, float)) or memory < 92 else 'fail', 'critical' if isinstance(memory, (int, float)) and memory >= 98 else 'warning', memory, '<92%', 'inspect:memory'))
     checks.append(health_check('storage.root', 'pass' if not isinstance(disk, (int, float)) or disk < 90 else 'fail', 'critical' if isinstance(disk, (int, float)) and disk >= 97 else 'warning', disk, '<90%', 'cleanup:disk'))
+    checks.append(health_check('storage.root-writable', 'fail' if root_readonly else 'pass', 'critical', root_readonly, False, 'inspect:filesystem'))
     checks.append(health_check('storage.inodes', 'pass' if not isinstance(inode, (int, float)) or inode < 90 else 'fail', 'warning', inode, '<90%', 'cleanup:inodes'))
-    checks.append(health_check('clock.synchronized', 'pass' if clock_synced() else 'fail', 'warning', clock_synced(), True, 'restart:time-sync'))
-    checks.append(health_check('power.undervoltage', 'pass' if not (raw.get('undervoltage_now') or raw.get('undervoltage_occurred')) else 'fail', 'critical' if raw.get('undervoltage_now') else 'warning', raw.get('throttled_raw', '0x0'), 'no undervoltage', 'inspect:power'))
-    checks.append(health_check('hardware.throttling', 'pass' if not (raw.get('throttled_now') or raw.get('throttled_occurred')) else 'fail', 'critical' if raw.get('throttled_now') else 'warning', raw.get('throttled_raw', '0x0'), 'no throttling', 'inspect:power-thermal'))
+    synced = clock_synced()
+    checks.append(health_check('clock.synchronized', 'pass' if synced else 'fail', 'warning', synced, True, 'restart:time-sync'))
+
+    undervoltage_now = bool(raw.get('undervoltage_now'))
+    undervoltage_history = bool(raw.get('undervoltage_occurred')) and not undervoltage_now
+    throttled_now = bool(raw.get('throttled_now'))
+    throttled_history = bool(raw.get('throttled_occurred')) and not throttled_now
+    checks.append(health_check('power.undervoltage', 'fail' if undervoltage_now else 'pass', 'critical', raw.get('throttled_raw', '0x0'), 'no current undervoltage', 'inspect:power'))
+    checks.append(health_check('power.undervoltage-history', 'fail' if undervoltage_history else 'pass', 'warning', raw.get('throttled_raw', '0x0'), 'no historical undervoltage since boot', 'inspect:power-history'))
+    checks.append(health_check('hardware.throttling', 'fail' if throttled_now else 'pass', 'critical', raw.get('throttled_raw', '0x0'), 'no current throttling', 'inspect:power-thermal'))
+    checks.append(health_check('hardware.throttling-history', 'fail' if throttled_history else 'pass', 'warning', raw.get('throttled_raw', '0x0'), 'no historical throttling since boot', 'inspect:power-thermal-history'))
     checks.append(health_check('system.reboot-required', 'fail' if raw.get('reboot_required') else 'pass', 'warning', bool(raw.get('reboot_required')), False, 'schedule:reboot'))
-    return {'health_version': 1, 'checks': checks}
+    checks.append(health_check('system.failed-units', 'fail' if failed_units else 'pass', 'warning', failed_units, [], 'inspect:systemd-failures'))
+    checks.append(health_check('network.wifi-signal', 'pass' if not isinstance(signal, (int, float)) or signal >= -82 else 'fail', 'warning', signal, '>= -82 dBm', 'inspect:wifi'))
+    checks.append(health_check('transport.controller', 'pass' if transport.get('fresh') else 'fail', 'critical', transport, f"success within {int(transport.get('max_age_seconds') or 30)} seconds", 'inspect:fleet-api-connectivity'))
+    return {'health_version': 2, 'checks': checks}
 
 
 def update_progress(rows: list[dict[str, Any]], status_blob: dict[str, Any]) -> list[dict[str, Any]]:
@@ -368,7 +444,7 @@ def request(url: str, method: str = 'GET', body: dict[str, Any] | None = None) -
         headers={
             'Authorization': 'Bearer ' + token(),
             'Content-Type': 'application/json',
-            'User-Agent': 'LGHS-Agent/0.5',
+            'User-Agent': 'LGHS-Agent/0.6',
         },
     )
     with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
@@ -429,10 +505,12 @@ def reporter() -> None:
         try:
             base = parse_conf().get('URL', '').rstrip('/')
             result = request(f'{base}/v1/report/{device()}', 'POST', envelope())
+            mark_controller_success()
             apply_audit_ack(result.get('audit_ack', {}))
             accept(result.get('commands', []))
             delay = REPORT_INTERVAL
-        except Exception:
+        except Exception as exc:
+            mark_controller_error(exc)
             delay = min(max(REPORT_INTERVAL, delay * 1.7), 60.0)
         remaining = max(0.25, delay - (time.monotonic() - started))
         WAKE.wait(remaining)
@@ -444,8 +522,10 @@ def longpoll() -> None:
         try:
             base = parse_conf().get('URL', '').rstrip('/')
             result = request(f'{base}/v1/commands/{device()}?wait={min(LONG_POLL, 30)}')
+            mark_controller_success()
             accept(result.get('commands', []))
-        except Exception:
+        except Exception as exc:
+            mark_controller_error(exc)
             STOP.wait(2)
 
 

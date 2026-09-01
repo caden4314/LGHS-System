@@ -21,21 +21,24 @@ BT_INDEX = os.environ.get("LGHS_BT_INDEX", "hci0")
 DISCOVERY_TIMEOUT = float(os.environ.get("LGHS_BT_DISCOVERY_TIMEOUT", "12"))
 RETRY_BACKOFF = float(os.environ.get("LGHS_BT_RETRY_BACKOFF", "5"))
 COMMAND_TIMEOUT = 6
+SOCKET_TIMEOUT = 180
 ALIAS_PREFIX = "LGHS-PROVISION-"
 ENABLED = Path("/etc/lghs/bluetooth-bootstrap-enabled")
 STATE_DIR = Path("/var/lib/lghs/bootstrap")
 PROVISIONED = STATE_DIR / "wifi-provisioned.json"
 TOKEN_PATHS = (Path("/etc/lghs/secrets/fleet-api-token"), Path("/var/lib/lghs-agent/fleet-api-token"))
 CONF_PATHS = (Path("/etc/lghs/fleet-api.conf"), Path("/var/lib/lghs-agent/fleet-api.conf"))
+HOST_KEY = Path("/etc/ssh/ssh_host_ed25519_key.pub")
+CLOUDFLARE_INSTALL = "/usr/local/sbin/lghs-cloudflare-install"
 MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\b")
 SOL_BLUETOOTH = getattr(socket, "SOL_BLUETOOTH", 274)
 BT_SECURITY = getattr(socket, "BT_SECURITY", 4)
 BT_SECURITY_LOW = 1
 
 
-def run(cmd, timeout=None):
+def run(cmd, timeout=None, input_text=None):
     try:
-        return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        return subprocess.run(cmd, text=True, input=input_text, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "command timed out")
 
@@ -49,9 +52,6 @@ def require_command(cmd, description, timeout=COMMAND_TIMEOUT):
 
 
 def set_app_authenticated_security(sock):
-    # The LGHS protocol authenticates both endpoints with the per-device Fleet
-    # token and encrypts the payload with X25519/HKDF + AES-GCM. BlueZ pairing
-    # is zero-touch and only establishes the underlying RFCOMM transport.
     sock.setsockopt(SOL_BLUETOOTH, BT_SECURITY, struct.pack("BB", BT_SECURITY_LOW, 0))
 
 
@@ -79,8 +79,6 @@ def fleet_token():
 def configure_adapter():
     require_command(["rfkill", "unblock", "bluetooth"], "Bluetooth rfkill unblock")
     require_command(["bluetoothctl", "power", "on"], "Bluetooth power-on")
-    # Explicitly select the controller: unindexed btmgmt commands can block on
-    # this Pi/BlueZ combination and stall first-boot provisioning indefinitely.
     require_command(["btmgmt", "-i", BT_INDEX, "io-cap", "3"], "Bluetooth IO capability setup")
     require_command(["btmgmt", "-i", BT_INDEX, "pairable", "on"], "Bluetooth pairable setup")
 
@@ -96,13 +94,6 @@ def _cached_controller():
 
 
 def discover_controller(timeout=None):
-    """Wait for a matching BR/EDR discovery event instead of polling.
-
-    btmgmt stays in discovery mode and emits device/name events as they arrive.
-    The process is stopped immediately after a provisioning controller appears.
-    A timeout is used only by --dry-run so the diagnostic command can return;
-    the normal bootstrap service waits continuously for an event.
-    """
     try:
         proc = subprocess.Popen(
             ["btmgmt", "-i", BT_INDEX, "find", "-b"],
@@ -231,12 +222,33 @@ def apply_wifi(wifi):
     return name
 
 
+def install_cloudflare(cloudflare):
+    if not isinstance(cloudflare, dict):
+        raise RuntimeError("controller did not provide Cloudflare bootstrap data")
+    ssh_host = str(cloudflare.get("ssh_host") or "")
+    tunnel_token = str(cloudflare.get("tunnel_token") or "")
+    if not ssh_host or not tunnel_token:
+        raise RuntimeError("Cloudflare bootstrap data is incomplete")
+    p = run([CLOUDFLARE_INSTALL], timeout=120, input_text=tunnel_token + "\n")
+    if p.returncode != 0:
+        raise RuntimeError("Cloudflare tunnel install failed: " + (p.stderr or p.stdout or "unknown error").strip()[-500:])
+    return ssh_host
+
+
+def ssh_host_key():
+    text = HOST_KEY.read_text(encoding="utf-8").strip()
+    parts = text.split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise RuntimeError("student ED25519 SSH host key is unavailable")
+    return f"{parts[0]} {parts[1]}"
+
+
 def exchange(address, dry_run=False):
     token = fleet_token()
     did = device_id()
     sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
     set_app_authenticated_security(sock)
-    sock.settimeout(20)
+    sock.settimeout(SOCKET_TIMEOUT)
     try:
         sock.connect((address, CHANNEL))
         hello = recv_frame(sock)
@@ -255,6 +267,7 @@ def exchange(address, dry_run=False):
             "client_nonce": client_nonce,
             "client_pub": client_pub,
             "proof": proof(token, "student", tx),
+            "dry_run": bool(dry_run),
         })
         response = recv_frame(sock)
         if response.get("v") != PROTOCOL_VERSION or response.get("type") != "provision":
@@ -276,20 +289,32 @@ def exchange(address, dry_run=False):
             print(f"SSID: {ssid}")
             print(f"Security: {key_mgmt}")
             print(f"Hidden: {'yes' if hidden else 'no'}")
-            print("Wi-Fi profile was NOT modified.")
+            print("Wi-Fi profile and Cloudflare tunnel were NOT modified.")
             return True
 
         connection = apply_wifi(wifi)
-        ok = fleet_health_ok()
-        send_frame(sock, {"v": PROTOCOL_VERSION, "type": "result", "status": "fleet-online" if ok else "wifi-online"})
-        if not ok:
+        if not fleet_health_ok():
             raise RuntimeError("Wi-Fi joined but Fleet API health check failed")
+
+        ssh_host = install_cloudflare(payload.get("cloudflare"))
+        send_frame(sock, {
+            "v": PROTOCOL_VERSION,
+            "type": "result",
+            "status": "ready",
+            "ssh_host": ssh_host,
+            "ssh_host_key": ssh_host_key(),
+        })
+        complete = recv_frame(sock)
+        if complete.get("v") != PROTOCOL_VERSION or complete.get("type") != "complete" or complete.get("status") != "ready":
+            raise RuntimeError("controller did not finalize zero-touch provisioning")
+
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(STATE_DIR, 0o700)
         marker = {
             "device_id": did,
             "controller_id": cid,
             "connection": connection,
+            "ssh_host": ssh_host,
             "provisioned_at": time.time(),
             "protocol": PROTOCOL_VERSION,
         }
@@ -321,7 +346,7 @@ def main():
             return 0
     configure_adapter()
     if dry_run:
-        print("LGHS Bluetooth bootstrap dry-run: no NetworkManager changes will be made.", flush=True)
+        print("LGHS Bluetooth bootstrap dry-run: no NetworkManager or Cloudflare changes will be made.", flush=True)
         found = discover_controller(timeout=DISCOVERY_TIMEOUT)
         if not found:
             print("Bluetooth bootstrap dry-run failed: no LGHS controller found", file=sys.stderr)
@@ -334,7 +359,7 @@ def main():
             print(f"Bluetooth bootstrap dry-run failed: {exc}", file=sys.stderr, flush=True)
             return 1
 
-    print("LGHS Bluetooth bootstrap waiting for controller discovery events", flush=True)
+    print("LGHS Bluetooth zero-touch bootstrap waiting for controller discovery events", flush=True)
     while not PROVISIONED.exists():
         found = discover_controller()
         if not found:
@@ -343,9 +368,9 @@ def main():
             continue
         address, name = found
         try:
-            print(f"Found {name}; attempting authenticated provisioning", flush=True)
+            print(f"Found {name}; attempting authenticated Wi-Fi + Cloudflare provisioning", flush=True)
             if exchange(address):
-                print("LGHS Bluetooth Wi-Fi bootstrap completed.", flush=True)
+                print("LGHS Bluetooth Wi-Fi + Cloudflare bootstrap completed.", flush=True)
                 return 0
         except Exception as exc:
             print(f"Bluetooth bootstrap attempt failed: {exc}", file=sys.stderr, flush=True)

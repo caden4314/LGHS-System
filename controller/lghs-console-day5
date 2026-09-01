@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""LGHS Fleet Control v0.6 deployment creation and filtering layer."""
+from __future__ import annotations
+
+import curses
+import importlib.machinery
+import importlib.util
+import json
+import sys
+import time
+
+BASE = '/usr/local/libexec/lghs-console-day4-core'
+sys.path.insert(0, '/usr/local/lib/lghs-python')
+from lghs.fleet_ui import build_create_args, filter_deployments
+
+
+def load_base():
+    loader = importlib.machinery.SourceFileLoader('lghs_console_day4', BASE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+day4 = load_base()
+day3 = day4.day3
+day2 = day4.day2
+ui = day4.ui
+
+
+def clip(value, width):
+    return str(value)[:max(0, width)]
+
+
+def choose(stdscr, state, title, prompt, options, default=0):
+    sel = max(0, min(int(default), len(options) - 1))
+    while True:
+        stdscr.erase()
+        ui.header(stdscr, state, title, prompt)
+        for index, (label, value) in enumerate(options):
+            ui.safe(stdscr, 3 + index, 4, f'{index + 1}. {label}', curses.A_REVERSE if index == sel else 0)
+        h, _ = stdscr.getmaxyx()
+        ui.safe(stdscr, h - 2, 1, 'Enter choose | Up/Down | Back cancel', curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == 'help':
+            ui.contextual_help(stdscr, state); continue
+        if action or ui.is_back(key):
+            return None
+        if key in (curses.KEY_DOWN, ord('j')):
+            sel = min(len(options) - 1, sel + 1)
+        elif key in (curses.KEY_UP, ord('k')):
+            sel = max(0, sel - 1)
+        elif ord('1') <= key <= ord('9') and key - ord('1') < len(options):
+            sel = key - ord('1'); key = 10
+        if key in (10, 13):
+            return options[sel][1]
+
+
+def prompt_int(stdscr, state, title, prompt, default, minimum, maximum):
+    while True:
+        value = ui.prompt_text(stdscr, state, title, prompt, str(default))
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            ui.popup(stdscr, state, title, 'Enter a whole number.'); continue
+        if minimum <= parsed <= maximum:
+            return parsed
+        ui.popup(stdscr, state, title, f'Value must be between {minimum} and {maximum}.')
+
+
+def selected_device_id(state):
+    devices = state.get('devices', [])
+    index = int(state.get('selected', 0) or 0)
+    if not devices or index < 0 or index >= len(devices):
+        return ''
+    return ui.device_id(devices[index])
+
+
+def create_deployment(stdscr, state):
+    title = 'New deployment'
+    default_name = 'Fleet rollout ' + time.strftime('%Y-%m-%d %H:%M')
+    name = ui.prompt_text(stdscr, state, title, 'Deployment name:', default_name)
+    if name is None:
+        return
+
+    target_type = choose(stdscr, state, title, 'Choose frozen deployment target', [
+        ('Selected / named device', 'device'),
+        ('Fleet group ID', 'group'),
+        ('Exact tag', 'tag'),
+        ('All enrolled devices', 'all'),
+    ])
+    if target_type is None:
+        return
+    target_value = ''
+    if target_type == 'device':
+        target_value = ui.prompt_text(stdscr, state, title, 'Device ID:', selected_device_id(state))
+    elif target_type == 'group':
+        target_value = ui.prompt_text(stdscr, state, title, 'Group ID:', '')
+    elif target_type == 'tag':
+        target_value = ui.prompt_text(stdscr, state, title, 'Exact tag (example ring:canary):', '')
+    if target_type != 'all' and target_value is None:
+        return
+
+    target_commit = ui.prompt_text(stdscr, state, title, 'Exact immutable target commit (40-char Git SHA):', '')
+    if target_commit is None:
+        return
+    target_version = ui.prompt_text(stdscr, state, title, 'Target version label (optional):', '0.6.0-dev')
+    if target_version is None:
+        return
+
+    strategy = choose(stdscr, state, title, 'Rollout strategy', [
+        ('All at once', 'all'),
+        ('Phased: canary + waves', 'phased'),
+    ])
+    if strategy is None:
+        return
+
+    spec = {
+        'name': name,
+        'target_type': target_type,
+        'target_value': target_value or '',
+        'target_commit': target_commit,
+        'target_version': target_version,
+        'phased': strategy == 'phased',
+    }
+    if strategy == 'phased':
+        canary = prompt_int(stdscr, state, title, 'Canary device count:', 1, 1, 9999)
+        if canary is None:
+            return
+        canary_tag = ui.prompt_text(stdscr, state, title, 'Preferred canary tag (optional):', 'ring:canary')
+        if canary_tag is None:
+            return
+        waves = ui.prompt_text(stdscr, state, title, 'Cumulative wave percentages:', '20,50,100')
+        if waves is None:
+            return
+        soak = prompt_int(stdscr, state, title, 'Soak seconds between healthy phases:', 300, 0, 86400)
+        if soak is None:
+            return
+        spec.update({'canary_count': canary, 'canary_tag': canary_tag, 'waves': waves, 'soak_seconds': soak})
+
+    health_age = prompt_int(stdscr, state, title, 'Max structured health report age (seconds):', 45, 10, 600)
+    if health_age is None:
+        return
+    spec['health_max_age'] = health_age
+
+    mode = choose(stdscr, state, title, 'Initial deployment behavior', [
+        ('Plan only (no commands dispatched)', 'plan'),
+        ('Dispatch first phase now; advance manually', 'dispatch'),
+        ('Automatic phase dispatch / soak / advance', 'auto'),
+    ])
+    if mode is None:
+        return
+    spec['dispatch'] = mode == 'dispatch'
+    spec['auto'] = mode == 'auto'
+    if mode == 'auto':
+        spec['respect_maintenance'] = ui.confirm(stdscr, state, 'Hold automatic phase dispatch until each Pi is inside its maintenance window?')
+
+    try:
+        args = build_create_args(spec)
+    except Exception as exc:
+        ui.popup(stdscr, state, 'Invalid deployment', str(exc))
+        return
+
+    summary = [
+        f"Name: {name}",
+        f"Target: {target_type} {target_value if target_type != 'all' else 'ALL'}",
+        f"Commit: {target_commit}",
+        f"Version: {target_version or '-'}",
+        f"Strategy: {'phased' if spec.get('phased') else 'all-at-once'}",
+        f"Mode: {mode}",
+        f"Health freshness: {health_age}s",
+        f"Maintenance-aware: {'yes' if spec.get('respect_maintenance') else 'no'}",
+        '',
+        'Target membership is resolved once and frozen when this deployment is created.',
+    ]
+    ui.popup(stdscr, state, 'Deployment preview', '\n'.join(summary))
+    if not ui.confirm(stdscr, state, 'Create this exact-commit deployment?'):
+        return
+    try:
+        result = day2.rollout_call(*args, timeout=15)
+        state['deployments_loaded'] = 0.0
+        state['deployment_selected_id'] = result.get('deployment_id') if isinstance(result, dict) else None
+        target = result.get('target', {}) if isinstance(result, dict) else {}
+        devices = target.get('resolved_devices', []) if isinstance(target, dict) else []
+        text = json.dumps(result, indent=2, sort_keys=True)
+        if devices:
+            text = f"Frozen target: {len(devices)} device(s)\n" + ', '.join(devices) + '\n\n' + text
+        ui.popup(stdscr, state, 'Deployment created', text)
+    except Exception as exc:
+        ui.popup(stdscr, state, 'Deployment creation failed', str(exc))
+
+
+def filtered_rows(state, force=False):
+    rows = day2.deployment_rows(state, force)
+    query = str(state.get('deployment_filter') or '')
+    return list(filter_deployments(rows, query))
+
+
+def deployments_screen(stdscr, state):
+    state['context'] = 'deployments'
+    sel = 0
+    while True:
+        ui.maintenance(stdscr, state)
+        rows_data = filtered_rows(state)
+        selected_id = state.get('deployment_selected_id')
+        if selected_id:
+            found = next((i for i, row in enumerate(rows_data) if row.get('deployment_id') == selected_id), None)
+            if found is not None:
+                sel = found
+        sel = min(sel, max(0, len(rows_data) - 1))
+        if rows_data:
+            state['deployment_selected_id'] = rows_data[sel].get('deployment_id')
+        h, w = stdscr.getmaxyx()
+        rows = max(1, h - 9)
+        start = max(0, sel - rows + 1) if sel >= rows else 0
+        query = str(state.get('deployment_filter') or '')
+        all_count = len(day2.deployment_rows(state))
+        ui.header(stdscr, state, 'Deployments', f"{len(rows_data)}/{all_count} shown | N new | / filter | Enter details/recovery")
+        ui.safe(stdscr, 2, 1, clip('Filter: ' + (query or '<none>'), w - 2), curses.A_DIM)
+        ui.safe(stdscr, 3, 1, '# STATE      DEV TARGET        NAME / EXECUTIONS', curses.A_BOLD | curses.A_UNDERLINE)
+        for pos, dep in enumerate(rows_data[start:start + rows]):
+            state_name = str(dep.get('state') or '?').upper()[:10]
+            device_count = int(dep.get('device_count') or 0)
+            target = str(dep.get('target_commit') or '')[:12]
+            name = str(dep.get('name') or dep.get('deployment_id') or '')
+            summary = day2.deployment_summary(dep)
+            line = f"{pos + 1 if pos < 9 else ' ':>1} {state_name:10} {device_count:3d} {target:12} {name[:32]}  {summary}"
+            ui.safe(stdscr, 4 + pos, 1, clip(line, w - 2), curses.A_REVERSE if start + pos == sel else 0)
+        if not rows_data:
+            message = state.get('deployments_error') or ('No deployments match this filter.' if query else 'No deployments yet. Press N to create one.')
+            ui.safe(stdscr, 5, 3, clip(message, w - 6), curses.A_DIM)
+        ui.safe(stdscr, h - 2, 1, 'N New | / Filter | C Clear filter | Enter open | F refresh | Back return', curses.A_DIM)
+        ui.safe(stdscr, h - 1, 1, 'Filters: state:paused device:CS-999 group:room101 tag:ring:canary target:abc123 auto:true maintenance:true', curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == 'help':
+            ui.contextual_help(stdscr, state); continue
+        if action:
+            return action
+        if ui.is_back(key):
+            return 'updates'
+        if key in (ord('n'), ord('N')):
+            create_deployment(stdscr, state)
+            filtered_rows(state, True)
+            continue
+        if key == ord('/'):
+            value = ui.prompt_text(stdscr, state, 'DEPLOYMENT FILTER', 'AND terms; keyed filters supported:', query)
+            if value is not None:
+                state['deployment_filter'] = value.strip()
+                sel = 0
+            continue
+        if key in (ord('c'), ord('C')):
+            state['deployment_filter'] = ''
+            sel = 0
+            continue
+        if key in (ord('f'), ord('F'), ord('r')):
+            filtered_rows(state, True)
+            continue
+        previous = sel
+        sel, opened = ui.list_nav(key, sel, len(rows_data), start, rows)
+        if rows_data and sel != previous:
+            state['deployment_selected_id'] = rows_data[sel].get('deployment_id')
+        if opened and rows_data:
+            deployment_id = str(rows_data[sel].get('deployment_id'))
+            state['deployment_selected_id'] = deployment_id
+            result = day2.deployment_detail_screen(stdscr, state, deployment_id)
+            if result not in {'deployments', None}:
+                return result
+            filtered_rows(state, True)
+
+
+day2.deployments_screen = deployments_screen
+
+
+def main():
+    day4.main()
+
+
+if __name__ == '__main__':
+    main()

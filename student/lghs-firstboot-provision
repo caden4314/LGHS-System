@@ -6,6 +6,7 @@ STATE_DIR=/var/lib/lghs
 STAMP="$STATE_DIR/provisioned"
 STUDENT_USER="lg_cs_cont"
 ADMIN_USER="cs_admin"
+DEFAULT_FLEET_API_URL="https://fleet-api.scenicrouteservers.com"
 log(){ logger -t "$LOG_TAG" "$*" 2>/dev/null || true;printf '[LGHS first boot] %s\n' "$*"; }
 [[ $EUID -eq 0 ]] || { echo "Must run as root" >&2;exit 1; }
 mkdir -p "$STATE_DIR" /etc/lghs
@@ -22,10 +23,11 @@ FLEET_PUBLIC="$BOOT_DIR/lghs-controller-key.pub";FLEET_PRIVATE="$BOOT_DIR/lghs-c
 
 read_value(){ local key="$1" file="$2";awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"; }
 require_simple_value(){ local name="$1" value="$2";[[ -n "$value" ]] || { log "Missing required value: $name";exit 1; };[[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || { log "Invalid newline in $name";exit 1; }; }
-decode_secret(){ local key="$1" encoded decoded;encoded="$(read_value "$key" "$SECRET_CONF")";[[ -n "$encoded" ]] || { log "Missing secret field: $key";exit 1; };decoded="$(printf '%s' "$encoded"|base64 --decode 2>/dev/null)" || { log "Invalid base64 for $key";exit 1; };[[ "$decoded" != *$'\n'* && "$decoded" != *$'\r'* ]] || { log "Newlines are not allowed in passwords";exit 1; };printf '%s' "$decoded"; }
+decode_secret(){ local key="$1" encoded decoded;encoded="$(read_value "$key" "$SECRET_CONF")";[[ -n "$encoded" ]] || { log "Missing secret field: $key";exit 1; };decoded="$(printf '%s' "$encoded"|base64 --decode 2>/dev/null)" || { log "Invalid base64 for $key";exit 1; };[[ "$decoded" != *$'\n'* && "$decoded" != *$'\r'* ]] || { log "Newlines are not allowed in secret field $key";exit 1; };printf '%s' "$decoded"; }
 
-DEVICE_ID="$(read_value DEVICE_ID "$PUBLIC_CONF")";TARGET_HOSTNAME="$(read_value TARGET_HOSTNAME "$PUBLIC_CONF")";ROLE="$(read_value ROLE "$PUBLIC_CONF")";USER_NAME="$(read_value USER_ACCOUNT "$PUBLIC_CONF")";ADMIN_NAME="$(read_value ADMIN_ACCOUNT "$PUBLIC_CONF")";ROOT_NAME="$(read_value ROOT_ACCOUNT "$PUBLIC_CONF")";ROOT_SAME_AS_ADMIN="$(read_value ROOT_SAME_AS_ADMIN "$PUBLIC_CONF")";MEMORY_GB="$(read_value MEMORY_GB "$PUBLIC_CONF")";ENCODING="$(read_value ENCODING "$SECRET_CONF")"
+DEVICE_ID="$(read_value DEVICE_ID "$PUBLIC_CONF")";TARGET_HOSTNAME="$(read_value TARGET_HOSTNAME "$PUBLIC_CONF")";ROLE="$(read_value ROLE "$PUBLIC_CONF")";USER_NAME="$(read_value USER_ACCOUNT "$PUBLIC_CONF")";ADMIN_NAME="$(read_value ADMIN_ACCOUNT "$PUBLIC_CONF")";ROOT_NAME="$(read_value ROOT_ACCOUNT "$PUBLIC_CONF")";ROOT_SAME_AS_ADMIN="$(read_value ROOT_SAME_AS_ADMIN "$PUBLIC_CONF")";MEMORY_GB="$(read_value MEMORY_GB "$PUBLIC_CONF")";ENCODING="$(read_value ENCODING "$SECRET_CONF")";FLEET_API_URL="$(read_value FLEET_API_URL "$PUBLIC_CONF")"
 [[ -n "$MEMORY_GB" ]] || MEMORY_GB=8
+[[ -n "$FLEET_API_URL" ]] || FLEET_API_URL="$DEFAULT_FLEET_API_URL"
 for pair in "DEVICE_ID:$DEVICE_ID" "TARGET_HOSTNAME:$TARGET_HOSTNAME" "ROLE:$ROLE" "USER_ACCOUNT:$USER_NAME" "ADMIN_ACCOUNT:$ADMIN_NAME" "ROOT_ACCOUNT:$ROOT_NAME";do require_simple_value "${pair%%:*}" "${pair#*:}";done
 [[ "$ROOT_SAME_AS_ADMIN" == "0" || "$ROOT_SAME_AS_ADMIN" == "1" ]] || { log "Invalid ROOT_SAME_AS_ADMIN value";exit 1; }
 [[ "$MEMORY_GB" == "4" || "$MEMORY_GB" == "8" ]] || { log "Unsupported Raspberry Pi 5 MEMORY_GB profile: $MEMORY_GB";exit 1; }
@@ -33,10 +35,18 @@ for pair in "DEVICE_ID:$DEVICE_ID" "TARGET_HOSTNAME:$TARGET_HOSTNAME" "ROLE:$ROL
 [[ "$ROLE" == "student" || "$ROLE" == "controller" ]] || { log "Invalid role: $ROLE";exit 1; }
 [[ "$TARGET_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,62}$ ]] || { log "Invalid hostname: $TARGET_HOSTNAME";exit 1; }
 [[ "$USER_NAME" == "$STUDENT_USER" && "$ADMIN_NAME" == "$ADMIN_USER" && "$ROOT_NAME" == "root" ]] || { log "Unexpected account mapping";exit 1; }
+[[ "$FLEET_API_URL" =~ ^https://[^[:space:]]+$ ]] || { log "Invalid Fleet API URL";exit 1; }
 
 USER_PASSWORD="$(decode_secret USER_PASSWORD_B64)";ADMIN_PASSWORD="$(decode_secret ADMIN_PASSWORD_B64)";ROOT_PASSWORD="$(decode_secret ROOT_PASSWORD_B64)"
 [[ -n "$USER_PASSWORD" && -n "$ADMIN_PASSWORD" && -n "$ROOT_PASSWORD" ]] || { log "One or more passwords are empty";exit 1; }
 if [[ "$ROOT_SAME_AS_ADMIN" == "1" && "$ROOT_PASSWORD" != "$ADMIN_PASSWORD" ]];then log "Root/Admin password-link verification failed";exit 1;fi
+
+FLEET_API_TOKEN=""
+if [[ "$ROLE" == "student" ]]; then
+  FLEET_API_TOKEN="$(decode_secret FLEET_API_TOKEN_B64)"
+  [[ ${#FLEET_API_TOKEN} -ge 32 && ${#FLEET_API_TOKEN} -le 512 ]] || { log "Invalid Fleet API token length";exit 1; }
+  [[ "$FLEET_API_TOKEN" != *[[:space:]]* ]] || { log "Fleet API token contains whitespace";exit 1; }
+fi
 
 id "$STUDENT_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$STUDENT_USER"
 id "$ADMIN_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$ADMIN_USER"
@@ -77,11 +87,37 @@ if [[ -f "$FLEET_PUBLIC" ]]; then
   fi
 fi
 
+# Student identity must exist before Bluetooth bootstrap starts. Install the
+# same per-device token for the root-owned bootstrap client and the unprivileged
+# managed-device agent, then provide the agent's HTTPS endpoint configuration.
+if [[ "$ROLE" == "student" ]]; then
+  install -d -m 0700 /etc/lghs/secrets /etc/cloudflared
+  printf '%s\n' "$FLEET_API_TOKEN" > /etc/lghs/secrets/fleet-api-token
+  chmod 0600 /etc/lghs/secrets/fleet-api-token
+  printf 'URL=%s\n' "$FLEET_API_URL" > /etc/lghs/fleet-api.conf
+  chmod 0600 /etc/lghs/fleet-api.conf
+  if id lghs-agent >/dev/null 2>&1; then
+    install -d -o lghs-agent -g lghs-agent -m 0700 /var/lib/lghs-agent
+    install -o lghs-agent -g lghs-agent -m 0400 /etc/lghs/secrets/fleet-api-token /var/lib/lghs-agent/fleet-api-token
+    install -o lghs-agent -g lghs-agent -m 0400 /etc/lghs/fleet-api.conf /var/lib/lghs-agent/fleet-api.conf
+  fi
+fi
+
 if [[ -x /usr/local/sbin/lghs-autologin-apply ]];then /usr/local/sbin/lghs-autologin-apply;fi
 if [[ "$ROLE" == "student" && -x /usr/local/sbin/lghs-dev-setup ]];then /usr/local/sbin/lghs-dev-setup || true;fi
+# Generic images deliberately contain no SSH host private keys. Generate a
+# unique set on the real Pi before validating or starting sshd.
+if command -v ssh-keygen >/dev/null 2>&1;then ssh-keygen -A;fi
 if command -v sshd >/dev/null 2>&1;then sshd -t;systemctl try-restart ssh.service >/dev/null 2>&1 || true;fi
+if [[ "$ROLE" == "student" ]]; then
+  systemctl reset-failed lghs-agent.service lghs-bt-bootstrap.service >/dev/null 2>&1 || true
+  systemctl try-restart lghs-agent.service >/dev/null 2>&1 || true
+  # Start, rather than only try-restart, so a unit that was inactive while
+  # first-boot identity was being created does not miss zero-touch bootstrap.
+  systemctl restart lghs-bt-bootstrap.service >/dev/null 2>&1 || true
+fi
 
 install -m 0600 "$PUBLIC_CONF" "$STATE_DIR/provisioned.conf";printf '%s\n' "$(date -u +%FT%TZ)">$STAMP;chmod 0600 "$STAMP"
 if command -v shred >/dev/null 2>&1;then shred -u -z -n 2 "$SECRET_CONF" 2>/dev/null || rm -f "$SECRET_CONF";else size="$(stat -c %s "$SECRET_CONF" 2>/dev/null||echo 0)";if [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]];then dd if=/dev/zero of="$SECRET_CONF" bs=1 count="$size" conv=notrunc status=none 2>/dev/null||true;sync;fi;rm -f "$SECRET_CONF";fi
-rm -f "$PUBLIC_CONF" "$FLEET_PUBLIC" "$FLEET_PRIVATE";sync;unset USER_PASSWORD ADMIN_PASSWORD ROOT_PASSWORD
-log "Provisioning complete for $DEVICE_ID ($ROLE, Pi 5 ${MEMORY_GB} GB); desktop autologin and deployment fleet identity configured."
+rm -f "$PUBLIC_CONF" "$FLEET_PUBLIC" "$FLEET_PRIVATE";sync;unset USER_PASSWORD ADMIN_PASSWORD ROOT_PASSWORD FLEET_API_TOKEN
+log "Provisioning complete for $DEVICE_ID ($ROLE, Pi 5 ${MEMORY_GB} GB); desktop autologin, Fleet API identity, and deployment fleet identity configured."

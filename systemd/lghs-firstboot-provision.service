@@ -1,7 +1,7 @@
 [Unit]
 Description=LGHS first-boot provisioning
 After=local-fs.target
-Before=display-manager.service getty@tty1.service lghs-policy.service lghs-agent.service
+Before=display-manager.service getty@tty1.service lghs-policy.service lghs-agent.service lghs-bt-bootstrap.service
 ConditionPathExists=!/var/lib/lghs/provisioned
 
 [Service]

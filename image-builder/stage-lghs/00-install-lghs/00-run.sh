@@ -31,6 +31,9 @@ set -e
 cd ${CHROOT_SOURCE}
 LGHS_IMAGE_BUILD=1 /bin/bash ./install.sh ${LGHS_ROLE}
 if [[ "${LGHS_ROLE}" == "student" ]]; then
+    python3 ./updater/patch-agent-root-writable.py /usr/local/sbin/lghs-agent
+    chown root:root /usr/local/sbin/lghs-agent
+    chmod 0755 /usr/local/sbin/lghs-agent
     /bin/bash ./student/lghs-install-network-ui
 fi
 EOF
