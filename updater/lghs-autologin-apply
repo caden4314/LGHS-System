@@ -11,6 +11,17 @@ esac
 
 id "$USER_NAME" >/dev/null 2>&1 || { echo "Missing autologin account: $USER_NAME" >&2; exit 1; }
 
+# LGHS, not Raspberry Pi OS's generic first-run wizard, owns identity and
+# password provisioning. Neutralize the distro wizard every time this policy is
+# applied so cached images and future package changes cannot reintroduce it.
+rm -f /etc/xdg/autostart/piwiz.desktop
+rm -f /etc/ssh/sshd_config.d/rename_user.conf
+rm -f /etc/sudoers.d/010_wiz-nopasswd
+rm -f /var/lib/userconf-pi/autologin
+systemctl disable userconfig.service >/dev/null 2>&1 || true
+systemctl mask userconfig.service >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/multi-user.target.wants/userconfig.service
+
 # LGHS is an appliance-style deployment. Always boot to the graphical target
 # and autologin only to the desktop. Current Raspberry Pi OS Trixie exposes
 # separate boot-target/autologin APIs; unlike the legacy B4 helper this avoids
@@ -49,6 +60,12 @@ fi
 # desktop; forcing a stale session name can strand boot at a blinking cursor.
 rm -f /etc/lightdm/lightdm.conf.d/90-lghs-autologin.conf \
       /etc/lightdm/lightdm.conf.d/99-lghs-autologin.conf
+
+# A graphical deployment must never inherit tty1 autologin from an older B4
+# configuration. Leave tty1 available as a recovery console, but require an
+# explicit login there.
+rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/getty@tty1.service.d 2>/dev/null || true
 
 systemctl set-default graphical.target >/dev/null 2>&1 || true
 systemctl enable lightdm.service >/dev/null 2>&1 || true
