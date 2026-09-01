@@ -46,12 +46,23 @@ WORK_DIR="${PI_GEN_DIR}/work/${IMG_NAME}"
 BASE_CACHE="${WORK_DIR}/stage4/rootfs"
 SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 
+# pi-gen requires a password in order to suppress its first-user rename wizard.
+# Generate a one-build-only random value; the final LGHS stage re-locks this
+# account and lghs-firstboot-provision installs the real per-device password
+# before display-manager/getty are allowed to start.
+BUILD_FIRST_USER_PASS="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+)"
+
 printf 'LGHS image build\n'
 printf '  Target hostname: %s\n' "$TARGET_HOSTNAME"
 printf '  Expected role:   %s\n' "$EXPECTED_ROLE"
 printf '  LGHS commit:     %s\n' "$SOURCE_COMMIT"
 printf '  pi-gen:          %s\n' "$PI_GEN_DIR"
 printf '  Fleet secrets:   none baked into image\n'
+printf '  First-run UI:    disabled; LGHS owns provisioning\n'
 
 if [[ ! -d "${PI_GEN_DIR}/.git" ]]; then
     git clone --branch arm64 https://github.com/RPi-Distro/pi-gen.git "$PI_GEN_DIR"
@@ -84,6 +95,10 @@ RELEASE='trixie'
 ARCH='arm64'
 TARGET_HOSTNAME='${TARGET_HOSTNAME}'
 FIRST_USER_NAME='lg_cs_cont'
+FIRST_USER_PASS='${BUILD_FIRST_USER_PASS}'
+DISABLE_FIRST_BOOT_USER_RENAME=1
+PASSWORDLESS_SUDO=0
+ENABLE_CLOUD_INIT=0
 ENABLE_SSH=1
 LOCALE_DEFAULT='en_US.UTF-8'
 KEYBOARD_KEYMAP='us'
@@ -103,6 +118,11 @@ SKIP_FILES=()
 cleanup() {
     local f
     for f in "${SKIP_FILES[@]:-}"; do rm -f "$f"; done
+    # Never leave the temporary build password behind in config.lghs.
+    if [[ -f "$PI_GEN_DIR/config.lghs" ]]; then
+        sed -i '/^FIRST_USER_PASS=/d' "$PI_GEN_DIR/config.lghs" 2>/dev/null || true
+    fi
+    BUILD_FIRST_USER_PASS=''
 }
 trap cleanup EXIT INT TERM
 
