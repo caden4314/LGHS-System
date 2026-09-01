@@ -39,7 +39,7 @@ The intended sequence is:
 After pulling the BT PR branch:
 
 ```bash
-sudo ./bluetooth/install-live-test.sh --start
+sudo bash ./bluetooth/install-live-test.sh --start
 ```
 
 The installer also runs the safe read-only Cloudflare credential probe. You can repeat it without exposing the token:
@@ -76,7 +76,7 @@ PY
 After pulling the BT PR branch on CS-999:
 
 ```bash
-sudo ./bluetooth/install-live-test.sh
+sudo bash ./bluetooth/install-live-test.sh
 ```
 
 This installs/enables the hardened files but intentionally preserves the existing provisioned state.
@@ -84,7 +84,7 @@ This installs/enables the hardened files but intentionally preserves the existin
 When ready for the deliberate live Bluetooth reprovision test:
 
 ```bash
-sudo ./bluetooth/install-live-test.sh --rearm
+sudo bash ./bluetooth/install-live-test.sh --rearm
 ```
 
 At the same time on LGCSCONT:
