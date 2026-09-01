@@ -7,6 +7,7 @@ import { initializeTheme } from './ThemeToggle'
 import './styles.css'
 import './art.css'
 import './theme.css'
+import './polish.css'
 
 initializeTheme()
 
