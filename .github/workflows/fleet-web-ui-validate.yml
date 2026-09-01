@@ -76,10 +76,12 @@ jobs:
         with:
           python-version: '3.13'
       - name: Compile gateway
-        run: python -m py_compile web-ui/gateway/app.py
+        run: python -m py_compile web-ui/gateway/app.py web-ui/gateway/test_security.py
       - name: Install pinned gateway dependencies
         run: python -m pip install --disable-pip-version-check -r web-ui/gateway/requirements.txt
       - name: Import gateway module
         env:
           LGHS_WEB_DIST: /tmp/lghs-web-ui-not-built
         run: PYTHONPATH=web-ui/gateway python -c "import app; print(app.app.title)"
+      - name: Run gateway security tests
+        run: PYTHONPATH=web-ui/gateway python web-ui/gateway/test_security.py -v
