@@ -85,8 +85,7 @@ export function SignalField({ compact = false }: { compact?: boolean }) {
         context.stroke()
       }
 
-      for (let index = 0; index < points.length; index += 1) {
-        const point = points[index]
+      points.forEach((point, index) => {
         const px = point.x * width
         const py = point.y * height
         const distance = Math.hypot(px - centerX, py - centerY)
@@ -94,13 +93,13 @@ export function SignalField({ compact = false }: { compact?: boolean }) {
           context.fillStyle = index % 11 === 0 ? warm : quiet
           context.fillRect(Math.round(px), Math.round(py), point.r * 2, point.r * 2)
         }
-      }
+      })
 
       context.strokeStyle = line
       for (let index = 0; index < points.length - 1; index += 1) {
         const a = points[index]
         const b = points[(index + 9) % points.length]
-        if (Math.abs(a.lane - b.lane) > 2) continue
+        if (!a || !b || Math.abs(a.lane - b.lane) > 2) continue
         context.beginPath()
         context.moveTo(a.x * width, a.y * height)
         context.lineTo(b.x * width, b.y * height)
