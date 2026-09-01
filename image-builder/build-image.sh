@@ -13,7 +13,7 @@ Usage: build-image.sh [--fresh|--fast] [hostname]
 Modes:
   auto     Full build the first time; cached fast rebuild afterward (default)
   --fresh  Rebuild Raspberry Pi OS and LGHS from scratch
-  --fast   Reuse completed stage0-stage4 cache and rebuild LGHS + export only
+  --fast   Reuse completed stage0-stage4 and any partial/completed LGHS rootfs
 
 Published LGHS images are fleet-key neutral. The Control Pi generates its
 Ed25519 fleet key locally; Student Pis are enrolled once with their per-device
@@ -47,10 +47,6 @@ BASE_CACHE="${WORK_DIR}/stage4/rootfs"
 SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 LGHS_STAGE="$REPO_ROOT/image-builder/stage-lghs"
 
-# pi-gen requires a password in order to suppress its first-user rename wizard.
-# Generate a one-build-only random value; the final LGHS stage re-locks this
-# account and lghs-firstboot-provision installs the real per-device password
-# before display-manager/getty are allowed to start.
 BUILD_FIRST_USER_PASS="$(python3 - <<'PY'
 import secrets
 print(secrets.token_urlsafe(48))
@@ -75,10 +71,6 @@ fi
 
 chmod +x "$LGHS_STAGE/prerun.sh"
 chmod +x "$LGHS_STAGE/00-install-lghs/00-run.sh"
-
-# A stale untracked SKIP marker on the custom stage causes pi-gen to jump
-# straight from "Begin stage-lghs" to "End stage-lghs" and export an old
-# rootfs. LGHS fast builds must *always* rerun the custom stage.
 rm -f "$LGHS_STAGE/SKIP" "$LGHS_STAGE/00-install-lghs/SKIP"
 
 STAGE_FILES="$LGHS_STAGE/00-install-lghs/files"
@@ -92,7 +84,6 @@ rsync -a --delete \
     "$REPO_ROOT/" "$STAGED_SOURCE/"
 printf '%s\n' "$SOURCE_COMMIT" > "$STAGED_SOURCE/.lghs-source-commit"
 
-# Only export the final LGHS stage.
 touch "$PI_GEN_DIR/stage2/SKIP_IMAGES" "$PI_GEN_DIR/stage4/SKIP_IMAGES" "$PI_GEN_DIR/stage5/SKIP_IMAGES"
 
 cat > "$PI_GEN_DIR/config.lghs" <<EOF
@@ -124,7 +115,6 @@ SKIP_FILES=()
 cleanup() {
     local f
     for f in "${SKIP_FILES[@]:-}"; do rm -f "$f"; done
-    # Never leave the temporary build password behind in config.lghs.
     if [[ -f "$PI_GEN_DIR/config.lghs" ]]; then
         sed -i '/^FIRST_USER_PASS=/d' "$PI_GEN_DIR/config.lghs" 2>/dev/null || true
     fi
@@ -136,11 +126,16 @@ if [[ "$MODE" == "fast" ]]; then
     [[ -f "$BASE_CACHE/etc/os-release" ]] || { echo "No completed stage4 cache; run --fresh once." >&2; exit 1; }
     echo
     echo "FAST REBUILD MODE"
+    echo "  Reusing LGHS-stage rootfs when present (failed retries resume instead of recopying)."
     for stage in stage0 stage1 stage2 stage3 stage4; do
         skip_file="$PI_GEN_DIR/$stage/SKIP"
         if [[ ! -e "$skip_file" ]]; then touch "$skip_file"; SKIP_FILES+=("$skip_file"); fi
     done
-    BUILD_ENV=(CLEAN=1)
+    # CLEAN=0 is intentional: skipped stock stages remain untouched and the
+    # custom LGHS stage resumes its existing rootfs. The installer is designed
+    # to be idempotent, so code/config-only retries avoid a full rootfs copy and
+    # repeated package downloads.
+    BUILD_ENV=(CLEAN=0)
 else
     echo
     echo "FULL BUILD MODE"
@@ -155,8 +150,6 @@ printf '\nBuild mode: %s\n\n' "$MODE"
 cd "$PI_GEN_DIR"
 sudo env "${BUILD_ENV[@]}" ./build.sh -c config.lghs
 
-# Never bless an export whose custom LGHS stage did not actually install the
-# source revision requested by this build.
 BUILT_COMMIT_FILE="$WORK_DIR/stage-lghs/rootfs/etc/lghs/source-commit"
 [[ -f "$BUILT_COMMIT_FILE" ]] || {
     echo "ERROR: LGHS stage did not produce /etc/lghs/source-commit; refusing build output." >&2
