@@ -6,7 +6,9 @@ Wants=lghs-fleet-api.service
 [Service]
 Type=simple
 User=root
-Group=root
+Group=lghs-web
+RuntimeDirectory=lghs-web-ops
+RuntimeDirectoryMode=0750
 ExecStart=/usr/local/libexec/lghs-web-ops
 Restart=on-failure
 RestartSec=2s
@@ -19,7 +21,7 @@ ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-UMask=0077
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target
