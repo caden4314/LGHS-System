@@ -28,6 +28,14 @@ printf '%s\n' "$LGHS_ROLE" > "${ROOTFS_DIR}/etc/lghs/build-role"
 
 on_chroot <<EOF
 set -e
+# The stock cached rootfs may intentionally contain no SSH host keys. LGHS
+# validates sshd during install, so create temporary build-only keys and remove
+# them on every exit. lghs-firstboot-provision will generate unique host keys
+# on the real Pi before SSH is exposed.
+rm -f /etc/ssh/ssh_host_*
+ssh-keygen -A
+trap 'rm -f /etc/ssh/ssh_host_*' EXIT
+
 cd ${CHROOT_SOURCE}
 LGHS_IMAGE_BUILD=1 /bin/bash ./install.sh ${LGHS_ROLE}
 if [[ "${LGHS_ROLE}" == "student" ]]; then
@@ -83,6 +91,9 @@ echo "LGHS: Raspberry Pi first-run wizard disabled."
 echo "LGHS: default boot target: $(systemctl get-default)"
 EOF
 
+# Defense in depth: no SSH host key is allowed to survive image construction.
+rm -f "${ROOTFS_DIR}"/etc/ssh/ssh_host_*
+
 # Ensure no deployment secret accidentally survives image creation.
 rm -f "${ROOTFS_DIR}/etc/lghs/secrets/controller_ed25519" \
       "${ROOTFS_DIR}/etc/lghs/secrets/controller_ed25519.pub" \
@@ -93,4 +104,5 @@ echo "LGHS: ${LGHS_ROLE} role installed for ${IMAGE_HOSTNAME}."
 echo "LGHS: first-boot Imager provisioning enabled."
 echo "LGHS: Raspberry Pi interactive first-run disabled."
 echo "LGHS: graphical desktop boot enforced."
+echo "LGHS: SSH host keys deferred to first boot."
 echo "LGHS: fleet key material will be injected by LGHS Imager per deployment."
