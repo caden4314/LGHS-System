@@ -14,6 +14,7 @@ import httpx
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from jwt import PyJWKClient
 
 Role = Literal['owner', 'operator', 'viewer']
@@ -276,27 +277,41 @@ app = FastAPI(
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS, www_redirect=False)
 
 
+def middleware_error(status: int, detail: str) -> JSONResponse:
+    return JSONResponse(status_code=status, content={'detail': detail})
+
+
 @app.middleware('http')
 async def security_middleware(request: Request, call_next):
     if request.method not in {'GET', 'HEAD', 'OPTIONS'} and request.url.path.startswith('/api/'):
         origin = request.headers.get('origin', '').rstrip('/')
         if origin != PUBLIC_ORIGIN:
-            raise HTTPException(status_code=403, detail='invalid request origin')
+            return middleware_error(403, 'invalid request origin')
         access_token = request.headers.get('cf-access-jwt-assertion', '')
         supplied = request.headers.get('x-lghs-csrf', '')
-        if not access_token or not supplied or not hmac.compare_digest(supplied, csrf_token(access_token)):
-            raise HTTPException(status_code=403, detail='CSRF validation failed')
+        try:
+            expected = csrf_token(access_token) if access_token else ''
+        except RuntimeError:
+            return middleware_error(503, 'CSRF protection is not configured')
+        if not access_token or not supplied or not hmac.compare_digest(supplied, expected):
+            return middleware_error(403, 'CSRF validation failed')
 
     response = await call_next(request)
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Referrer-Policy'] = 'no-referrer'
     response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Cross-Origin-Opener-Policy'] = 'same-origin'
+    response.headers['Cross-Origin-Resource-Policy'] = 'same-origin'
     response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=(), usb=(), bluetooth=()'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Content-Security-Policy'] = (
         "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; "
         "form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; font-src 'self'; connect-src 'self'"
     )
+    if request.url.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
     return response
 
 
