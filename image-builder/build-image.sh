@@ -45,6 +45,7 @@ IMG_NAME="LGHS-${TARGET_HOSTNAME}"
 WORK_DIR="${PI_GEN_DIR}/work/${IMG_NAME}"
 BASE_CACHE="${WORK_DIR}/stage4/rootfs"
 SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+LGHS_STAGE="$REPO_ROOT/image-builder/stage-lghs"
 
 # pi-gen requires a password in order to suppress its first-user rename wizard.
 # Generate a one-build-only random value; the final LGHS stage re-locks this
@@ -72,10 +73,15 @@ else
     git -C "$PI_GEN_DIR" pull --ff-only origin arm64
 fi
 
-chmod +x "$REPO_ROOT/image-builder/stage-lghs/prerun.sh"
-chmod +x "$REPO_ROOT/image-builder/stage-lghs/00-install-lghs/00-run.sh"
+chmod +x "$LGHS_STAGE/prerun.sh"
+chmod +x "$LGHS_STAGE/00-install-lghs/00-run.sh"
 
-STAGE_FILES="$REPO_ROOT/image-builder/stage-lghs/00-install-lghs/files"
+# A stale untracked SKIP marker on the custom stage causes pi-gen to jump
+# straight from "Begin stage-lghs" to "End stage-lghs" and export an old
+# rootfs. LGHS fast builds must *always* rerun the custom stage.
+rm -f "$LGHS_STAGE/SKIP" "$LGHS_STAGE/00-install-lghs/SKIP"
+
+STAGE_FILES="$LGHS_STAGE/00-install-lghs/files"
 STAGED_SOURCE="$STAGE_FILES/LGHS-System"
 rm -rf "$STAGED_SOURCE" "$STAGE_FILES/fleet-keys"
 mkdir -p "$STAGED_SOURCE"
@@ -105,7 +111,7 @@ KEYBOARD_KEYMAP='us'
 KEYBOARD_LAYOUT='English (US)'
 TIMEZONE_DEFAULT='America/Chicago'
 WPA_COUNTRY='US'
-STAGE_LIST='stage0 stage1 stage2 stage3 stage4 ${REPO_ROOT}/image-builder/stage-lghs'
+STAGE_LIST='stage0 stage1 stage2 stage3 stage4 ${LGHS_STAGE}'
 DEPLOY_COMPRESSION='zip'
 COMPRESSION_LEVEL='1'
 EOF
@@ -149,5 +155,19 @@ printf '\nBuild mode: %s\n\n' "$MODE"
 cd "$PI_GEN_DIR"
 sudo env "${BUILD_ENV[@]}" ./build.sh -c config.lghs
 
+# Never bless an export whose custom LGHS stage did not actually install the
+# source revision requested by this build.
+BUILT_COMMIT_FILE="$WORK_DIR/stage-lghs/rootfs/etc/lghs/source-commit"
+[[ -f "$BUILT_COMMIT_FILE" ]] || {
+    echo "ERROR: LGHS stage did not produce /etc/lghs/source-commit; refusing build output." >&2
+    exit 1
+}
+BUILT_COMMIT="$(tr -d '[:space:]' < "$BUILT_COMMIT_FILE")"
+[[ "$BUILT_COMMIT" == "$SOURCE_COMMIT" ]] || {
+    echo "ERROR: LGHS stage is stale: expected $SOURCE_COMMIT, got $BUILT_COMMIT" >&2
+    exit 1
+}
+
+echo "LGHS stage verification: $BUILT_COMMIT"
 printf '\nLGHS build finished. Output files:\n'
 find "$PI_GEN_DIR/deploy" -maxdepth 1 -type f -printf '  %f\n' | sort
