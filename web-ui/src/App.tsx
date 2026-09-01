@@ -34,36 +34,30 @@ export default function App() {
   const snapshot = fleet.data
   const identity = session.data
   const criticalAlerts = snapshot.alerts.filter((alert) => alert.severity === 'critical' && !alert.acknowledged).length
+  const pendingSudo = (snapshot.sudoRequests ?? []).filter((row) => row.state === 'pending').length
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark" aria-hidden="true">LG</div>
-          <div><strong>LGHS Fleet</strong><span>Operations</span></div>
-        </div>
-
+        <div className="brand"><div className="brand-mark" aria-hidden="true">LG</div><div><strong>LGHS Fleet</strong><span>Operations</span></div></div>
         <nav className="primary-nav" aria-label="Primary navigation">
           {navigation.map(({ to, label, icon: Icon, end }) => (
             <NavLink key={to} to={to} end={end} className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
-              <Icon aria-hidden="true" />
-              <span>{label}</span>
-              {label === 'Alerts' && criticalAlerts > 0 && <span className="nav-count" aria-label={`${criticalAlerts} critical alerts`}>{criticalAlerts}</span>}
+              <Icon aria-hidden="true" /><span>{label}</span>
+              {label === 'Alerts' && criticalAlerts > 0 && <span className="nav-count">{criticalAlerts}</span>}
+              {label === 'Sudo' && pendingSudo > 0 && <span className="nav-count">{pendingSudo}</span>}
             </NavLink>
           ))}
         </nav>
-
         <div className="sidebar-footer">
-          <div className="controller-status"><span className="status-dot" aria-hidden="true" /><div><strong>Controller connected</strong><span>Gateway snapshot received</span></div></div>
-          <div className="build-label">LGHS 0.6 · Web preview</div>
+          <div className="controller-status"><span className={`status-dot${snapshot.degraded ? ' warning' : ''}`} aria-hidden="true" /><div><strong>{snapshot.degraded ? 'Controller recovering' : 'Controller connected'}</strong><span>{snapshot.degraded ? 'Showing last good snapshot' : 'Live SQLite telemetry'}</span></div></div>
+          <div className="build-label">LGHS 0.6 · Fleet Web</div>
         </div>
       </aside>
 
       <div className="workspace">
         <header className="topbar">
-          <Link className="global-search" to="/fleet" aria-label="Open fleet search">
-            <Search aria-hidden="true" /><span>Search fleet</span>
-          </Link>
+          <Link className="global-search" to="/fleet" aria-label="Open fleet search"><Search aria-hidden="true" /><span>Search fleet</span></Link>
           <div className="topbar-actions">
             <ThemeToggle />
             <Link className="icon-button" to="/alerts" aria-label="Open alerts"><Bell aria-hidden="true" />{criticalAlerts > 0 && <span className="notification-dot" />}</Link>
@@ -83,10 +77,10 @@ export default function App() {
             <Route path="/alerts" element={<AlertsPage snapshot={snapshot} />} />
             <Route path="/deployments" element={<DeploymentsPage snapshot={snapshot} />} />
             <Route path="/deployments/:deploymentId" element={<DeploymentsPage snapshot={snapshot} />} />
-            <Route path="/sudo" element={<SudoPage />} />
+            <Route path="/sudo" element={<SudoPage snapshot={snapshot} />} />
             <Route path="/activity" element={<ActivityPage snapshot={snapshot} />} />
             <Route path="/groups" element={<GroupsPage snapshot={snapshot} />} />
-            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/settings" element={<SettingsPage snapshot={snapshot} />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </main>
