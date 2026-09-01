@@ -1,23 +1,22 @@
 [Unit]
 Description=LGHS Fleet Web Gateway
-After=network-online.target lghs-fleet-api.service
-Wants=network-online.target
-Requires=lghs-fleet-api.service
+After=network-online.target lghs-fleet-api.service lghs-fleet-web-ops.service
+Wants=network-online.target lghs-fleet-api.service lghs-fleet-web-ops.service
 
 [Service]
 Type=simple
 User=lghs-web
 Group=lghs-web
-WorkingDirectory=/opt/lghs/fleet-web
+WorkingDirectory=/opt/lghs-fleet-web
 EnvironmentFile=/etc/lghs/fleet-web.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
-Environment=LGHS_WEB_FLEET_TOKEN_FILE=/etc/lghs/fleet-web-admin-token.json
-Environment=LGHS_WEB_FLEET_CACHE=/var/lib/lghs/fleet-cache.json
-Environment=LGHS_WEB_ROLE_FILE=/etc/lghs/web-roles.json
-Environment=LGHS_WEB_CSRF_FILE=/etc/lghs/web-csrf.key
+Environment=LGHS_WEB_FLEET_TOKEN_FILE=/etc/lghs-web/fleet-admin-token.json
+Environment=LGHS_WEB_ROLE_FILE=/etc/lghs-web/roles.json
+Environment=LGHS_WEB_CSRF_FILE=/etc/lghs-web/csrf.key
+Environment=LGHS_WEB_OPS_SOCKET=/run/lghs-web-ops/socket
 Environment=LGHS_WEB_DIST=/usr/local/share/lghs-web-ui
-ExecStart=/opt/lghs/fleet-web/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8790 --no-server-header --proxy-headers --forwarded-allow-ips=127.0.0.1
+ExecStart=/opt/lghs-fleet-web/venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8790 --no-server-header --proxy-headers --forwarded-allow-ips=127.0.0.1
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15
