@@ -94,6 +94,7 @@ def discover_devices():
                 "addr": name,
                 "port": "22",
                 "transport": meta.get("transport", "cloudflare"),
+                "ssh_user": meta.get("ssh_user"),
             })
         return out
     return _original_discover()
@@ -124,6 +125,7 @@ def refresh_fleet(discovered):
         d.setdefault("host", meta.get("ssh_host") or name)
         d["addr"] = name
         d["transport"] = meta.get("transport", d.get("transport", "cloudflare"))
+        d["ssh_user"] = meta.get("ssh_user", d.get("ssh_user"))
         d.setdefault("sudo_requests", [])
         try:
             received = float(d.get("received_at") or 0)
@@ -171,6 +173,7 @@ def ssh_args(target, batch=True):
     legacy.ensure_dirs()
     meta = target_meta(target)
     host = meta["host"]
+    ssh_user = meta.get("ssh_user") or legacy.SSH_USER
     args = [
         "ssh", "-i", legacy.KEY_FILE,
         "-o", "IdentitiesOnly=yes",
@@ -194,7 +197,7 @@ def ssh_args(target, batch=True):
         args += ["-o", f"ProxyCommand={CLOUDFLARED} access ssh --hostname %h"]
     if batch:
         args += ["-o", "BatchMode=yes"]
-    args.append(f"{legacy.SSH_USER}@{host}")
+    args.append(f"{ssh_user}@{host}")
     return args
 
 
