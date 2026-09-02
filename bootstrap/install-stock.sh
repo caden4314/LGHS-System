@@ -6,6 +6,8 @@ BRANCH="${LGHS_UPDATE_BRANCH:-main}"
 SOURCE=/opt/lghs/stock-source
 APPLY=/opt/lghs/stock-apply
 BUILD_BIN=/usr/local/lib/lghs-stock-bootstrap-bin
+SMUDGE=/usr/local/libexec/lghs-user-map-smudge
+CLEAN=/usr/local/libexec/lghs-user-map-clean
 
 log(){ printf '[LGHS stock] %s\n' "$*"; }
 die(){ echo "LGHS stock bootstrap: $*" >&2; exit 1; }
@@ -30,7 +32,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
   git curl ca-certificates openssh-server sudo bluez rfkill network-manager \
   python3 python3-cryptography avahi-daemon avahi-utils
 
-install -d -m 0755 /opt/lghs /etc/lghs /usr/local/lib/lghs-bt
+install -d -m 0755 /opt/lghs /etc/lghs /usr/local/lib/lghs-bt /usr/local/libexec
 install -d -m 0700 /etc/lghs/secrets /var/lib/lghs/bootstrap /etc/ssh/authorized_keys
 printf '%s\n' student > /etc/lghs/role
 printf '%s\n' "$STUDENT_USER" > /etc/lghs/student-user
@@ -82,21 +84,67 @@ fi
 COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 log "LGHS source: ${COMMIT:0:12}"
 
-# Build a device-local mapped source tree. Legacy image deployments still use
-# lg_cs_cont/cs_admin; stock deployments use cs-##/cs-admin. Mapping the source
-# before install keeps every installed policy/script consistent on this device.
+# Persist the stock account mapping in Git's checkout filters. LGHS's upstream
+# source intentionally keeps the legacy image account names for compatibility;
+# on this device every future git reset performed by lghs-update is smudged to
+# cs-##/cs-admin while the clean filter maps it back for Git comparisons. This
+# keeps the updater checkout clean and prevents a future update from reverting
+# the stock device to lg_cs_cont/cs_admin.
+cat > "$SMUDGE" <<'PY'
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+raw = sys.stdin.buffer.read()
+try:
+    text = raw.decode('utf-8')
+except UnicodeDecodeError:
+    sys.stdout.buffer.write(raw); raise SystemExit(0)
+student = Path('/etc/lghs/student-user').read_text(encoding='utf-8').strip()
+admin = Path('/etc/lghs/admin-user').read_text(encoding='utf-8').strip()
+sys.stdout.write(text.replace('lg_cs_cont', student).replace('cs_admin', admin))
+PY
+cat > "$CLEAN" <<'PY'
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+raw = sys.stdin.buffer.read()
+try:
+    text = raw.decode('utf-8')
+except UnicodeDecodeError:
+    sys.stdout.buffer.write(raw); raise SystemExit(0)
+student = Path('/etc/lghs/student-user').read_text(encoding='utf-8').strip()
+admin = Path('/etc/lghs/admin-user').read_text(encoding='utf-8').strip()
+sys.stdout.write(text.replace(student, 'lg_cs_cont').replace(admin, 'cs_admin'))
+PY
+chmod 0755 "$SMUDGE" "$CLEAN"
+git -C "$SOURCE" config filter.lghs-user-map.smudge "$SMUDGE"
+git -C "$SOURCE" config filter.lghs-user-map.clean "$CLEAN"
+git -C "$SOURCE" config filter.lghs-user-map.required true
+install -d -m 0755 "$SOURCE/.git/info"
+printf '* filter=lghs-user-map\n' > "$SOURCE/.git/info/attributes"
+git -C "$SOURCE" reset --hard HEAD >/dev/null
+
+cat > /etc/lghs/update.env <<EOF
+LGHS_REPO_URL=$REPO_URL
+LGHS_UPDATE_BRANCH=$BRANCH
+LGHS_UPDATE_CHECKOUT=$SOURCE
+EOF
+chmod 0644 /etc/lghs/update.env
+
+# Build a disposable device-local tree for the initial install. This is also a
+# defense-in-depth mapping in case a Git implementation skipped a filter on a
+# file type; installed scripts/policies must never reference the wrong account.
 rm -rf "$APPLY"
 cp -a "$SOURCE" "$APPLY"
 python3 - "$APPLY" "$STUDENT_USER" "$ADMIN_USER" <<'PY'
-import os, sys
+import sys
 from pathlib import Path
 root = Path(sys.argv[1]); student = sys.argv[2]; admin = sys.argv[3]
 for path in root.rglob('*'):
     if not path.is_file() or '.git' in path.parts:
         continue
     try:
-        raw = path.read_bytes()
-        text = raw.decode('utf-8')
+        raw = path.read_bytes(); text = raw.decode('utf-8')
     except Exception:
         continue
     mapped = text.replace('lg_cs_cont', student).replace('cs_admin', admin)
