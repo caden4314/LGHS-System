@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REGISTRY = Path('/etc/lghs/bootstrap-tokens.json')
+DEVICE_RE = re.compile(r'^CS-[0-9]{1,3}$')
+TTL_SECONDS = 24 * 60 * 60
+
+
+def atomic_write(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + '.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        raise SystemExit('Run with sudo')
+    if len(sys.argv) != 2:
+        raise SystemExit('Usage: lghs-bootstrap-enroll CS-NNN')
+
+    device = sys.argv[1].strip().upper()
+    if not DEVICE_RE.fullmatch(device):
+        raise SystemExit('Invalid LGHS student device ID')
+
+    token = sys.stdin.readline(1024).strip()
+    if len(token) < 48 or len(token) > 512 or any(ch.isspace() for ch in token):
+        raise SystemExit('Invalid bootstrap token')
+
+    try:
+        data = json.loads(REGISTRY.read_text(encoding='utf-8')) if REGISTRY.exists() else {}
+    except Exception as exc:
+        raise SystemExit(f'Invalid bootstrap registry: {exc}')
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault('version', 1)
+    devices = data.setdefault('devices', {})
+    if not isinstance(devices, dict):
+        raise SystemExit('Invalid bootstrap registry devices object')
+
+    now = time.time()
+    # Opportunistically purge expired one-time bootstrap credentials.
+    for key, value in list(devices.items()):
+        if isinstance(value, dict) and float(value.get('expires_at') or 0) <= now:
+            devices.pop(key, None)
+
+    devices[device] = {
+        'token': token,
+        'source': 'stock-bootstrap',
+        'created_at': now,
+        'expires_at': now + TTL_SECONDS,
+    }
+    atomic_write(REGISTRY, data)
+    print(f'BOOTSTRAP ENROLLED {device} (expires in 24h)')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
