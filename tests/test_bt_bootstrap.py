@@ -92,7 +92,7 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertLess(verify_call, mint_call)
         self.assertIn('status != "cloudflare-ready"', controller)
         self.assertIn('"type": "fleet_enrollment"', controller)
-        self.assertIn('"type": "fleet_enrollment"', student)
+        self.assertIn('enrollment.get("type") != "fleet_enrollment"', student)
         self.assertIn('["bluetooth", "cloudflare", "cloudflare-verified", "fleet"]', student)
 
     def test_controller_publishes_rfcomm_sdp_service(self):
