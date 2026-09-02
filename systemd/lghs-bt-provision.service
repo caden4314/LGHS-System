@@ -21,7 +21,10 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/lghs
-ReadWritePaths=/var/lib/lghs /run /etc/lghs/fleet.json
+# Provisioning performs atomic registry updates by creating temporary files in
+# /etc/lghs before replacing fleet.json/bootstrap/Fleet token registries. Allow
+# the LGHS configuration tree to be writable only inside this sandboxed service.
+ReadWritePaths=/var/lib/lghs /run /etc/lghs
 
 [Install]
 WantedBy=multi-user.target
