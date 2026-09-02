@@ -240,12 +240,17 @@ echo " LGHS STOCK BOOTSTRAP READY: $DEVICE"
 echo "============================================================"
 echo "Bluetooth is waiting for LGCSCONT."
 echo
-echo "On your Windows manager, register this ONE-TIME bootstrap credential:"
+echo "1) On your Windows manager, update LGCSCONT first:"
+echo '  ssh LGCSCONT-CF "sudo env LGHS_UPDATE_BRANCH=main /usr/local/sbin/lghs-update"'
+echo '  ssh LGCSCONT-CF "sudo systemctl restart lghs-bt-provision.service"'
 echo
-echo "  printf '$TOKEN\\n' | ssh LGCSCONT-CF \"sudo python3 /opt/lghs/repo/controller/lghs-bootstrap-enroll $DEVICE\""
+echo "2) Then register this ONE-TIME Bluetooth credential in Windows PowerShell:"
+echo "  \$bt = '$TOKEN'"
+echo "  \$bt | ssh LGCSCONT-CF \"sudo python3 /opt/lghs/repo/controller/lghs-bootstrap-enroll $DEVICE\""
+echo '  Remove-Variable bt'
 echo
-echo "Then make sure the controller is current and Bluetooth provisioning is running:"
-echo "  ssh LGCSCONT-CF \"sudo /usr/local/sbin/lghs-update && sudo systemctl restart lghs-bt-provision.service\""
+echo "3) Watch the controller complete Bluetooth -> Cloudflare verify -> Fleet:"
+echo '  ssh LGCSCONT-CF "sudo journalctl -fu lghs-bt-provision.service"'
 echo
-echo "After Cloudflare is verified, the controller will create/deliver the Fleet token automatically."
-echo "Do NOT manually enroll a Fleet token before that point."
+echo "After Cloudflare is verified, the controller creates and delivers the Fleet token automatically."
+echo "Do NOT run lghs-imager-enroll or manually create a Fleet token for this stock deployment."
