@@ -8,6 +8,7 @@ APPLY=/opt/lghs/stock-apply
 BUILD_BIN=/usr/local/lib/lghs-stock-bootstrap-bin
 SMUDGE=/usr/local/libexec/lghs-user-map-smudge
 CLEAN=/usr/local/libexec/lghs-user-map-clean
+BOOT_TOKEN=/etc/lghs/secrets/bootstrap-token
 
 log(){ printf '[LGHS stock] %s\n' "$*"; }
 die(){ echo "LGHS stock bootstrap: $*" >&2; exit 1; }
@@ -53,25 +54,53 @@ if ! id "$ADMIN_USER" >/dev/null 2>&1; then
 fi
 usermod -aG sudo "$ADMIN_USER"
 
+derive_bootstrap_token() {
+  local password="$1"
+  LGHS_PROVISION_PASSWORD="$password" python3 - "$DEVICE" "$BOOT_TOKEN" <<'PY'
+import base64
+import hashlib
+import hmac
+import os
+import sys
+from pathlib import Path
+
+device = sys.argv[1].upper()
+target = Path(sys.argv[2])
+password = os.environ.pop('LGHS_PROVISION_PASSWORD')
+master = hashlib.scrypt(password.encode('utf-8'), salt=b'LGHS-stock-bootstrap-v1', n=2**15, r=8, p=1, dklen=32)
+token = hmac.new(master, b'LGHS-STOCK-BT-v1\0' + device.encode('ascii'), hashlib.sha512).digest()
+text = base64.urlsafe_b64encode(token).decode('ascii').rstrip('=')
+target.write_text(text + '\n', encoding='utf-8')
+os.chmod(target, 0o600)
+PY
+}
+
 if [[ "${LGHS_NONINTERACTIVE:-0}" != 1 ]]; then
   echo
-  echo "Set the teacher password for $ADMIN_USER (Root will use the same password)."
+  echo "Enter the LGHS provisioning/teacher password."
+  echo "Use the SAME password that was armed once on LGCSCONT."
+  echo "It will also become the $ADMIN_USER and root password on this Pi."
   while :; do
-    read -rsp "Teacher password: " ADMIN_PASS; echo
+    read -rsp "LGHS password: " ADMIN_PASS; echo
     read -rsp "Confirm password: " ADMIN_PASS2; echo
-    [[ -n "$ADMIN_PASS" ]] || { echo "Password cannot be empty."; continue; }
+    [[ ${#ADMIN_PASS} -ge 12 ]] || { echo "Use at least 12 characters."; continue; }
     [[ "$ADMIN_PASS" == "$ADMIN_PASS2" ]] || { echo "Passwords did not match."; continue; }
     break
   done
+  derive_bootstrap_token "$ADMIN_PASS"
   printf '%s:%s\n' "$ADMIN_USER" "$ADMIN_PASS" | chpasswd
   printf 'root:%s\n' "$ADMIN_PASS" | chpasswd
   unset ADMIN_PASS ADMIN_PASS2
 else
   [[ -n "${LGHS_ADMIN_PASSWORD:-}" ]] || die "LGHS_ADMIN_PASSWORD is required with LGHS_NONINTERACTIVE=1"
+  [[ ${#LGHS_ADMIN_PASSWORD} -ge 12 ]] || die "LGHS_ADMIN_PASSWORD must be at least 12 characters"
+  derive_bootstrap_token "$LGHS_ADMIN_PASSWORD"
   printf '%s:%s\n' "$ADMIN_USER" "$LGHS_ADMIN_PASSWORD" | chpasswd
   printf 'root:%s\n' "$LGHS_ADMIN_PASSWORD" | chpasswd
   unset LGHS_ADMIN_PASSWORD
 fi
+
+[[ -s "$BOOT_TOKEN" ]] || die "Failed to derive Bluetooth bootstrap credential"
 
 if [[ ! -d "$SOURCE/.git" ]]; then
   rm -rf "$SOURCE"
@@ -207,16 +236,9 @@ ssh-keygen -A
 sshd -t
 systemctl enable --now ssh.service bluetooth.service NetworkManager.service
 
-# A one-time credential authenticates first Bluetooth contact. It is not the
-# Fleet token and is deleted after Fleet enrollment completes.
-BOOT_TOKEN=/etc/lghs/secrets/bootstrap-token
-if [[ ! -s "$BOOT_TOKEN" ]]; then
-  python3 - <<'PY' > "$BOOT_TOKEN"
-import secrets
-print(secrets.token_urlsafe(48))
-PY
-  chmod 0600 "$BOOT_TOKEN"
-fi
+# The password-derived per-device token authenticates only the initial Bluetooth
+# contact. It is never sent as plaintext and is deleted after Fleet enrollment.
+chmod 0600 "$BOOT_TOKEN"
 install -m 0600 /dev/null /etc/lghs/bluetooth-bootstrap-enabled
 
 # Ensure the stock bootstrap uses the updated unit/script from this checkout.
@@ -233,24 +255,13 @@ systemctl enable --now lghs-bt-bootstrap.service
 printf '%s\n' "$COMMIT" > /etc/lghs/source-commit
 printf '%s\n' "$COMMIT" > /var/lib/lghs/update/current-commit
 
-TOKEN="$(cat "$BOOT_TOKEN")"
 echo
 echo "============================================================"
-echo " LGHS STOCK BOOTSTRAP READY: $DEVICE"
+echo " LGHS ZERO-TOUCH PROVISIONING STARTED: $DEVICE"
 echo "============================================================"
-echo "Bluetooth is waiting for LGCSCONT."
+echo "You are done on this Pi. Leave it powered on near LGCSCONT."
+echo "It will automatically complete:"
+echo "  Bluetooth authentication -> Cloudflare tunnel -> controller verification -> Fleet enrollment"
 echo
-echo "1) On your Windows manager, update LGCSCONT first:"
-echo '  ssh LGCSCONT-CF "sudo env LGHS_UPDATE_BRANCH=main /usr/local/sbin/lghs-update"'
-echo '  ssh LGCSCONT-CF "sudo systemctl restart lghs-bt-provision.service"'
-echo
-echo "2) Then register this ONE-TIME Bluetooth credential in Windows PowerShell:"
-echo "  \$bt = '$TOKEN'"
-echo "  \$bt | ssh LGCSCONT-CF \"sudo python3 /opt/lghs/repo/controller/lghs-bootstrap-enroll $DEVICE\""
-echo '  Remove-Variable bt'
-echo
-echo "3) Watch the controller complete Bluetooth -> Cloudflare verify -> Fleet:"
-echo '  ssh LGCSCONT-CF "sudo journalctl -fu lghs-bt-provision.service"'
-echo
-echo "After Cloudflare is verified, the controller creates and delivers the Fleet token automatically."
-echo "Do NOT run lghs-imager-enroll or manually create a Fleet token for this stock deployment."
+echo "No per-device token copy or Windows command is required."
+echo "Fleet will not start until Cloudflare SSH has been verified by LGCSCONT."
