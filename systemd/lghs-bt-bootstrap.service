@@ -1,5 +1,5 @@
 [Unit]
-Description=LGHS Bluetooth Wi-Fi Bootstrap Client
+Description=LGHS Bluetooth Bootstrap Client (Cloudflare before Fleet)
 After=lghs-firstboot-provision.service bluetooth.service lghs-bt-prepare.service NetworkManager.service
 Requires=bluetooth.service lghs-bt-prepare.service
 Wants=lghs-firstboot-provision.service NetworkManager.service
@@ -22,10 +22,10 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/lghs
-# Bluetooth provisions Wi-Fi and then installs the device-scoped remotely
-# managed Cloudflare connector. Keep the rest of the OS read-only while
-# explicitly permitting only the persistent paths that installer owns.
-ReadWritePaths=/var/lib/lghs /var/lib/lghs-agent /etc/NetworkManager/system-connections /etc/cloudflared /etc/systemd/system /usr/local/bin /run
+# Bluetooth first installs the device-scoped Cloudflare connector and the
+# controller SSH public key. Only after the controller verifies SSH through
+# Cloudflare may this service persist the per-device Fleet identity.
+ReadWritePaths=/var/lib/lghs /var/lib/lghs-agent /etc/NetworkManager/system-connections /etc/cloudflared /etc/systemd/system /usr/local/bin /run /etc/lghs/secrets /etc/lghs/fleet-api.conf /etc/lghs/controller_ed25519.pub /etc/ssh/authorized_keys
 
 [Install]
 WantedBy=multi-user.target
