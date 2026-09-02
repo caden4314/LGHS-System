@@ -83,7 +83,7 @@ if [[ "${LGHS_NONINTERACTIVE:-0}" != 1 ]]; then
   while :; do
     read -rsp "LGHS password: " ADMIN_PASS; echo
     read -rsp "Confirm password: " ADMIN_PASS2; echo
-    [[ ${#ADMIN_PASS} -ge 12 ]] || { echo "Use at least 12 characters."; continue; }
+    [[ -n "$ADMIN_PASS" ]] || { echo "Password cannot be empty."; continue; }
     [[ "$ADMIN_PASS" == "$ADMIN_PASS2" ]] || { echo "Passwords did not match."; continue; }
     break
   done
@@ -93,7 +93,6 @@ if [[ "${LGHS_NONINTERACTIVE:-0}" != 1 ]]; then
   unset ADMIN_PASS ADMIN_PASS2
 else
   [[ -n "${LGHS_ADMIN_PASSWORD:-}" ]] || die "LGHS_ADMIN_PASSWORD is required with LGHS_NONINTERACTIVE=1"
-  [[ ${#LGHS_ADMIN_PASSWORD} -ge 12 ]] || die "LGHS_ADMIN_PASSWORD must be at least 12 characters"
   derive_bootstrap_token "$LGHS_ADMIN_PASSWORD"
   printf '%s:%s\n' "$ADMIN_USER" "$LGHS_ADMIN_PASSWORD" | chpasswd
   printf 'root:%s\n' "$LGHS_ADMIN_PASSWORD" | chpasswd
@@ -113,12 +112,6 @@ fi
 COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 log "LGHS source: ${COMMIT:0:12}"
 
-# Persist the stock account mapping in Git's checkout filters. LGHS's upstream
-# source intentionally keeps the legacy image account names for compatibility;
-# on this device every future git reset performed by lghs-update is smudged to
-# cs-##/cs-admin while the clean filter maps it back for Git comparisons. This
-# keeps the updater checkout clean and prevents a future update from reverting
-# the stock device to lg_cs_cont/cs_admin.
 cat > "$SMUDGE" <<'PY'
 #!/usr/bin/env python3
 import sys
@@ -160,9 +153,6 @@ LGHS_UPDATE_CHECKOUT=$SOURCE
 EOF
 chmod 0644 /etc/lghs/update.env
 
-# Build a disposable device-local tree for the initial install. This is also a
-# defense-in-depth mapping in case a Git implementation skipped a filter on a
-# file type; installed scripts/policies must never reference the wrong account.
 rm -rf "$APPLY"
 cp -a "$SOURCE" "$APPLY"
 python3 - "$APPLY" "$STUDENT_USER" "$ADMIN_USER" <<'PY'
@@ -182,9 +172,6 @@ for path in root.rglob('*'):
 PY
 printf '%s\n' "$COMMIT" > "$APPLY/.lghs-source-commit"
 
-# Run the normal installer while deliberately suppressing live service starts.
-# This installs the complete LGHS payload, but Fleet remains dormant until the
-# Bluetooth -> Cloudflare -> controller verification sequence succeeds.
 install -d -m 0755 "$BUILD_BIN"
 cat > "$BUILD_BIN/systemctl" <<'EOS'
 #!/bin/bash
@@ -208,17 +195,11 @@ PATH="$BUILD_BIN:$PATH" /bin/bash "$APPLY/install.sh" student
 rm -rf "$BUILD_BIN"
 trap - EXIT
 
-# The stock account remains usable for recovery until provisioning succeeds.
-# No Fleet service is allowed to run before Cloudflare has been controller-
-# verified and a per-device Fleet credential has been delivered.
 systemctl disable --now \
   lghs-agent.service lghs-command-executor.service lghs-discovery-advertise.service \
   lghs-policy.service lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer \
   >/dev/null 2>&1 || true
 
-# Controller SSH authorization is delivered over the authenticated Bluetooth
-# channel and lives outside the user's home so the hardened BT service need not
-# write arbitrary home-directory content.
 cat > /etc/ssh/sshd_config.d/91-lghs-stock-admin.conf <<EOF
 Match User $ADMIN_USER
     PubkeyAuthentication yes
@@ -236,12 +217,9 @@ ssh-keygen -A
 sshd -t
 systemctl enable --now ssh.service bluetooth.service NetworkManager.service
 
-# The password-derived per-device token authenticates only the initial Bluetooth
-# contact. It is never sent as plaintext and is deleted after Fleet enrollment.
 chmod 0600 "$BOOT_TOKEN"
 install -m 0600 /dev/null /etc/lghs/bluetooth-bootstrap-enabled
 
-# Ensure the stock bootstrap uses the updated unit/script from this checkout.
 install -m 0644 "$APPLY/bluetooth/lghs_bt_protocol.py" /usr/local/lib/lghs-bt/lghs_bt_protocol.py
 install -m 0755 "$APPLY/bluetooth/lghs-bt-prepare" /usr/local/sbin/lghs-bt-prepare
 install -m 0755 "$APPLY/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap
