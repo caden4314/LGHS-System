@@ -23,10 +23,14 @@ cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-fleet-command *
 # root-owned updater checkout and imports the installed responsive console.
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-console
 cs_admin ALL=(root) NOPASSWD: /usr/bin/python3 /opt/lghs/repo/controller/lghs-console-day2
-# LGHS Imager uses the dedicated controller management link to register the
-# per-device Fleet API token generated for a newly flashed Student Pi. The token
-# is supplied on stdin and never appears in argv.
+# Legacy LGHS Imager enrollment. The token is supplied on stdin and never
+# appears in argv.
 cs_admin ALL=(root) NOPASSWD: /usr/bin/python3 /opt/lghs/repo/controller/lghs-imager-enroll *
+# Stock Raspberry Pi OS enrollment uses a separate one-time Bluetooth bootstrap
+# credential. This helper only writes /etc/lghs/bootstrap-tokens.json; it does
+# NOT create a Fleet API token. Fleet is minted later by lghs-bt-provision only
+# after the device's Cloudflare SSH endpoint has been verified.
+cs_admin ALL=(root) NOPASSWD: /usr/bin/python3 /opt/lghs/repo/controller/lghs-bootstrap-enroll *
 # lghs-telemetry-configure itself validates that the supplied endpoint is HTTPS.
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-telemetry-configure *
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
