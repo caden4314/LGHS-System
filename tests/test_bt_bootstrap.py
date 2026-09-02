@@ -12,7 +12,7 @@ from lghs_bt_protocol import (decrypt_payload, derive_key, encrypt_payload,
 
 class BluetoothProtocolTests(unittest.TestCase):
     def test_mutual_auth_and_encrypted_round_trip(self):
-        token = b"device-specific-fleet-token-for-test"
+        token = b"device-specific-bootstrap-token-for-test"
         server_private, server_pub = new_ephemeral()
         client_private, client_pub = new_ephemeral()
         tx = transcript("LGCSCONT", "CS-999", "server-nonce", "client-nonce", server_pub, client_pub)
@@ -34,7 +34,7 @@ class BluetoothProtocolTests(unittest.TestCase):
         self.assertEqual(decrypt_payload(client_key, tx, envelope), payload)
 
     def test_transcript_change_breaks_authentication(self):
-        token = b"fleet-token"
+        token = b"one-time-bootstrap-token"
         _, server_pub = new_ephemeral()
         _, client_pub = new_ephemeral()
         tx = transcript("LGCSCONT", "CS-999", "a", "b", server_pub, client_pub)
@@ -72,11 +72,28 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn("decrypt_payload", student)
         self.assertIn("encrypt_payload", controller)
 
-    def test_controller_authenticates_against_device_token_registry(self):
-        src = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
-        self.assertIn("fleet-api-tokens.json", src)
-        self.assertIn('verify_proof(token, "student"', src)
-        self.assertIn("encrypt_payload", src)
+    def test_controller_authenticates_against_one_time_bootstrap_registry(self):
+        controller = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
+        student = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
+        enroll = (ROOT / "controller" / "lghs-bootstrap-enroll").read_text(encoding="utf-8")
+        self.assertIn("bootstrap-tokens.json", controller)
+        self.assertIn("bootstrap_token_for(device_id)", controller)
+        self.assertIn('verify_proof(token, "student"', controller)
+        self.assertIn("/etc/lghs/secrets/bootstrap-token", student)
+        self.assertIn("expires_at", enroll)
+        self.assertIn("24 * 60 * 60", enroll)
+
+    def test_cloudflare_is_verified_before_fleet_token_is_minted(self):
+        controller = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
+        student = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
+
+        verify_call = controller.index("verify_cloudflare_ssh(device_id")
+        mint_call = controller.index("fleet_token = mint_fleet_token(device_id)")
+        self.assertLess(verify_call, mint_call)
+        self.assertIn('"status" != "cloudflare-ready"', controller)
+        self.assertIn('"type": "fleet_enrollment"', controller)
+        self.assertIn('"type": "fleet_enrollment"', student)
+        self.assertIn('["bluetooth", "cloudflare", "cloudflare-verified", "fleet"]', student)
 
     def test_controller_publishes_rfcomm_sdp_service(self):
         src = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
@@ -95,7 +112,7 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertLess(script.index("ssh-keygen -A"), script.index("sshd -t"))
         self.assertIn("/etc/cloudflared", script)
         self.assertIn("systemctl restart lghs-bt-bootstrap.service", script)
-        self.assertIn("Before=display-manager.service getty@tty1.service lghs-policy.service lghs-agent.service lghs-bt-bootstrap.service", firstboot_unit)
+        self.assertIn("Before=graphical.target display-manager.service getty@tty1.service lghs-policy.service lghs-agent.service lghs-bt-bootstrap.service", firstboot_unit)
         self.assertIn("After=lghs-firstboot-provision.service", bt_unit)
 
     def test_bt_sandbox_permits_only_needed_tunnel_install_paths(self):
@@ -110,6 +127,8 @@ class BluetoothSourceInvariants(unittest.TestCase):
             "/etc/systemd/system",
             "/usr/local/bin",
             "/run",
+            "/etc/lghs/secrets",
+            "/etc/ssh/authorized_keys",
         ):
             self.assertIn(path, write_line)
 
