@@ -83,6 +83,21 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn("expires_at", enroll)
         self.assertIn("24 * 60 * 60", enroll)
 
+    def test_stock_password_bootstrap_is_prearmed_and_requires_no_per_device_handoff(self):
+        controller_setup = (ROOT / "controller" / "lghs-stock-bootstrap-secret").read_text(encoding="utf-8")
+        stock = (ROOT / "bootstrap" / "install-stock.sh").read_text(encoding="utf-8")
+        for marker in ("LGHS-stock-bootstrap-v1", "LGHS-STOCK-BT-v1\\0", "hashlib.scrypt", "hashlib.sha512"):
+            self.assertIn(marker, controller_setup)
+            self.assertIn(marker, stock)
+        self.assertIn("range(1, 15)", controller_setup)
+        self.assertIn("stock-password-derived", controller_setup)
+        self.assertIn("Use at least 12 characters", controller_setup)
+        self.assertIn("Use at least 12 characters", stock)
+        self.assertNotIn("lghs-bootstrap-enroll", stock)
+        self.assertNotIn("Remove-Variable bt", stock)
+        self.assertNotIn("$bt =", stock)
+        self.assertIn("No per-device token copy or Windows command is required.", stock)
+
     def test_cloudflare_is_verified_before_fleet_token_is_minted(self):
         controller = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
         student = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
