@@ -1,33 +1,42 @@
 #!/usr/bin/env python3
 import json
 import os
+import secrets
+import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, "/usr/local/lib/lghs-bt")
-from lghs_bt_protocol import (PROTOCOL_VERSION, decrypt_payload, derive_key,
-                              encrypt_payload, new_ephemeral, proof, recv_frame,
-                              send_frame, transcript, verify_proof)
+from lghs_bt_protocol import (PROTOCOL_VERSION, derive_key, encrypt_payload,
+                              new_ephemeral, proof, recv_frame, send_frame,
+                              transcript, verify_proof)
 
 CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
-TOKENS = Path(os.environ.get("LGHS_FLEET_API_TOKENS", "/etc/lghs/fleet-api-tokens.json"))
+BOOTSTRAP_TOKENS = Path(os.environ.get("LGHS_BOOTSTRAP_TOKENS", "/etc/lghs/bootstrap-tokens.json"))
+FLEET_TOKENS = Path(os.environ.get("LGHS_FLEET_API_TOKENS", "/etc/lghs/fleet-api-tokens.json"))
 ROLE = Path("/etc/lghs/role")
-SOCKET_TIMEOUT = 180
+SOCKET_TIMEOUT = 240
 COMMAND_TIMEOUT = 90
 SOL_BLUETOOTH = getattr(socket, "SOL_BLUETOOTH", 274)
 BT_SECURITY = getattr(socket, "BT_SECURITY", 4)
 BT_SECURITY_LOW = 1
 CLOUDFLARE_PROVISION = "/usr/local/sbin/lghs-cloudflare-provision"
+CONTROLLER_KEY = Path("/etc/lghs/secrets/controller_ed25519")
+CONTROLLER_PUB = Path("/etc/lghs/secrets/controller_ed25519.pub")
+KNOWN_HOSTS = Path("/var/lib/lghs/ssh_known_hosts")
+DEFAULT_FLEET_API_URL = os.environ.get("LGHS_FLEET_API_URL", "https://fleet-api.scenicrouteservers.com")
+CLOUDFLARED = shutil.which("cloudflared") or "/usr/local/bin/cloudflared"
 
 
-def run(cmd, timeout=None):
+def run(cmd, timeout=None, input_text=None):
     try:
-        return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        return subprocess.run(cmd, text=True, input=input_text, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "command timed out")
 
@@ -40,17 +49,79 @@ def controller_id():
     return socket.gethostname().upper()
 
 
-def token_for(device_id):
+def load_json(path):
     try:
-        data = json.loads(TOKENS.read_text(encoding="utf-8"))
-    except Exception:
+        value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception as exc:
+        raise RuntimeError(f"Invalid registry {path}: {exc}")
+    return value if isinstance(value, dict) else {}
+
+
+def atomic_write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def bootstrap_token_for(device_id):
+    data = load_json(BOOTSTRAP_TOKENS)
+    devices = data.get("devices", {}) if isinstance(data.get("devices", {}), dict) else {}
+    entry = devices.get(device_id)
+    if not isinstance(entry, dict):
         return b""
-    if isinstance(data, dict) and "devices" in data:
-        data = data["devices"]
-    value = data.get(device_id) if isinstance(data, dict) else None
-    if isinstance(value, dict):
-        value = value.get("token")
-    return str(value or "").encode("utf-8")
+    if float(entry.get("expires_at") or 0) <= time.time():
+        return b""
+    value = str(entry.get("token") or "")
+    return value.encode("utf-8") if len(value) >= 48 else b""
+
+
+def consume_bootstrap_token(device_id):
+    data = load_json(BOOTSTRAP_TOKENS)
+    devices = data.setdefault("devices", {})
+    if isinstance(devices, dict):
+        devices.pop(device_id, None)
+    data.setdefault("version", 1)
+    atomic_write(BOOTSTRAP_TOKENS, data)
+
+
+def mint_fleet_token(device_id):
+    token = secrets.token_urlsafe(48)
+    data = load_json(FLEET_TOKENS)
+    data.setdefault("version", 1)
+    devices = data.setdefault("devices", {})
+    if not isinstance(devices, dict):
+        raise RuntimeError("Invalid Fleet token registry devices object")
+    devices[device_id] = {
+        "token": token,
+        "source": "bluetooth-after-cloudflare-verify",
+        "updated_at": time.time(),
+    }
+    atomic_write(FLEET_TOKENS, data)
+    return token
+
+
+def controller_public_key():
+    if CONTROLLER_PUB.exists():
+        text = CONTROLLER_PUB.read_text(encoding="utf-8").strip()
+    else:
+        p = run(["ssh-keygen", "-y", "-f", str(CONTROLLER_KEY)], timeout=10)
+        if p.returncode != 0:
+            raise RuntimeError("controller SSH public key is unavailable")
+        text = p.stdout.strip()
+    parts = text.split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise RuntimeError("controller fleet key is not Ed25519")
+    return f"{parts[0]} {parts[1]}"
 
 
 def active_wifi_profile():
@@ -66,9 +137,9 @@ def active_wifi_profile():
     if not connection:
         raise RuntimeError("controller has no active Wi-Fi connection")
 
-    def field(name, secrets=False):
+    def field(name, secrets_flag=False):
         cmd = ["nmcli"]
-        if secrets:
+        if secrets_flag:
             cmd.append("--show-secrets")
         cmd += ["-g", name, "connection", "show", connection]
         out = run(cmd)
@@ -76,7 +147,7 @@ def active_wifi_profile():
 
     ssid = field("802-11-wireless.ssid")
     key_mgmt = field("802-11-wireless-security.key-mgmt")
-    psk = field("802-11-wireless-security.psk", secrets=True)
+    psk = field("802-11-wireless-security.psk", secrets_flag=True)
     hidden = field("802-11-wireless.hidden").lower() in ("yes", "true", "1")
     if not ssid:
         raise RuntimeError("active Wi-Fi profile has no SSID")
@@ -84,13 +155,7 @@ def active_wifi_profile():
         raise RuntimeError("Bluetooth bootstrap currently supports open/WPA-PSK/SAE Wi-Fi only")
     if key_mgmt and not psk:
         raise RuntimeError("active Wi-Fi profile requires a secret that NetworkManager did not expose")
-    return {
-        "ssid": ssid,
-        "key_mgmt": key_mgmt or "open",
-        "psk": psk,
-        "hidden": hidden,
-        "autoconnect": True,
-    }
+    return {"ssid": ssid, "key_mgmt": key_mgmt or "open", "psk": psk, "hidden": hidden, "autoconnect": True}
 
 
 def cloudflare_prepare(device_id):
@@ -101,10 +166,8 @@ def cloudflare_prepare(device_id):
         data = json.loads((p.stdout or "").strip())
     except Exception as exc:
         raise RuntimeError(f"Cloudflare bootstrap returned invalid JSON: {exc}")
-    token = str(data.get("tunnel_token") or "")
-    host = str(data.get("ssh_host") or "")
-    if not token or not host:
-        raise RuntimeError("Cloudflare bootstrap response is missing tunnel token or SSH hostname")
+    if not data.get("tunnel_token") or not data.get("ssh_host"):
+        raise RuntimeError("Cloudflare bootstrap response is incomplete")
     return data
 
 
@@ -113,6 +176,28 @@ def cloudflare_finalize(device_id, host_key):
     if p.returncode != 0:
         raise RuntimeError("Cloudflare bootstrap finalization failed: " + (p.stderr or p.stdout or "unknown error").strip()[-500:])
     return json.loads((p.stdout or "{}").strip())
+
+
+def verify_cloudflare_ssh(device_id, ssh_host, ssh_user):
+    if not CONTROLLER_KEY.exists():
+        raise RuntimeError("controller SSH private key is missing")
+    if not os.path.exists(CLOUDFLARED) and not shutil.which("cloudflared"):
+        raise RuntimeError("cloudflared is not installed on the controller")
+    args = [
+        "ssh", "-i", str(CONTROLLER_KEY), "-o", "IdentitiesOnly=yes",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=yes",
+        "-o", "BatchMode=yes", "-o", "ConnectTimeout=12",
+        "-o", f"ProxyCommand={CLOUDFLARED} access ssh --hostname %h",
+        f"{ssh_user}@{ssh_host}", "hostname",
+    ]
+    last = ""
+    for _ in range(8):
+        p = run(args, timeout=25)
+        if p.returncode == 0 and p.stdout.strip().upper() == device_id:
+            return
+        last = (p.stderr or p.stdout or "").strip()
+        time.sleep(3)
+    raise RuntimeError("Cloudflare SSH verification failed; Fleet enrollment refused: " + last[-500:])
 
 
 def ensure_sdp_record():
@@ -135,13 +220,8 @@ def handle_client(conn, address):
     server_private, server_pub = new_ephemeral()
     server_nonce = os.urandom(24).hex()
     cid = controller_id()
-    send_frame(conn, {
-        "v": PROTOCOL_VERSION,
-        "type": "controller_hello",
-        "controller_id": cid,
-        "server_nonce": server_nonce,
-        "server_pub": server_pub,
-    })
+    send_frame(conn, {"v": PROTOCOL_VERSION, "type": "controller_hello", "controller_id": cid,
+                      "server_nonce": server_nonce, "server_pub": server_pub})
 
     hello = recv_frame(conn)
     if hello.get("v") != PROTOCOL_VERSION or hello.get("type") != "student_hello":
@@ -154,56 +234,63 @@ def handle_client(conn, address):
     if not device_id or len(device_id) > 64:
         raise ValueError("invalid device id")
 
-    token = token_for(device_id)
+    token = bootstrap_token_for(device_id)
     if not token:
-        raise PermissionError("device is not enrolled in the Fleet API token registry")
+        raise PermissionError("device has no active one-time Bluetooth bootstrap credential")
     tx = transcript(cid, device_id, server_nonce, client_nonce, server_pub, client_pub)
     if not verify_proof(token, "student", tx, supplied):
-        raise PermissionError("student authentication failed")
+        raise PermissionError("student bootstrap authentication failed")
 
     key = derive_key(server_private, client_pub, token, tx)
     wifi = active_wifi_profile()
-    payload = {"type": "wifi_profile", "wifi": wifi, "issued_at": time.time()}
+    payload = {
+        "type": "wifi_profile", "wifi": wifi, "issued_at": time.time(),
+        "controller_pubkey": controller_public_key(),
+    }
     cloudflare = None
     if not dry_run:
         cloudflare = cloudflare_prepare(device_id)
-        payload["cloudflare"] = {
-            "ssh_host": cloudflare["ssh_host"],
-            "tunnel_token": cloudflare["tunnel_token"],
-        }
+        payload["cloudflare"] = {"ssh_host": cloudflare["ssh_host"], "tunnel_token": cloudflare["tunnel_token"]}
 
     encrypted = encrypt_payload(key, tx, payload)
-    send_frame(conn, {
-        "v": PROTOCOL_VERSION,
-        "type": "provision",
-        "controller_proof": proof(token, "controller", tx),
-        **encrypted,
-    })
+    send_frame(conn, {"v": PROTOCOL_VERSION, "type": "provision",
+                      "controller_proof": proof(token, "controller", tx), **encrypted})
 
     result = recv_frame(conn)
     if result.get("type") != "result":
         raise ValueError("student did not return provisioning result")
     status = str(result.get("status") or "unknown")
-
     if dry_run:
         print(f"Bluetooth bootstrap dry-run {device_id} from {address[0]}: {status}", flush=True)
         return
+    if status != "cloudflare-ready":
+        raise RuntimeError(f"student did not reach Cloudflare-ready state: {status}")
 
-    if status != "ready":
-        raise RuntimeError(f"student provisioning did not become ready: {status}")
     host_key = str(result.get("ssh_host_key") or "")
     ssh_host = str(result.get("ssh_host") or "")
+    ssh_user = str(result.get("ssh_user") or "cs-admin")
     if cloudflare is None or ssh_host != cloudflare.get("ssh_host"):
         raise RuntimeError("student Cloudflare hostname does not match controller allocation")
 
     finalized = cloudflare_finalize(device_id, host_key)
-    send_frame(conn, {
-        "v": PROTOCOL_VERSION,
-        "type": "complete",
-        "status": "ready",
-        "ssh_host": finalized.get("ssh_host") or ssh_host,
-    })
-    print(f"Bluetooth zero-touch bootstrap READY {device_id}: {ssh_host}", flush=True)
+    verify_cloudflare_ssh(device_id, finalized.get("ssh_host") or ssh_host, ssh_user)
+    print(f"Cloudflare VERIFIED {device_id}: {ssh_user}@{ssh_host}", flush=True)
+
+    # Only now is a Fleet credential created. This enforces the required order:
+    # Bluetooth authentication -> Cloudflare install -> controller SSH verify -> Fleet.
+    fleet_token = mint_fleet_token(device_id)
+    fleet_payload = {
+        "type": "fleet_enrollment", "fleet_token": fleet_token,
+        "fleet_api_url": DEFAULT_FLEET_API_URL, "issued_at": time.time(),
+    }
+    encrypted_fleet = encrypt_payload(key, tx, fleet_payload)
+    send_frame(conn, {"v": PROTOCOL_VERSION, "type": "fleet_enrollment", **encrypted_fleet})
+    fleet_result = recv_frame(conn)
+    if fleet_result.get("type") != "result" or fleet_result.get("status") != "fleet-ready":
+        raise RuntimeError("student did not confirm Fleet enrollment")
+
+    consume_bootstrap_token(device_id)
+    print(f"READY {device_id}: Bluetooth -> Cloudflare verified -> Fleet enrolled", flush=True)
 
 
 def client_thread(conn, address):
@@ -228,10 +315,10 @@ def main():
     server = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     set_app_authenticated_security(server)
-    server.bind((socket.BDADDR_ANY, CHANNEL))
-    server.listen(5)
+    server.bind((socket.BDADDR_ANY, CHANNEL)); server.listen(5)
     ensure_sdp_record()
     print(f"LGHS Bluetooth provisioning listening on RFCOMM channel {CHANNEL}", flush=True)
+    print("Enrollment order enforced: Bluetooth -> Cloudflare verify -> Fleet", flush=True)
     while True:
         conn, address = server.accept()
         threading.Thread(target=client_thread, args=(conn, address), daemon=True).start()
