@@ -90,7 +90,7 @@ class BluetoothSourceInvariants(unittest.TestCase):
         verify_call = controller.index("verify_cloudflare_ssh(device_id")
         mint_call = controller.index("fleet_token = mint_fleet_token(device_id)")
         self.assertLess(verify_call, mint_call)
-        self.assertIn('"status" != "cloudflare-ready"', controller)
+        self.assertIn('status != "cloudflare-ready"', controller)
         self.assertIn('"type": "fleet_enrollment"', controller)
         self.assertIn('"type": "fleet_enrollment"', student)
         self.assertIn('["bluetooth", "cloudflare", "cloudflare-verified", "fleet"]', student)
