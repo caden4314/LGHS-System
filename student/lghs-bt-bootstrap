@@ -8,7 +8,6 @@ import struct
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, "/usr/local/lib/lghs-bt")
@@ -21,19 +20,23 @@ BT_INDEX = os.environ.get("LGHS_BT_INDEX", "hci0")
 DISCOVERY_TIMEOUT = float(os.environ.get("LGHS_BT_DISCOVERY_TIMEOUT", "12"))
 RETRY_BACKOFF = float(os.environ.get("LGHS_BT_RETRY_BACKOFF", "5"))
 COMMAND_TIMEOUT = 6
-SOCKET_TIMEOUT = 180
+SOCKET_TIMEOUT = 240
 ALIAS_PREFIX = "LGHS-PROVISION-"
 ENABLED = Path("/etc/lghs/bluetooth-bootstrap-enabled")
 STATE_DIR = Path("/var/lib/lghs/bootstrap")
 PROVISIONED = STATE_DIR / "wifi-provisioned.json"
-TOKEN_PATHS = (Path("/etc/lghs/secrets/fleet-api-token"), Path("/var/lib/lghs-agent/fleet-api-token"))
-CONF_PATHS = (Path("/etc/lghs/fleet-api.conf"), Path("/var/lib/lghs-agent/fleet-api.conf"))
+BOOTSTRAP_TOKEN = Path("/etc/lghs/secrets/bootstrap-token")
+FLEET_TOKEN_ROOT = Path("/etc/lghs/secrets/fleet-api-token")
+FLEET_CONF_ROOT = Path("/etc/lghs/fleet-api.conf")
+FLEET_TOKEN_AGENT = Path("/var/lib/lghs-agent/fleet-api-token")
+FLEET_CONF_AGENT = Path("/var/lib/lghs-agent/fleet-api.conf")
 HOST_KEY = Path("/etc/ssh/ssh_host_ed25519_key.pub")
 CLOUDFLARE_INSTALL = "/usr/local/sbin/lghs-cloudflare-install"
 MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\b")
 SOL_BLUETOOTH = getattr(socket, "SOL_BLUETOOTH", 274)
 BT_SECURITY = getattr(socket, "BT_SECURITY", 4)
 BT_SECURITY_LOW = 1
+DEFAULT_FLEET_API_URL = "https://fleet-api.scenicrouteservers.com"
 
 
 def run(cmd, timeout=None, input_text=None):
@@ -65,15 +68,24 @@ def device_id():
     return socket.gethostname().upper()
 
 
-def fleet_token():
-    for path in TOKEN_PATHS:
-        try:
-            value = path.read_text(encoding="utf-8").strip()
-            if value:
-                return value.encode("utf-8")
-        except Exception:
-            pass
-    raise RuntimeError("no Fleet API token is installed")
+def admin_user():
+    try:
+        value = Path("/etc/lghs/admin-user").read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return "cs_admin"
+
+
+def bootstrap_token():
+    try:
+        value = BOOTSTRAP_TOKEN.read_text(encoding="utf-8").strip()
+    except Exception:
+        value = ""
+    if len(value) < 48 or any(ch.isspace() for ch in value):
+        raise RuntimeError("no valid one-time Bluetooth bootstrap token is installed")
+    return value.encode("utf-8")
 
 
 def configure_adapter():
@@ -96,15 +108,11 @@ def _cached_controller():
 def discover_controller(timeout=None):
     try:
         proc = subprocess.Popen(
-            ["btmgmt", "-i", BT_INDEX, "find", "-b"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
+            ["btmgmt", "-i", BT_INDEX, "find", "-b"], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1,
         )
     except FileNotFoundError:
         return _cached_controller()
-
     started = time.monotonic()
     current_mac = None
     try:
@@ -116,7 +124,6 @@ def discover_controller(timeout=None):
                 wait = min(1.0, remaining)
             else:
                 wait = 1.0
-
             if proc.stdout is None:
                 break
             ready, _, _ = select.select([proc.stdout], [], [], wait)
@@ -124,7 +131,6 @@ def discover_controller(timeout=None):
                 if proc.poll() is not None:
                     break
                 continue
-
             raw = proc.stdout.readline()
             if not raw:
                 if proc.poll() is not None:
@@ -146,41 +152,10 @@ def discover_controller(timeout=None):
             try:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2)
+                proc.kill(); proc.wait(timeout=2)
         if proc.stdout is not None:
             proc.stdout.close()
-
     return _cached_controller()
-
-
-def read_conf():
-    values = {}
-    for path in CONF_PATHS:
-        try:
-            for raw in path.read_text(encoding="utf-8").splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                values[k.strip()] = v.strip().strip("'\"")
-            if values:
-                break
-        except Exception:
-            pass
-    return values
-
-
-def fleet_health_ok():
-    conf = read_conf()
-    base = conf.get("LGHS_FLEET_API_URL") or conf.get("FLEET_API_URL") or "https://fleet-api.scenicrouteservers.com"
-    url = base.rstrip("/") + "/health"
-    try:
-        with urllib.request.urlopen(url, timeout=12) as response:
-            body = json.loads(response.read(8192))
-            return response.status == 200 and bool(body.get("ok"))
-    except Exception:
-        return False
 
 
 def validate_wifi(wifi):
@@ -202,8 +177,7 @@ def apply_wifi(wifi):
     psk = str(wifi.get("psk") or "")
     name = "LGHS-Bootstrap-" + "".join(c if c.isalnum() or c in "._-" else "_" for c in ssid)[:40]
     run(["nmcli", "connection", "delete", name])
-    cmd = ["nmcli", "connection", "add", "type", "wifi", "ifname", "*", "con-name", name, "ssid", ssid]
-    p = run(cmd)
+    p = run(["nmcli", "connection", "add", "type", "wifi", "ifname", "*", "con-name", name, "ssid", ssid])
     if p.returncode != 0:
         raise RuntimeError("NetworkManager could not create bootstrap Wi-Fi profile")
     if hidden:
@@ -222,6 +196,27 @@ def apply_wifi(wifi):
     return name
 
 
+def install_controller_key(public_key):
+    parts = str(public_key or "").strip().split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise RuntimeError("controller did not provide a valid Ed25519 public key")
+    key = f"{parts[0]} {parts[1]}"
+    user = admin_user()
+    if run(["id", user]).returncode != 0:
+        raise RuntimeError(f"admin account is unavailable: {user}")
+    Path("/etc/lghs/controller_ed25519.pub").write_text(key + "\n", encoding="utf-8")
+    os.chmod("/etc/lghs/controller_ed25519.pub", 0o644)
+    directory = Path("/etc/ssh/authorized_keys")
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o755)
+    target = directory / user
+    target.write_text(key + "\n", encoding="utf-8")
+    os.chmod(target, 0o600)
+    require_command(["sshd", "-t"], "SSH configuration validation")
+    run(["systemctl", "try-restart", "ssh.service"])
+    return user
+
+
 def install_cloudflare(cloudflare):
     if not isinstance(cloudflare, dict):
         raise RuntimeError("controller did not provide Cloudflare bootstrap data")
@@ -229,7 +224,7 @@ def install_cloudflare(cloudflare):
     tunnel_token = str(cloudflare.get("tunnel_token") or "")
     if not ssh_host or not tunnel_token:
         raise RuntimeError("Cloudflare bootstrap data is incomplete")
-    p = run([CLOUDFLARE_INSTALL], timeout=120, input_text=tunnel_token + "\n")
+    p = run([CLOUDFLARE_INSTALL], timeout=180, input_text=tunnel_token + "\n")
     if p.returncode != 0:
         raise RuntimeError("Cloudflare tunnel install failed: " + (p.stderr or p.stdout or "unknown error").strip()[-500:])
     return ssh_host
@@ -243,8 +238,50 @@ def ssh_host_key():
     return f"{parts[0]} {parts[1]}"
 
 
+def install_fleet_identity(payload):
+    if payload.get("type") != "fleet_enrollment":
+        raise RuntimeError("invalid Fleet enrollment payload")
+    token = str(payload.get("fleet_token") or "")
+    api_url = str(payload.get("fleet_api_url") or DEFAULT_FLEET_API_URL)
+    if len(token) < 32 or len(token) > 512 or any(ch.isspace() for ch in token):
+        raise RuntimeError("controller supplied an invalid Fleet token")
+    if not api_url.startswith("https://") or any(ch.isspace() for ch in api_url):
+        raise RuntimeError("controller supplied an invalid Fleet API URL")
+
+    FLEET_TOKEN_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    FLEET_TOKEN_ROOT.write_text(token + "\n", encoding="utf-8")
+    os.chmod(FLEET_TOKEN_ROOT, 0o600)
+    FLEET_CONF_ROOT.write_text(f"URL={api_url}\n", encoding="utf-8")
+    os.chmod(FLEET_CONF_ROOT, 0o600)
+
+    try:
+        import pwd
+        agent = pwd.getpwnam("lghs-agent")
+        FLEET_TOKEN_AGENT.parent.mkdir(parents=True, exist_ok=True)
+        FLEET_TOKEN_AGENT.write_text(token + "\n", encoding="utf-8")
+        FLEET_CONF_AGENT.write_text(f"URL={api_url}\n", encoding="utf-8")
+        os.chown(FLEET_TOKEN_AGENT, agent.pw_uid, agent.pw_gid)
+        os.chown(FLEET_CONF_AGENT, agent.pw_uid, agent.pw_gid)
+        os.chmod(FLEET_TOKEN_AGENT, 0o400)
+        os.chmod(FLEET_CONF_AGENT, 0o400)
+    except KeyError:
+        raise RuntimeError("LGHS agent account is missing")
+
+    # Fleet starts only after the controller has verified this device through
+    # its Cloudflare SSH hostname and delivered the per-device Fleet token.
+    services = [
+        "lghs-policy.service", "lghs-command-executor.service",
+        "lghs-agent.service", "lghs-discovery-advertise.service",
+    ]
+    timers = ["lghs-update.timer", "lghs-reconcile.timer", "lghs-netqueue.timer"]
+    require_command(["systemctl", "enable", *services, *timers], "Fleet service enable", timeout=20)
+    require_command(["systemctl", "start", *services, *timers], "Fleet service start", timeout=30)
+    BOOTSTRAP_TOKEN.unlink(missing_ok=True)
+    return api_url
+
+
 def exchange(address, dry_run=False):
-    token = fleet_token()
+    token = bootstrap_token()
     did = device_id()
     sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
     set_app_authenticated_security(sock)
@@ -261,13 +298,9 @@ def exchange(address, dry_run=False):
         client_nonce = os.urandom(24).hex()
         tx = transcript(cid, did, server_nonce, client_nonce, server_pub, client_pub)
         send_frame(sock, {
-            "v": PROTOCOL_VERSION,
-            "type": "student_hello",
-            "device_id": did,
-            "client_nonce": client_nonce,
-            "client_pub": client_pub,
-            "proof": proof(token, "student", tx),
-            "dry_run": bool(dry_run),
+            "v": PROTOCOL_VERSION, "type": "student_hello", "device_id": did,
+            "client_nonce": client_nonce, "client_pub": client_pub,
+            "proof": proof(token, "student", tx), "dry_run": bool(dry_run),
         })
         response = recv_frame(sock)
         if response.get("v") != PROTOCOL_VERSION or response.get("type") != "provision":
@@ -283,45 +316,45 @@ def exchange(address, dry_run=False):
 
         if dry_run:
             send_frame(sock, {"v": PROTOCOL_VERSION, "type": "result", "status": "dry-run-ok"})
-            print("Authenticated Bluetooth bootstrap handshake succeeded.")
+            print("Authenticated one-time Bluetooth bootstrap handshake succeeded.")
             print(f"Controller: {cid}")
             print(f"Device: {did}")
             print(f"SSID: {ssid}")
             print(f"Security: {key_mgmt}")
             print(f"Hidden: {'yes' if hidden else 'no'}")
-            print("Wi-Fi profile and Cloudflare tunnel were NOT modified.")
+            print("Wi-Fi, Cloudflare, and Fleet were NOT modified.")
             return True
 
         connection = apply_wifi(wifi)
-        if not fleet_health_ok():
-            raise RuntimeError("Wi-Fi joined but Fleet API health check failed")
-
+        ssh_user = install_controller_key(payload.get("controller_pubkey"))
         ssh_host = install_cloudflare(payload.get("cloudflare"))
+
+        # This is the hand-off point: the controller must prove that it can SSH
+        # through Cloudflare before it is allowed to mint a Fleet credential.
         send_frame(sock, {
-            "v": PROTOCOL_VERSION,
-            "type": "result",
-            "status": "ready",
-            "ssh_host": ssh_host,
-            "ssh_host_key": ssh_host_key(),
+            "v": PROTOCOL_VERSION, "type": "result", "status": "cloudflare-ready",
+            "ssh_host": ssh_host, "ssh_host_key": ssh_host_key(), "ssh_user": ssh_user,
         })
-        complete = recv_frame(sock)
-        if complete.get("v") != PROTOCOL_VERSION or complete.get("type") != "complete" or complete.get("status") != "ready":
-            raise RuntimeError("controller did not finalize zero-touch provisioning")
+
+        enrollment = recv_frame(sock)
+        if enrollment.get("v") != PROTOCOL_VERSION or enrollment.get("type") != "fleet_enrollment":
+            raise RuntimeError("controller did not send Fleet enrollment after Cloudflare verification")
+        fleet_payload = decrypt_payload(key, tx, enrollment)
+        api_url = install_fleet_identity(fleet_payload)
+        send_frame(sock, {"v": PROTOCOL_VERSION, "type": "result", "status": "fleet-ready"})
 
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(STATE_DIR, 0o700)
         marker = {
-            "device_id": did,
-            "controller_id": cid,
-            "connection": connection,
-            "ssh_host": ssh_host,
-            "provisioned_at": time.time(),
-            "protocol": PROTOCOL_VERSION,
+            "device_id": did, "controller_id": cid, "connection": connection,
+            "ssh_host": ssh_host, "fleet_api_url": api_url,
+            "provisioned_at": time.time(), "protocol": PROTOCOL_VERSION,
+            "order": ["bluetooth", "cloudflare", "cloudflare-verified", "fleet"],
         }
         tmp = PROVISIONED.with_suffix(".tmp")
         tmp.write_text(json.dumps(marker, separators=(",", ":")) + "\n", encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, PROVISIONED)
+        os.chmod(tmp, 0o600); os.replace(tmp, PROVISIONED)
+        ENABLED.unlink(missing_ok=True)
         return True
     finally:
         sock.close()
@@ -331,46 +364,40 @@ def main():
     dry_run = "--dry-run" in sys.argv[1:]
     unknown = [arg for arg in sys.argv[1:] if arg != "--dry-run"]
     if unknown:
-        print("Usage: lghs-bt-bootstrap [--dry-run]", file=sys.stderr)
-        return 2
+        print("Usage: lghs-bt-bootstrap [--dry-run]", file=sys.stderr); return 2
     if os.geteuid() != 0:
         raise SystemExit("Run as root")
     if not hasattr(socket, "AF_BLUETOOTH"):
         raise SystemExit("Python lacks AF_BLUETOOTH support")
     if not dry_run:
         if not ENABLED.exists():
-            print("LGHS Bluetooth bootstrap is not enabled on this device.")
-            return 0
+            print("LGHS Bluetooth bootstrap is not enabled on this device."); return 0
         if PROVISIONED.exists():
-            print("LGHS Bluetooth bootstrap already completed.")
-            return 0
+            print("LGHS Bluetooth bootstrap already completed."); return 0
     configure_adapter()
     if dry_run:
-        print("LGHS Bluetooth bootstrap dry-run: no NetworkManager or Cloudflare changes will be made.", flush=True)
+        print("LGHS Bluetooth bootstrap dry-run: no Wi-Fi, Cloudflare, or Fleet changes will be made.", flush=True)
         found = discover_controller(timeout=DISCOVERY_TIMEOUT)
         if not found:
-            print("Bluetooth bootstrap dry-run failed: no LGHS controller found", file=sys.stderr)
-            return 1
+            print("Bluetooth bootstrap dry-run failed: no LGHS controller found", file=sys.stderr); return 1
         address, name = found
         print(f"Found {name} at {address}; testing authenticated encrypted handshake", flush=True)
         try:
             return 0 if exchange(address, dry_run=True) else 1
         except Exception as exc:
-            print(f"Bluetooth bootstrap dry-run failed: {exc}", file=sys.stderr, flush=True)
-            return 1
+            print(f"Bluetooth bootstrap dry-run failed: {exc}", file=sys.stderr, flush=True); return 1
 
-    print("LGHS Bluetooth zero-touch bootstrap waiting for controller discovery events", flush=True)
+    print("LGHS Bluetooth bootstrap waiting: Cloudflare will be verified before Fleet enrollment", flush=True)
     while not PROVISIONED.exists():
         found = discover_controller()
         if not found:
             print(f"Bluetooth discovery stopped; retrying in {RETRY_BACKOFF:g} seconds", file=sys.stderr, flush=True)
-            time.sleep(RETRY_BACKOFF)
-            continue
+            time.sleep(RETRY_BACKOFF); continue
         address, name = found
         try:
-            print(f"Found {name}; attempting authenticated Wi-Fi + Cloudflare provisioning", flush=True)
+            print(f"Found {name}; attempting Bluetooth -> Cloudflare -> Fleet provisioning", flush=True)
             if exchange(address):
-                print("LGHS Bluetooth Wi-Fi + Cloudflare bootstrap completed.", flush=True)
+                print("LGHS provisioning completed in required order: Bluetooth -> Cloudflare -> Fleet.", flush=True)
                 return 0
         except Exception as exc:
             print(f"Bluetooth bootstrap attempt failed: {exc}", file=sys.stderr, flush=True)
