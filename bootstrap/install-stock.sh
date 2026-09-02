@@ -67,7 +67,15 @@ from pathlib import Path
 device = sys.argv[1].upper()
 target = Path(sys.argv[2])
 password = os.environ.pop('LGHS_PROVISION_PASSWORD')
-master = hashlib.scrypt(password.encode('utf-8'), salt=b'LGHS-stock-bootstrap-v1', n=2**15, r=8, p=1, dklen=32)
+master = hashlib.scrypt(
+    password.encode('utf-8'),
+    salt=b'LGHS-stock-bootstrap-v1',
+    n=2**15,
+    r=8,
+    p=1,
+    dklen=32,
+    maxmem=64 * 1024 * 1024,
+)
 token = hmac.new(master, b'LGHS-STOCK-BT-v1\0' + device.encode('ascii'), hashlib.sha512).digest()
 text = base64.urlsafe_b64encode(token).decode('ascii').rstrip('=')
 target.write_text(text + '\n', encoding='utf-8')
