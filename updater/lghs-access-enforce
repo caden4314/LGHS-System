@@ -34,6 +34,15 @@ for f in /usr/local/sbin/lghs-*; do
   chown root:"$ADMIN_GROUP" "$f"
   chmod 0750 "$f"
 done
+
+# lghs-agent is intentionally unprivileged. It must be able to execute its own
+# entrypoint even though the rest of /usr/local/sbin/lghs-* stays admin-only.
+# Grant only the dedicated service account access; students remain excluded.
+if id lghs-agent >/dev/null 2>&1 && [[ -e /usr/local/sbin/lghs-agent ]]; then
+  chown root:lghs-agent /usr/local/sbin/lghs-agent
+  chmod 0750 /usr/local/sbin/lghs-agent
+fi
+
 # The Control Pi keeps the unwrapped fleet CLI in libexec so the queue wrapper
 # can call it. Apply the same management-only permissions there.
 if [[ -e /usr/local/libexec/lghsctl-real ]]; then
