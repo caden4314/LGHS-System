@@ -9,8 +9,8 @@ ConditionPathExists=!/var/lib/lghs/bootstrap/wifi-provisioned.json
 
 [Service]
 Type=simple
-# Re-run adapter preparation on every bootstrap start so repair reruns also
-# recreate the btmgmt compatibility wrapper before the Python client starts.
+# Re-run adapter preparation on every bootstrap start so repair reruns recreate
+# the PTY-safe btmgmt compatibility wrapper before the Python client starts.
 ExecStartPre=/usr/local/sbin/lghs-bt-prepare
 Environment=PATH=/usr/local/lib/lghs-bt-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/local/sbin/lghs-bt-bootstrap
@@ -26,13 +26,10 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ConfigurationDirectory=cloudflared
-ReadOnlyPaths=/etc/lghs
-# Bluetooth first installs the device-scoped Cloudflare connector and the
-# controller SSH public key. Only after the controller verifies SSH through
-# Cloudflare may this service persist the per-device Fleet identity.
-# Prefix optional files with '-' because they do not exist until the Bluetooth
-# handoff creates them; otherwise systemd fails namespace setup before ExecStart.
-ReadWritePaths=/var/lib/lghs /var/lib/lghs-agent /etc/NetworkManager/system-connections /etc/cloudflared /etc/systemd/system /usr/local/bin /usr/local/lib/lghs-bt-bin /run /etc/lghs/secrets -/etc/lghs/fleet-api.conf -/etc/lghs/controller_ed25519.pub /etc/lghs/bluetooth-bootstrap-enabled /etc/ssh/authorized_keys
+# Use only stable parent directories here. Referencing files/directories that are
+# intentionally created during bootstrap can make systemd fail at NAMESPACE
+# before ExecStartPre/ExecStart ever get a chance to create them.
+ReadWritePaths=/var/lib/lghs /var/lib/lghs-agent /etc/NetworkManager/system-connections /etc/cloudflared /etc/systemd/system /usr/local/bin /usr/local/lib /run /etc/lghs /etc/ssh/authorized_keys
 
 [Install]
 WantedBy=multi-user.target
