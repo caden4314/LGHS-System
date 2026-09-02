@@ -72,6 +72,7 @@ def discover_devices():
             "addr": meta.get("ssh_host", ""),
             "port": "22",
             "transport": meta.get("transport", "cloudflare"),
+            "ssh_user": meta.get("ssh_user"),
         })
     known = {d['name'].upper() for d in devices}
     for d in local_discover_devices():
@@ -104,7 +105,8 @@ def ssh_base(target, batch=True):
     ensure_dirs()
     meta = target_meta(target)
     host = meta['host']
-    dest = host if "@" in host else f"{DEFAULT_USER}@{host}"
+    ssh_user = meta.get('ssh_user') or DEFAULT_USER
+    dest = host if "@" in host else f"{ssh_user}@{host}"
     args = [
         "ssh", "-i", KEY_FILE,
         "-o", "IdentitiesOnly=yes",
