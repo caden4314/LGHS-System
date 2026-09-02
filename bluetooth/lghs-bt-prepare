@@ -4,6 +4,7 @@ set -euo pipefail
 ROLE="$(cat /etc/lghs/role 2>/dev/null || true)"
 BT_INDEX="${LGHS_BT_INDEX:-hci0}"
 TIMEOUT_SECS="${LGHS_BT_COMMAND_TIMEOUT:-6}"
+BT_COMPAT_DIR=/usr/local/lib/lghs-bt-bin
 
 [[ "$ROLE" == controller || "$ROLE" == student ]] || {
   echo "LGHS Bluetooth prepare: invalid role '$ROLE'" >&2
@@ -35,8 +36,8 @@ retry() {
 }
 
 # Raspberry Pi OS / BlueZ 5.82 btmgmt waits forever when stdin is /dev/null,
-# which is the normal stdin for a systemd service. Give only btmgmt a private
-# pseudo-terminal so its one-shot management commands complete noninteractively.
+# which is the normal stdin for a systemd service. Give btmgmt a private
+# pseudo-terminal so management and discovery commands work noninteractively.
 retry_btmgmt() {
   local description="$1"
   shift
@@ -48,6 +49,23 @@ retry_btmgmt() {
   done
   retry "$description" /usr/bin/script -q -e -c "$quoted" /dev/null
 }
+
+# lghs-bt-bootstrap also invokes btmgmt. Put a compatibility wrapper first in
+# that service's PATH so every btmgmt invocation receives the same private PTY,
+# including the long-running `find -b` discovery command.
+install -d -m 0755 "$BT_COMPAT_DIR"
+cat > "$BT_COMPAT_DIR/btmgmt" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+REAL=/usr/bin/btmgmt
+quoted=""
+arg=""
+for arg in "$REAL" "$@"; do
+  printf -v quoted '%s%q ' "$quoted" "$arg"
+done
+exec /usr/bin/script -q -e -c "$quoted" /dev/null
+EOF
+chmod 0755 "$BT_COMPAT_DIR/btmgmt"
 
 rfkill unblock bluetooth
 retry "power-on" bluetoothctl power on
