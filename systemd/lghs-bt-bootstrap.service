@@ -21,6 +21,7 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+ConfigurationDirectory=cloudflared
 ReadOnlyPaths=/etc/lghs
 # Bluetooth first installs the device-scoped Cloudflare connector and the
 # controller SSH public key. Only after the controller verifies SSH through
