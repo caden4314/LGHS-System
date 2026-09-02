@@ -20,6 +20,7 @@ from lghs_bt_protocol import (PROTOCOL_VERSION, derive_key, encrypt_payload,
 CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
 BOOTSTRAP_TOKENS = Path(os.environ.get("LGHS_BOOTSTRAP_TOKENS", "/etc/lghs/bootstrap-tokens.json"))
 FLEET_TOKENS = Path(os.environ.get("LGHS_FLEET_API_TOKENS", "/etc/lghs/fleet-api-tokens.json"))
+TRANSPORT_REGISTRY = Path("/etc/lghs/fleet.json")
 ROLE = Path("/etc/lghs/role")
 SOCKET_TIMEOUT = 240
 COMMAND_TIMEOUT = 90
@@ -57,14 +58,14 @@ def load_json(path):
     return value if isinstance(value, dict) else {}
 
 
-def atomic_write(path, value):
+def atomic_write(path, value, mode=0o600):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(value, handle, indent=2, sort_keys=True)
             handle.write("\n")
-        os.chmod(tmp, 0o600)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     finally:
         try:
@@ -108,6 +109,21 @@ def mint_fleet_token(device_id):
     }
     atomic_write(FLEET_TOKENS, data)
     return token
+
+
+def record_ssh_user(device_id, ssh_user):
+    data = load_json(TRANSPORT_REGISTRY)
+    data.setdefault("version", 1)
+    devices = data.setdefault("devices", {})
+    if not isinstance(devices, dict):
+        raise RuntimeError("Invalid transport registry devices object")
+    entry = devices.setdefault(device_id, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        devices[device_id] = entry
+    entry["ssh_user"] = ssh_user
+    entry["provision_order"] = ["bluetooth", "cloudflare", "cloudflare-verified", "fleet"]
+    atomic_write(TRANSPORT_REGISTRY, data, mode=0o644)
 
 
 def controller_public_key():
@@ -273,6 +289,7 @@ def handle_client(conn, address):
         raise RuntimeError("student Cloudflare hostname does not match controller allocation")
 
     finalized = cloudflare_finalize(device_id, host_key)
+    record_ssh_user(device_id, ssh_user)
     verify_cloudflare_ssh(device_id, finalized.get("ssh_host") or ssh_host, ssh_user)
     print(f"Cloudflare VERIFIED {device_id}: {ssh_user}@{ssh_host}", flush=True)
 
