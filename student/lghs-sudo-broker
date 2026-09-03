@@ -12,7 +12,6 @@ from pathlib import Path
 
 REQUEST_DIR = Path('/var/lib/lghs/sudo-requests')
 AUDIT_LOG = Path('/var/log/lghs-sudo-audit.jsonl')
-STUDENT = 'lg_cs_cont'
 TTL = 600
 CLIENT_EVENTS = {
     'password_prompt_opened',
@@ -20,6 +19,19 @@ CLIENT_EVENTS = {
     'waiting_for_fleet',
     'requester_cancelled_wait',
 }
+
+
+def student_user():
+    try:
+        value = Path('/etc/lghs/student-user').read_text(encoding='utf-8').strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return 'lg_cs_cont'
+
+
+STUDENT = student_user()
 
 
 def now_iso():
@@ -69,7 +81,10 @@ def caller():
 
 def safe_cwd(uid):
     cwd = os.environ.get('LGHS_REQUEST_CWD') or os.getcwd()
-    home = Path('/home') / STUDENT
+    try:
+        home = Path(__import__('pwd').getpwnam(STUDENT).pw_dir)
+    except Exception:
+        home = Path('/home') / STUDENT
     try:
         resolved = Path(cwd).resolve()
         if resolved == home or home in resolved.parents:
