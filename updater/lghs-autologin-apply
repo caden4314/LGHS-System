@@ -4,7 +4,10 @@ set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
 case "$ROLE" in
-  student) USER_NAME=lg_cs_cont ;;
+  student)
+    USER_NAME="$(cat /etc/lghs/student-user 2>/dev/null || true)"
+    [[ -n "$USER_NAME" ]] || USER_NAME=lg_cs_cont
+    ;;
   controller) USER_NAME=cs_admin ;;
   *) echo "Unknown LGHS role: $ROLE" >&2; exit 1 ;;
 esac
@@ -22,10 +25,6 @@ systemctl disable userconfig.service >/dev/null 2>&1 || true
 systemctl mask userconfig.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/multi-user.target.wants/userconfig.service
 
-# LGHS is an appliance-style deployment. Always boot to the graphical target
-# and autologin only to the desktop. Current Raspberry Pi OS Trixie exposes
-# separate boot-target/autologin APIs; unlike the legacy B4 helper this avoids
-# creating a tty1 console-autologin override alongside the desktop session.
 if command -v raspi-config >/dev/null 2>&1 && \
    grep -q '^do_boot_target()' /usr/bin/raspi-config 2>/dev/null && \
    grep -q '^do_autologin()' /usr/bin/raspi-config 2>/dev/null; then
@@ -34,9 +33,6 @@ if command -v raspi-config >/dev/null 2>&1 && \
     SUDO_USER="$USER_NAME" HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)" \
       raspi-config nonint do_autologin 2 >/dev/null
 else
-    # Portable fallback: force graphical.target, remove any tty1 autologin, and
-    # configure LightDM to log directly into the distro-selected desktop
-    # session. Do not hard-code a session name; Raspberry Pi OS owns that.
     systemctl set-default graphical.target >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf
     rmdir --ignore-fail-on-non-empty /etc/systemd/system/getty@tty1.service.d 2>/dev/null || true
@@ -55,15 +51,8 @@ EOF
     fi
 fi
 
-# Remove obsolete LGHS overrides from older images. Raspberry Pi OS's own
-# LightDM configuration selects the correct labwc session for the installed
-# desktop; forcing a stale session name can strand boot at a blinking cursor.
 rm -f /etc/lightdm/lightdm.conf.d/90-lghs-autologin.conf \
       /etc/lightdm/lightdm.conf.d/99-lghs-autologin.conf
-
-# A graphical deployment must never inherit tty1 autologin from an older B4
-# configuration. Leave tty1 available as a recovery console, but require an
-# explicit login there.
 rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf
 rmdir --ignore-fail-on-non-empty /etc/systemd/system/getty@tty1.service.d 2>/dev/null || true
 
