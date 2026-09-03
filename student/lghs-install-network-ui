@@ -3,7 +3,6 @@ set -euo pipefail
 
 # Build Raspberry Pi's network panel with the LGHS student-only UI restriction.
 # Students retain normal Wi-Fi selection/connect/disconnect and non-sensitive UI.
-# Both "Edit Connections..." entries are omitted only for lg_cs_cont.
 
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
 SRC=/usr/local/src/lghs-pplug-netman
@@ -26,11 +25,12 @@ python3 - "$SRC/src/applet.c" <<'PY'
 from pathlib import Path
 import re,sys
 p=Path(sys.argv[1]);s=p.read_text(encoding='utf-8')
-include_old='#include <unistd.h>\n#include <sys/socket.h>';include_new='#include <unistd.h>\n#include <pwd.h>\n#include <sys/socket.h>'
+include_old='#include <unistd.h>\n#include <sys/socket.h>'
+include_new='#include <unistd.h>\n#include <pwd.h>\n#include <stdio.h>\n#include <string.h>\n#include <sys/socket.h>'
 if include_old not in s:raise SystemExit('LGHS patch failed: include anchor not found')
 s=s.replace(include_old,include_new,1)
 anchor='G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN'
-helper='''G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN\nstatic gboolean lghs_restricted_student (void)\n{\n    struct passwd *pw = getpwuid (geteuid ());\n    return pw && pw->pw_name && strcmp (pw->pw_name, "lg_cs_cont") == 0;\n}\n#endif\n\n#ifdef LXPANEL_PLUGIN'''
+helper='''G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN\nstatic gboolean lghs_restricted_student (void)\n{\n    struct passwd *pw = getpwuid (geteuid ());\n    FILE *f;\n    char name[128];\n    size_t n;\n    if (!pw || !pw->pw_name) return FALSE;\n    f = fopen ("/etc/lghs/student-user", "r");\n    if (!f) return strcmp (pw->pw_name, "lg_cs_cont") == 0;\n    if (!fgets (name, sizeof name, f)) { fclose (f); return FALSE; }\n    fclose (f);\n    n = strlen (name);\n    while (n > 0 && (name[n - 1] == '\\n' || name[n - 1] == '\\r')) name[--n] = '\\0';\n    return n > 0 && strcmp (pw->pw_name, name) == 0;\n}\n#endif\n\n#ifdef LXPANEL_PLUGIN'''
 if anchor not in s:raise SystemExit('LGHS patch failed: type anchor not found')
 s=s.replace(anchor,helper,1)
 pattern=re.compile(r"(?P<indent>\t)/\* 'Edit Connections\.\.\.' item \*/\n(?P<body>\tapplet->connections_menu_item = gtk_menu_item_new_with_mnemonic \(_\(\"Edit Connections…\"\)\);\n\tg_signal_connect \(applet->connections_menu_item,\n\s*\"activate\",\n\s*G_CALLBACK \(nma_edit_connections_cb\),\n\s*applet\);\n\tgtk_menu_shell_append \([^\n]+, applet->connections_menu_item\);)")
