@@ -3,14 +3,15 @@ set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
-STUDENT=lg_cs_cont
-ADMIN=cs_admin
+STUDENT="$(cat /etc/lghs/student-user 2>/dev/null || true)"
+ADMIN="$(cat /etc/lghs/admin-user 2>/dev/null || true)"
+[[ -n "$STUDENT" ]] || STUDENT=lg_cs_cont
+[[ -n "$ADMIN" ]] || ADMIN=cs_admin
 ADMIN_GROUP=lghs-admin
 
 getent group "$ADMIN_GROUP" >/dev/null 2>&1 || groupadd --system "$ADMIN_GROUP"
 if id "$ADMIN" >/dev/null 2>&1; then usermod -aG "$ADMIN_GROUP" "$ADMIN"; fi
 
-# LGHS management/config/state is readable by root and the dedicated admin only.
 for dir in /etc/lghs /opt/lghs /var/lib/lghs; do
   [[ -e "$dir" ]] || continue
   chown root:"$ADMIN_GROUP" "$dir"
@@ -21,41 +22,28 @@ done
 [[ -d /var/lib/lghs/netqueue ]] && { chown root:root /var/lib/lghs/netqueue; chmod 0700 /var/lib/lghs/netqueue; }
 [[ -d /var/lib/lghs/netqueue/jobs ]] && { chown root:root /var/lib/lghs/netqueue/jobs; chmod 0700 /var/lib/lghs/netqueue/jobs; }
 
-# Files used by LGHS services are not student-readable. Root services can still
-# consume them, while cs_admin can inspect non-secret configuration if needed.
 find /etc/lghs -maxdepth 1 -type f -exec chown root:"$ADMIN_GROUP" {} + -exec chmod 0640 {} + 2>/dev/null || true
 find /var/lib/lghs -maxdepth 1 -type f -exec chown root:"$ADMIN_GROUP" {} + -exec chmod 0640 {} + 2>/dev/null || true
 
-# Management commands are not directly executable by the student. The one
-# public sudo wrapper invokes its broker via real sudo as root, so broker files
-# can remain admin-only here.
 for f in /usr/local/sbin/lghs-*; do
   [[ -e "$f" ]] || continue
   chown root:"$ADMIN_GROUP" "$f"
   chmod 0750 "$f"
 done
 
-# lghs-agent is intentionally unprivileged. It must be able to execute its own
-# entrypoint even though the rest of /usr/local/sbin/lghs-* stays admin-only.
-# Grant only the dedicated service account access; students remain excluded.
 if id lghs-agent >/dev/null 2>&1 && [[ -e /usr/local/sbin/lghs-agent ]]; then
   chown root:lghs-agent /usr/local/sbin/lghs-agent
   chmod 0750 /usr/local/sbin/lghs-agent
 fi
 
-# The Control Pi keeps the unwrapped fleet CLI in libexec so the queue wrapper
-# can call it. Apply the same management-only permissions there.
 if [[ -e /usr/local/libexec/lghsctl-real ]]; then
   chown root:"$ADMIN_GROUP" /usr/local/libexec/lghsctl-real
   chmod 0750 /usr/local/libexec/lghsctl-real
 fi
 
-# Student-facing launchers only.
 [[ -e /usr/local/bin/sudo ]] && { chown root:root /usr/local/bin/sudo; chmod 0755 /usr/local/bin/sudo; }
 [[ -e /usr/local/bin/lghs-vscode ]] && { chown root:root /usr/local/bin/lghs-vscode; chmod 0755 /usr/local/bin/lghs-vscode; }
 
-# A Student Pi must never retain controller-only management clients/collectors
-# from an old image or a role change.
 if [[ "$ROLE" == "student" ]]; then
   rm -f /usr/local/sbin/lghsctl /usr/local/sbin/lghs-console /usr/local/sbin/lghs-audit-sync /usr/local/libexec/lghsctl-real
   systemctl disable --now lghs-audit-sync.timer lghs-audit-sync.service >/dev/null 2>&1 || true
@@ -69,13 +57,10 @@ if [[ "$ROLE" == "student" ]]; then
   fi
 fi
 
-# Students may inspect normal desktop state but cannot use PolicyKit to manage
-# LGHS/system services or change unit definitions. The managed sudo workflow is
-# the only supported path for privileged classroom commands.
 install -d -m 0755 /etc/polkit-1/rules.d
-cat > /etc/polkit-1/rules.d/48-lghs-service-management.rules <<'EOF'
+cat > /etc/polkit-1/rules.d/48-lghs-service-management.rules <<EOF
 polkit.addRule(function(action, subject) {
-    if (subject.user == "lg_cs_cont") {
+    if (subject.user == "$STUDENT") {
         if (action.id == "org.freedesktop.systemd1.manage-units" ||
             action.id == "org.freedesktop.systemd1.manage-unit-files" ||
             action.id == "org.freedesktop.systemd1.reload-daemon") {
@@ -87,7 +72,6 @@ EOF
 chmod 0644 /etc/polkit-1/rules.d/48-lghs-service-management.rules
 chown root:root /etc/polkit-1/rules.d/48-lghs-service-management.rules
 
-# Audit/log files stay outside the student's supplementary groups.
 for f in /var/log/sudo.log /var/log/lghs-sudo-audit.jsonl /var/log/lghs-update.log /var/log/lghs-os-update.log /var/log/lghs-netqueue.log; do
   [[ -e "$f" ]] || continue
   chown root:adm "$f" 2>/dev/null || chown root:root "$f"
