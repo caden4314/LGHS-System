@@ -59,6 +59,7 @@ trust_desktop_file() {
 
 setup_user() {
   local user="$1" home workspace venv marker existing uid gid code_icon desktop_file
+  [[ -n "$user" ]] || return 0
   getent passwd "$user" >/dev/null 2>&1 || return 0
   home="$(getent passwd "$user" | cut -d: -f6)"
   [[ -n "$home" && -d "$home" ]] || return 0
@@ -125,10 +126,19 @@ EOF
   printf 'LGHS development environment ready for %s: %s\n' "$user" "$venv"
 }
 
-setup_user lg_cs_cont
-setup_user cs_admin
-
 ROLE="$(cat /etc/lghs/role 2>/dev/null || true)"
+if [[ "$ROLE" == "student" ]]; then
+  STUDENT_USER="$(cat /etc/lghs/student-user 2>/dev/null || true)"
+  ADMIN_USER="$(cat /etc/lghs/admin-user 2>/dev/null || true)"
+  [[ -n "$STUDENT_USER" ]] || STUDENT_USER=lg_cs_cont
+  [[ -n "$ADMIN_USER" ]] || ADMIN_USER=cs_admin
+  setup_user "$STUDENT_USER"
+  setup_user "$ADMIN_USER"
+else
+  setup_user lg_cs_cont
+  setup_user cs_admin
+fi
+
 if [[ "$ROLE" == "controller" ]] && getent passwd cs_admin >/dev/null 2>&1; then
   ADMIN_HOME="$(getent passwd cs_admin | cut -d: -f6)"
   install -d -m 0755 -o cs_admin -g cs_admin "$ADMIN_HOME/Desktop"
@@ -152,7 +162,6 @@ EOF
     /usr/share/applications/lghs-fleet-control.desktop \
     "$ADMIN_HOME/Desktop/LGHS-Fleet-Control.desktop"
   trust_desktop_file cs_admin "$ADMIN_HOME" "$ADMIN_HOME/Desktop/LGHS-Fleet-Control.desktop"
-
   echo "LGHS Fleet Control desktop launcher installed for cs_admin."
 else
   rm -f /usr/share/applications/lghs-fleet-control.desktop
