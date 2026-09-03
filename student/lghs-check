@@ -1,53 +1,69 @@
 #!/usr/bin/env bash
 set -u
-STUDENT="lg_cs_cont";ADMIN="cs_admin";FAIL=0
-pass(){ printf '[PASS] %s\n' "$1"; };fail(){ printf '[FAIL] %s\n' "$1";FAIL=1; }
 
-if id -nG "$STUDENT" 2>/dev/null|tr ' ' '\n'|grep -qx sudo;then fail "student is not in sudo group";else pass "student is not in sudo group";fi
-if id -nG "$STUDENT" 2>/dev/null|tr ' ' '\n'|grep -Eq '^(adm|systemd-journal|lghs-admin)$';then fail "student excluded from management/audit groups";else pass "student excluded from management/audit groups";fi
-if id -nG "$ADMIN" 2>/dev/null|tr ' ' '\n'|grep -qx sudo;then pass "admin sudo membership";else fail "admin sudo membership";fi
-if id -nG "$ADMIN" 2>/dev/null|tr ' ' '\n'|grep -qx lghs-admin;then pass "admin LGHS management membership";else fail "admin LGHS management membership";fi
-if visudo -cf /etc/sudoers >/dev/null 2>&1;then pass "sudoers syntax";else fail "sudoers syntax";fi
-if grep -q 'Defaults:lg_cs_cont.*rootpw' /etc/sudoers.d/90-lghs-student 2>/dev/null && grep -q 'PASSWD: ALL' /etc/sudoers.d/90-lghs-student 2>/dev/null;then pass "Root-password local sudo fallback";else fail "Root-password local sudo fallback";fi
-if [[ -f /etc/sudoers.d/89-lghs-audit && -f /var/log/sudo.log ]];then pass "sudo command audit logging";else fail "sudo command audit logging";fi
-if [[ -x /usr/local/bin/sudo && -e /usr/local/sbin/lghs-sudo-broker && -e /usr/local/sbin/lghs-approved-exec && -e /usr/local/sbin/lghs-sudo-admin ]];then pass "fleet-approved sudo broker";else fail "fleet-approved sudo broker";fi
-if [[ -x /usr/local/sbin/lghs-audit-export && -d /var/lib/lghs/sudo-requests && -f /var/log/lghs-sudo-audit.jsonl ]];then pass "sudo audit export and state";else fail "sudo audit export and state";fi
+read_identity() {
+  local path="$1" fallback="$2" value
+  value="$(cat "$path" 2>/dev/null || true)"
+  [[ -n "$value" ]] && printf '%s\n' "$value" || printf '%s\n' "$fallback"
+}
 
-if runuser -u "$STUDENT" -- test ! -r /etc/lghs/role && runuser -u "$STUDENT" -- test ! -x /usr/local/sbin/lghs-update;then pass "student blocked from LGHS management/config";else fail "student blocked from LGHS management/config";fi
-if [[ ! -e /usr/local/sbin/lghsctl && ! -e /usr/local/sbin/lghs-console && ! -e /usr/local/sbin/lghs-audit-sync ]];then pass "controller CLI absent from Student Pi";else fail "controller CLI absent from Student Pi";fi
-if [[ -f /etc/polkit-1/rules.d/48-lghs-service-management.rules ]];then pass "student service-management PolicyKit block";else fail "student service-management PolicyKit block";fi
+STUDENT="$(read_identity /etc/lghs/student-user lg_cs_cont)"
+ADMIN="$(read_identity /etc/lghs/admin-user cs_admin)"
+FAIL=0
+pass(){ printf '[PASS] %s\n' "$1"; }
+fail(){ printf '[FAIL] %s\n' "$1"; FAIL=1; }
 
-if [[ -f /etc/polkit-1/rules.d/49-lghs-network.rules ]];then pass "NetworkManager PolicyKit rule";else fail "NetworkManager PolicyKit rule";fi
-BAD="";if [[ -d /etc/NetworkManager/system-connections ]];then BAD="$(find /etc/NetworkManager/system-connections -maxdepth 1 -type f \( ! -user root -o ! -group root -o ! -perm 0600 \) -print 2>/dev/null)";fi
-if [[ -z "$BAD" ]];then pass "NetworkManager profile permissions";else fail "NetworkManager profile permissions";fi
-if [[ -x /usr/local/sbin/lghs-network-ui-apply && -f /usr/local/lib/lghs/libnetman.so.hardened ]];then pass "network UI hardening installed";else fail "network UI hardening installed";fi
-if [[ -x /usr/bin/lp-connection-editor ]] && grep -q 'LGHS_NETWORK_EDITOR_GUARD' /usr/bin/lp-connection-editor 2>/dev/null;then pass "advanced network editor guarded";else fail "advanced network editor guarded";fi
-NETMAN_LIB="$(dpkg -L wfplug-netman 2>/dev/null|grep -E '/wf-panel-pi/libnetman\.so$'|head -n1||true)";[[ -n "$NETMAN_LIB" ]]||NETMAN_LIB="$(find /usr/lib -type f -path '*/wf-panel-pi/libnetman.so' -print -quit 2>/dev/null||true)"
-if [[ -n "$NETMAN_LIB" && -f "$NETMAN_LIB" && -f /usr/local/lib/lghs/libnetman.so.hardened ]] && cmp -s "$NETMAN_LIB" /usr/local/lib/lghs/libnetman.so.hardened;then pass "Edit Connections hidden in student panel";else fail "Edit Connections hidden in student panel";fi
+if id -nG "$STUDENT" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then fail "student is not in sudo group"; else pass "student is not in sudo group"; fi
+if id -nG "$STUDENT" 2>/dev/null | tr ' ' '\n' | grep -Eq '^(adm|systemd-journal|lghs-admin)$'; then fail "student excluded from management/audit groups"; else pass "student excluded from management/audit groups"; fi
+if id -nG "$ADMIN" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then pass "admin sudo membership"; else fail "admin sudo membership"; fi
+if id -nG "$ADMIN" 2>/dev/null | tr ' ' '\n' | grep -qx lghs-admin; then pass "admin LGHS management membership"; else fail "admin LGHS management membership"; fi
+if visudo -cf /etc/sudoers >/dev/null 2>&1; then pass "sudoers syntax"; else fail "sudoers syntax"; fi
+if [[ -f /etc/sudoers.d/90-lghs-student ]] && grep -Fq "Defaults:${STUDENT}" /etc/sudoers.d/90-lghs-student 2>/dev/null && grep -Fq 'rootpw' /etc/sudoers.d/90-lghs-student 2>/dev/null && grep -Fq 'PASSWD: ALL' /etc/sudoers.d/90-lghs-student 2>/dev/null; then pass "Root-password local sudo fallback"; else fail "Root-password local sudo fallback"; fi
+if [[ -f /etc/sudoers.d/89-lghs-audit && -f /var/log/sudo.log ]]; then pass "sudo command audit logging"; else fail "sudo command audit logging"; fi
+if [[ -x /usr/local/bin/sudo && -e /usr/local/sbin/lghs-sudo-broker && -e /usr/local/sbin/lghs-approved-exec && -e /usr/local/sbin/lghs-sudo-admin ]]; then pass "fleet-approved sudo broker"; else fail "fleet-approved sudo broker"; fi
+if [[ -x /usr/local/sbin/lghs-audit-export && -d /var/lib/lghs/sudo-requests && -f /var/log/lghs-sudo-audit.jsonl ]]; then pass "sudo audit export and state"; else fail "sudo audit export and state"; fi
+
+if runuser -u "$STUDENT" -- test ! -r /etc/lghs/role && runuser -u "$STUDENT" -- test ! -x /usr/local/sbin/lghs-update; then pass "student blocked from LGHS management/config"; else fail "student blocked from LGHS management/config"; fi
+if [[ ! -e /usr/local/sbin/lghsctl && ! -e /usr/local/sbin/lghs-console && ! -e /usr/local/sbin/lghs-audit-sync ]]; then pass "controller CLI absent from Student Pi"; else fail "controller CLI absent from Student Pi"; fi
+if [[ -f /etc/polkit-1/rules.d/48-lghs-service-management.rules ]] && grep -Fq "subject.user == \"$STUDENT\"" /etc/polkit-1/rules.d/48-lghs-service-management.rules; then pass "student service-management PolicyKit block"; else fail "student service-management PolicyKit block"; fi
+
+if [[ -f /etc/polkit-1/rules.d/49-lghs-network.rules ]]; then pass "NetworkManager PolicyKit rule"; else fail "NetworkManager PolicyKit rule"; fi
+BAD=""; if [[ -d /etc/NetworkManager/system-connections ]]; then BAD="$(find /etc/NetworkManager/system-connections -maxdepth 1 -type f \( ! -user root -o ! -group root -o ! -perm 0600 \) -print 2>/dev/null)"; fi
+if [[ -z "$BAD" ]]; then pass "NetworkManager profile permissions"; else fail "NetworkManager profile permissions"; fi
+if [[ -x /usr/local/sbin/lghs-network-ui-apply && -f /usr/local/lib/lghs/libnetman.so.hardened ]]; then pass "network UI hardening installed"; else fail "network UI hardening installed"; fi
+if [[ -x /usr/bin/lp-connection-editor ]] && grep -q 'LGHS_NETWORK_EDITOR_GUARD' /usr/bin/lp-connection-editor 2>/dev/null; then pass "advanced network editor guarded"; else fail "advanced network editor guarded"; fi
+NETMAN_LIB="$(dpkg -L wfplug-netman 2>/dev/null | grep -E '/wf-panel-pi/libnetman\.so$' | head -n1 || true)"; [[ -n "$NETMAN_LIB" ]] || NETMAN_LIB="$(find /usr/lib -type f -path '*/wf-panel-pi/libnetman.so' -print -quit 2>/dev/null || true)"
+if [[ -n "$NETMAN_LIB" && -f "$NETMAN_LIB" && -f /usr/local/lib/lghs/libnetman.so.hardened ]] && cmp -s "$NETMAN_LIB" /usr/local/lib/lghs/libnetman.so.hardened; then pass "Edit Connections hidden in student panel"; else fail "Edit Connections hidden in student panel"; fi
 
 for user in "$STUDENT" "$ADMIN"; do
-  home="$(getent passwd "$user" 2>/dev/null|cut -d: -f6)"
-  if [[ -n "$home" && -x "$home/CS2/.venv/bin/python" && -x "$home/CS2/.venv/bin/pip" && -f "$home/.config/Code/User/settings.json" ]];then pass "$user VS Code/Python environment";else fail "$user VS Code/Python environment";fi
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+  if [[ -n "$home" && -x "$home/CS2/.venv/bin/python" && -x "$home/CS2/.venv/bin/pip" && -f "$home/.config/Code/User/settings.json" ]]; then pass "$user VS Code/Python environment"; else fail "$user VS Code/Python environment"; fi
 done
-if command -v code >/dev/null 2>&1;then pass "VS Code installed";else fail "VS Code installed";fi
-if command -v gcc >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && command -v pipx >/dev/null 2>&1;then pass "developer toolchain";else fail "developer toolchain";fi
+if command -v code >/dev/null 2>&1; then pass "VS Code installed"; else fail "VS Code installed"; fi
+if command -v gcc >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && command -v pipx >/dev/null 2>&1; then pass "developer toolchain"; else fail "developer toolchain"; fi
 
-if [[ -x /usr/local/sbin/lghs-update && -x /usr/local/sbin/lghs-os-update && -x /usr/local/sbin/lghs-reconcile && -x /usr/local/sbin/lghs-access-enforce ]];then pass "live LGHS/OS/self-heal tools";else fail "live LGHS/OS/self-heal tools";fi
-if [[ -x /usr/local/sbin/lghs-netqueue && -d /var/lib/lghs/netqueue/jobs && -f /etc/systemd/system/lghs-netqueue.service && -f /etc/systemd/system/lghs-netqueue.timer ]];then pass "persistent offline network queue installed";else fail "persistent offline network queue installed";fi
-if systemctl is-enabled lghs-netqueue.timer >/dev/null 2>&1;then pass "offline network queue retry timer enabled";else fail "offline network queue retry timer enabled";fi
-if [[ -x /etc/NetworkManager/dispatcher.d/90-lghs-netqueue ]];then pass "network reconnect queue trigger installed";else fail "network reconnect queue trigger installed";fi
-if ! grep -Eq '^(After|Wants|Requires)=.*network-online\.target' /etc/systemd/system/lghs-update.service /etc/systemd/system/lghs-agent.service /etc/systemd/system/lghs-netqueue.service 2>/dev/null;then pass "LGHS services do not require network-online to start";else fail "LGHS services do not require network-online to start";fi
-if systemctl is-enabled lghs-update.timer >/dev/null 2>&1;then pass "LGHS update timer enabled";else fail "LGHS update timer enabled";fi
-if systemctl is-enabled lghs-reconcile.timer >/dev/null 2>&1;then pass "self-heal timer enabled";else fail "self-heal timer enabled";fi
-if systemctl is-enabled lghs-policy.service >/dev/null 2>&1;then pass "policy service enabled";else fail "policy service enabled";fi
-if systemctl is-active NetworkManager >/dev/null 2>&1;then pass "NetworkManager active";else fail "NetworkManager active";fi
-if systemctl is-enabled lghs-firstboot-provision.service >/dev/null 2>&1;then pass "first-boot provisioner enabled";else fail "first-boot provisioner enabled";fi
+if [[ -x /usr/local/sbin/lghs-update && -x /usr/local/sbin/lghs-os-update && -x /usr/local/sbin/lghs-reconcile && -x /usr/local/sbin/lghs-access-enforce ]]; then pass "live LGHS/OS/self-heal tools"; else fail "live LGHS/OS/self-heal tools"; fi
+if [[ -x /usr/local/sbin/lghs-netqueue && -d /var/lib/lghs/netqueue/jobs && -f /etc/systemd/system/lghs-netqueue.service && -f /etc/systemd/system/lghs-netqueue.timer ]]; then pass "persistent offline network queue installed"; else fail "persistent offline network queue installed"; fi
+if systemctl is-enabled lghs-netqueue.timer >/dev/null 2>&1; then pass "offline network queue retry timer enabled"; else fail "offline network queue retry timer enabled"; fi
+if [[ -x /etc/NetworkManager/dispatcher.d/90-lghs-netqueue ]]; then pass "network reconnect queue trigger installed"; else fail "network reconnect queue trigger installed"; fi
+if ! grep -Eq '^(After|Wants|Requires)=.*network-online\.target' /etc/systemd/system/lghs-update.service /etc/systemd/system/lghs-agent.service /etc/systemd/system/lghs-netqueue.service 2>/dev/null; then pass "LGHS services do not require network-online to start"; else fail "LGHS services do not require network-online to start"; fi
+if systemctl is-enabled lghs-update.timer >/dev/null 2>&1; then pass "LGHS update timer enabled"; else fail "LGHS update timer enabled"; fi
+if systemctl is-enabled lghs-reconcile.timer >/dev/null 2>&1; then pass "self-heal timer enabled"; else fail "self-heal timer enabled"; fi
+if systemctl is-enabled lghs-policy.service >/dev/null 2>&1; then pass "policy service enabled"; else fail "policy service enabled"; fi
+if systemctl is-active NetworkManager >/dev/null 2>&1; then pass "NetworkManager active"; else fail "NetworkManager active"; fi
+if systemctl is-enabled lghs-firstboot-provision.service >/dev/null 2>&1; then pass "first-boot provisioner enabled"; else fail "first-boot provisioner enabled"; fi
 
-if [[ "$(cat /etc/lghs/autologin-user 2>/dev/null)" == "$STUDENT" ]];then pass "student desktop autologin target";else fail "student desktop autologin target";fi
-if [[ -f /etc/ssh/sshd_config.d/90-lghs-fleet.conf ]] && sshd -t >/dev/null 2>&1;then pass "fleet SSH hardening";else fail "fleet SSH hardening";fi
-if [[ -f /home/cs_admin/.ssh/authorized_keys ]];then
-  mode="$(stat -c %a /home/cs_admin/.ssh/authorized_keys 2>/dev/null)";owner="$(stat -c %U /home/cs_admin/.ssh/authorized_keys 2>/dev/null)"
-  if [[ "$mode" == "600" && "$owner" == "cs_admin" ]];then pass "fleet SSH authorized_keys permissions";else fail "fleet SSH authorized_keys permissions";fi
-else fail "fleet SSH authorized_keys installed";fi
+if [[ "$(cat /etc/lghs/autologin-user 2>/dev/null)" == "$STUDENT" ]]; then pass "student desktop autologin target"; else fail "student desktop autologin target"; fi
+if [[ -f /etc/ssh/sshd_config.d/90-lghs-fleet.conf ]] && sshd -t >/dev/null 2>&1; then pass "fleet SSH hardening"; else fail "fleet SSH hardening"; fi
+AUTH_KEYS="/etc/ssh/authorized_keys/$ADMIN"
+if [[ -f "$AUTH_KEYS" ]]; then
+  mode="$(stat -c %a "$AUTH_KEYS" 2>/dev/null)"; owner="$(stat -c %U "$AUTH_KEYS" 2>/dev/null)"
+  if [[ "$mode" == "644" && "$owner" == "root" ]]; then pass "fleet SSH authorized_keys permissions"; else fail "fleet SSH authorized_keys permissions"; fi
+elif [[ -f "/home/$ADMIN/.ssh/authorized_keys" ]]; then
+  mode="$(stat -c %a "/home/$ADMIN/.ssh/authorized_keys" 2>/dev/null)"; owner="$(stat -c %U "/home/$ADMIN/.ssh/authorized_keys" 2>/dev/null)"
+  if [[ "$mode" == "600" && "$owner" == "$ADMIN" ]]; then pass "fleet SSH authorized_keys permissions"; else fail "fleet SSH authorized_keys permissions"; fi
+else
+  fail "fleet SSH authorized_keys installed"
+fi
 
 exit "$FAIL"
