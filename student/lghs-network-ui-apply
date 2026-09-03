@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STUDENT_USER="lg_cs_cont"
+STUDENT_USER="$(cat /etc/lghs/student-user 2>/dev/null || true)"
+[[ -n "$STUDENT_USER" ]] || STUDENT_USER="lg_cs_cont"
 HARDENED_LIB="/usr/local/lib/lghs/libnetman.so.hardened"
 VERSION_FILE="/usr/local/lib/lghs/libnetman.package-version"
 BACKUP_DIR="/usr/local/lib/lghs-backups"
@@ -36,7 +37,8 @@ if [[ -x "$EDITOR" && ! -L "$EDITOR" ]];then
         cat > "$EDITOR" <<'EOF'
 #!/bin/sh
 # LGHS_NETWORK_EDITOR_GUARD
-if [ "$(id -un 2>/dev/null)" = "lg_cs_cont" ]; then
+STUDENT_USER="$(cat /etc/lghs/student-user 2>/dev/null || printf '%s' lg_cs_cont)"
+if [ "$(id -un 2>/dev/null)" = "$STUDENT_USER" ]; then
     command -v notify-send >/dev/null 2>&1 && notify-send "Network settings" "Advanced connection editing is managed by LGHS." >/dev/null 2>&1 || true
     exit 126
 fi
