@@ -175,6 +175,23 @@ for path in root.rglob('*'):
     except Exception:
         continue
     mapped = text.replace('lg_cs_cont', student).replace('cs_admin', admin)
+
+    # Hardware validation on CS-01 found that sshd cannot read a root-owned
+    # centralized AuthorizedKeysFile when the per-user file is mode 0600.
+    # Keep the directory root-owned/0755 and the public key root-owned/0644.
+    if path.name == 'lghs-bt-bootstrap':
+        mapped = mapped.replace('os.chmod(target, 0o600)\n    require_command(["sshd", "-t"]',
+                                'os.chmod(target, 0o644)\n    require_command(["sshd", "-t"]')
+
+        # Provisioning retries must not tear down working Wi-Fi. If the Pi is
+        # already connected to the requested SSID, reuse that connection and
+        # continue with Cloudflare/Fleet instead of delete/recreate/up.
+        old = '''    name = "LGHS-Bootstrap-" + "".join(c if c.isalnum() or c in "._-" else "_" for c in ssid)[:40]\n    run(["nmcli", "connection", "delete", name])\n'''
+        new = '''    name = "LGHS-Bootstrap-" + "".join(c if c.isalnum() or c in "._-" else "_" for c in ssid)[:40]\n    status = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"])\n    if status.returncode == 0:\n        for line in status.stdout.splitlines():\n            fields = line.split(":", 3)\n            if len(fields) != 4 or fields[1] != "wifi" or fields[2] != "connected":\n                continue\n            current = fields[3].replace("\\\\:", ":")\n            shown = run(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", current])\n            if shown.returncode == 0 and shown.stdout.strip() == ssid:\n                return current\n    run(["nmcli", "connection", "delete", name])\n'''
+        if old not in mapped:
+            raise SystemExit('stock bootstrap patch failed: apply_wifi shape changed')
+        mapped = mapped.replace(old, new, 1)
+
     if mapped != text:
         path.write_text(mapped, encoding='utf-8')
 PY
