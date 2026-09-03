@@ -1,28 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
-STUDENT="lg_cs_cont"
-ADMIN="cs_admin"
+
+read_identity() {
+    local path="$1" fallback="$2" value=""
+    if [[ -r "$path" ]]; then
+        value="$(tr -d '\r\n' <"$path")"
+    fi
+    printf '%s' "${value:-$fallback}"
+}
+
+STUDENT="$(read_identity /etc/lghs/student-user lg_cs_cont)"
+ADMIN="$(read_identity /etc/lghs/admin-user cs_admin)"
+
 log(){ logger -t LGHS-POLICY "$*"; echo "[LGHS] $*"; }
 
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
+[[ "$STUDENT" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || { log "Invalid student account identity: $STUDENT"; exit 1; }
+[[ "$ADMIN" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || { log "Invalid admin account identity: $ADMIN"; exit 1; }
 getent passwd "$STUDENT" >/dev/null || { log "Missing student account: $STUDENT"; exit 1; }
 getent passwd "$ADMIN" >/dev/null || { log "Missing admin account: $ADMIN"; exit 1; }
 
-if id -nG "$STUDENT" | tr ' ' '\n' | grep -qx sudo; then gpasswd -d "$STUDENT" sudo >/dev/null;log "Removed $STUDENT from sudo group";fi
-if ! id -nG "$ADMIN" | tr ' ' '\n' | grep -qx sudo; then usermod -aG sudo "$ADMIN";log "Added $ADMIN to sudo group";fi
+if id -nG "$STUDENT" | tr ' ' '\n' | grep -qx sudo; then
+    gpasswd -d "$STUDENT" sudo >/dev/null
+    log "Removed $STUDENT from sudo group"
+fi
+if ! id -nG "$ADMIN" | tr ' ' '\n' | grep -qx sudo; then
+    usermod -aG sudo "$ADMIN"
+    log "Added $ADMIN to sudo group"
+fi
 
 install -d -m 0755 /etc/sudoers.d /etc/polkit-1/rules.d /etc/logrotate.d
-cat >/etc/sudoers.d/90-lghs-student <<'EOF'
-Defaults:lg_cs_cont timestamp_timeout=0,rootpw
-lg_cs_cont ALL=(ALL:ALL) PASSWD: ALL
-lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-broker *
-lg_cs_cont ALL=(root) NOPASSWD: /usr/local/sbin/lghs-approved-exec *
+cat >/etc/sudoers.d/90-lghs-student <<EOF
+Defaults:${STUDENT} timestamp_timeout=0,rootpw
+${STUDENT} ALL=(ALL:ALL) PASSWD: ALL
+${STUDENT} ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-broker *
+${STUDENT} ALL=(root) NOPASSWD: /usr/local/sbin/lghs-approved-exec *
 EOF
-chmod 0440 /etc/sudoers.d/90-lghs-student;chown root:root /etc/sudoers.d/90-lghs-student
+chmod 0440 /etc/sudoers.d/90-lghs-student
+chown root:root /etc/sudoers.d/90-lghs-student
 
-cat >/etc/polkit-1/rules.d/49-lghs-network.rules <<'EOF'
+cat >/etc/polkit-1/rules.d/49-lghs-network.rules <<EOF
 polkit.addRule(function(action, subject) {
-    if (subject.user == "lg_cs_cont") {
+    if (subject.user == "${STUDENT}") {
         if (action.id == "org.freedesktop.NetworkManager.settings.modify.system" ||
             action.id == "org.freedesktop.NetworkManager.settings.modify.own" ||
             action.id == "org.freedesktop.NetworkManager.settings.modify.hostname" ||
@@ -32,7 +51,8 @@ polkit.addRule(function(action, subject) {
     }
 });
 EOF
-chmod 0644 /etc/polkit-1/rules.d/49-lghs-network.rules;chown root:root /etc/polkit-1/rules.d/49-lghs-network.rules
+chmod 0644 /etc/polkit-1/rules.d/49-lghs-network.rules
+chown root:root /etc/polkit-1/rules.d/49-lghs-network.rules
 
 cat >/etc/logrotate.d/lghs-sudo <<'EOF'
 /var/log/sudo.log /var/log/lghs-sudo-audit.jsonl /var/log/lghs-update.log /var/log/lghs-os-update.log {
@@ -48,8 +68,10 @@ EOF
 chmod 0644 /etc/logrotate.d/lghs-sudo
 
 NM=/etc/NetworkManager/system-connections
-if [[ -d "$NM" ]]; then find "$NM" -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 0600 {} +;fi
-if [[ -x /usr/local/sbin/lghs-network-ui-apply ]]; then /usr/local/sbin/lghs-network-ui-apply;fi
-if [[ -x /usr/local/sbin/lghs-access-enforce ]]; then /usr/local/sbin/lghs-access-enforce;fi
+if [[ -d "$NM" ]]; then
+    find "$NM" -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 0600 {} +
+fi
+if [[ -x /usr/local/sbin/lghs-network-ui-apply ]]; then /usr/local/sbin/lghs-network-ui-apply; fi
+if [[ -x /usr/local/sbin/lghs-access-enforce ]]; then /usr/local/sbin/lghs-access-enforce; fi
 visudo -cf /etc/sudoers >/dev/null
-log "Policy enforcement complete"
+log "Policy enforcement complete for student=$STUDENT admin=$ADMIN"
