@@ -7,26 +7,31 @@ CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
 STATE_DIR=/var/lib/lghs/update
 [[ "$ROLE" == "student" || "$ROLE" == "controller" ]] || exit 0
 
-# Only reinstall from the persistent checkout when it is the same commit that
-# LGHS considers installed. This prevents a stale main checkout from silently
-# overwriting a manually/test-branch installed build during boot.
+# Stock-provisioned students have dynamic cs-## / cs-admin identities recorded
+# in /etc/lghs. Never run the raw legacy installer during reconciliation on
+# those devices: doing so can recreate lg_cs_cont/cs_admin and overwrite the
+# stock identity mapping. Updates install new files; reconcile only reapplies
+# the currently installed policy helpers.
+STOCK_STUDENT=0
+if [[ "$ROLE" == "student" && -s /etc/lghs/student-user && -s /etc/lghs/admin-user ]]; then
+    STOCK_STUDENT=1
+fi
+
 EXPECTED_COMMIT="$(cat "$STATE_DIR/current-commit" 2>/dev/null || cat /etc/lghs/source-commit 2>/dev/null || true)"
 CHECKOUT_COMMIT=""
 if [[ -d "$CHECKOUT/.git" ]]; then
     CHECKOUT_COMMIT="$(git -c safe.directory="$CHECKOUT" -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
 fi
 
-if [[ -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && "$CHECKOUT_COMMIT" == "$EXPECTED_COMMIT" ]]; then
+if [[ "$STOCK_STUDENT" -eq 0 && -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && "$CHECKOUT_COMMIT" == "$EXPECTED_COMMIT" ]]; then
     /bin/bash "$CHECKOUT/install.sh" "$ROLE"
     exit 0
 fi
 
-if [[ -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && -n "$CHECKOUT_COMMIT" && "$CHECKOUT_COMMIT" != "$EXPECTED_COMMIT" ]]; then
+if [[ "$STOCK_STUDENT" -eq 0 && -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && -n "$CHECKOUT_COMMIT" && "$CHECKOUT_COMMIT" != "$EXPECTED_COMMIT" ]]; then
     logger -t LGHS-RECONCILE "Skipping stale checkout $CHECKOUT_COMMIT; installed commit is $EXPECTED_COMMIT"
 fi
 
-# Minimal fallback while the checkout is unavailable or stale. These tools are
-# from the currently installed build, so reconciliation cannot downgrade it.
 [[ -x /usr/local/sbin/lghs-autologin-apply ]] && /usr/local/sbin/lghs-autologin-apply || true
 [[ -x /usr/local/sbin/lghs-dev-setup ]] && /usr/local/sbin/lghs-dev-setup || true
 if [[ "$ROLE" == "student" ]]; then
