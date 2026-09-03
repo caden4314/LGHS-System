@@ -11,7 +11,19 @@ from pathlib import Path
 
 REQUEST_DIR = Path('/var/lib/lghs/sudo-requests')
 AUDIT_LOG = Path('/var/log/lghs-sudo-audit.jsonl')
-STUDENT = 'lg_cs_cont'
+
+
+def student_user():
+    try:
+        value = Path('/etc/lghs/student-user').read_text(encoding='utf-8').strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return 'lg_cs_cont'
+
+
+STUDENT = student_user()
 
 
 def now_iso():
@@ -61,25 +73,27 @@ def clean_env():
     return env
 
 
+def student_home():
+    try:
+        return Path(__import__('pwd').getpwnam(STUDENT).pw_dir)
+    except Exception:
+        return Path('/home') / STUDENT
+
+
 def main():
     if os.geteuid() != 0 or os.environ.get('SUDO_USER') != STUDENT:
         fail('approved executor may only be called by the student through sudo')
     if len(sys.argv) < 4 or sys.argv[2] != '--':
         fail('invalid approved execution request')
 
-    rid = sys.argv[1]
-    argv = sys.argv[3:]
-    path = REQUEST_DIR / f'{rid}.json'
-    lock_path = REQUEST_DIR / f'{rid}.lock'
+    rid = sys.argv[1]; argv = sys.argv[3:]
+    path = REQUEST_DIR / f'{rid}.json'; lock_path = REQUEST_DIR / f'{rid}.lock'
 
     with lock_path.open('a+') as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            data = json.loads(path.read_text(encoding='utf-8'))
-        except Exception:
-            fail('approval record not found')
-        if data.get('requester') != STUDENT:
-            fail('request owner mismatch')
+        try: data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception: fail('approval record not found')
+        if data.get('requester') != STUDENT: fail('request owner mismatch')
         if data.get('argv') != argv:
             audit('execution_mismatch', request_id=rid, authorization='fleet', requested=data.get('argv'), supplied=argv)
             fail('command no longer matches the approved request')
@@ -94,25 +108,20 @@ def main():
                   authorization='fleet', current_status=data.get('status'), command=data.get('command'))
             fail(f"request is {data.get('status', 'not approved')}")
 
-        cwd = data.get('cwd') or f'/home/{STUDENT}'
-        home = Path(f'/home/{STUDENT}')
+        home = student_home()
+        cwd = data.get('cwd') or str(home)
         try:
             resolved = Path(cwd).resolve()
-            if not (resolved == home or home in resolved.parents):
-                cwd = str(home)
-        except Exception:
-            cwd = str(home)
+            if not (resolved == home or home in resolved.parents): cwd = str(home)
+        except Exception: cwd = str(home)
 
-        data['status'] = 'executing'
-        data['started_at'] = now_iso()
-        data['authorization'] = 'fleet'
+        data['status'] = 'executing'; data['started_at'] = now_iso(); data['authorization'] = 'fleet'
         atomic_write(path, data)
         audit('executing', request_id=rid, device_id=data.get('device_id'), requester=STUDENT,
               approved_by=data.get('approved_by'), cwd=cwd, command=data.get('command'), argv=argv,
               authorization='fleet', requested_at=data.get('requested_at'), resolved_at=data.get('resolved_at'))
 
-    try:
-        rc = subprocess.run(argv, cwd=cwd, env=clean_env()).returncode
+    try: rc = subprocess.run(argv, cwd=cwd, env=clean_env()).returncode
     except FileNotFoundError:
         print(f'LGHS sudo: command not found: {argv[0]}', file=sys.stderr); rc = 127
     except Exception as exc:
@@ -120,11 +129,8 @@ def main():
 
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
-        data['status'] = 'completed'
-        data['completed_at'] = now_iso()
-        data['exit_code'] = rc
-        data['authorization'] = 'fleet'
-        atomic_write(path, data)
+        data['status'] = 'completed'; data['completed_at'] = now_iso(); data['exit_code'] = rc
+        data['authorization'] = 'fleet'; atomic_write(path, data)
     finally:
         audit('completed', request_id=rid, device_id=data.get('device_id'), requester=STUDENT,
               approved_by=data.get('approved_by'), command=data.get('command'), argv=argv,
