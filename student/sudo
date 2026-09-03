@@ -5,10 +5,23 @@ import shlex
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 REAL_SUDO = '/usr/bin/sudo'
-STUDENT = 'lg_cs_cont'
 BROKER_WAIT_SECONDS = 600
+
+
+def student_user():
+    try:
+        value = Path('/etc/lghs/student-user').read_text(encoding='utf-8').strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return 'lg_cs_cont'
+
+
+STUDENT = student_user()
 
 
 def run(cmd, env=None):
@@ -123,30 +136,24 @@ def managed_sudo(argv):
                 stop_child(local)
                 print('\nTeacher approval received. Running command...')
                 return approved_exec(rid, argv)
-
             if state == 'denied':
                 stop_child(local)
                 print('\nLGHS sudo request denied.', file=sys.stderr)
                 return 126
-
             if state == 'expired':
                 stop_child(local)
                 print('\nLGHS sudo request expired. Run the command again if it is still needed.', file=sys.stderr)
                 return 124
-
             if state == 'cancelled':
                 stop_child(local)
                 print('\nLGHS sudo request cancelled.', file=sys.stderr)
                 return 130
-
             if state in ('local_authorized', 'executing'):
                 return local.wait() if local is not None else 126
-
             if state == 'completed':
                 if local is not None:
                     return local.wait() if local_rc is None else local_rc
                 return 0
-
             if state == 'unknown':
                 stop_child(local)
                 print('\nLGHS sudo approval watcher failed.', file=sys.stderr)
@@ -184,11 +191,9 @@ def main():
     if not argv:
         print('LGHS managed sudo: enter a command, for example: sudo apt install python3-numpy')
         return 1
-
     if argv[0].startswith('-'):
         print('LGHS managed sudo requires a command as the first argument.', file=sys.stderr)
         return 2
-
     return managed_sudo(argv)
 
 
