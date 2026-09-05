@@ -109,7 +109,7 @@ def managed_sudo(argv):
     print(f'LGHS sudo request {rid[:8]} submitted automatically.')
     print(f'Command: {shlex.join(argv)}')
 
-    interactive = sys.stdin.isatty() and sys.stderr.isatty()
+    interactive = os.environ.get('LGHS_FORCE_NONINTERACTIVE') != '1' and sys.stdin.isatty() and sys.stderr.isatty()
     local = None
     if interactive:
         print('Teacher approval can arrive remotely, or enter the LGHS Root password now:')

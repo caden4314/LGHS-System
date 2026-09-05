@@ -70,7 +70,8 @@ def start_test():
     cmd = [
         '/usr/sbin/runuser', '-u', student, '--', '/usr/bin/env',
         f'USER={student}', f'LOGNAME={student}', f'HOME={account.pw_dir}',
-        'PATH=/usr/local/bin:/usr/bin:/bin', '/usr/local/bin/sudo', '/usr/bin/id'
+        'LGHS_FORCE_NONINTERACTIVE=1', 'PATH=/usr/local/bin:/usr/bin:/bin',
+        '/usr/local/bin/sudo', '/usr/bin/id'
     ]
     child = subprocess.Popen(
         cmd,
