@@ -51,6 +51,14 @@ class StructuredHealthGateTests(unittest.TestCase):
         self.target = 'b' * 40
         self.db.update_device_inventory('CS-001', current_commit=self.old, current_version='0.5.1', health_state='healthy', now=900)
 
+    def test_host_root_readonly_uses_pid1_mount_namespace(self):
+        agent = load_agent()
+        root = Path(self.tmp.name) / 'mountinfo'
+        root.write_text('26 1 179:2 / / rw,noatime shared:1 - ext4 /dev/mmcblk0p2 rw\n', encoding='utf-8')
+        self.assertFalse(agent.root_filesystem_readonly(root))
+        root.write_text('26 1 179:2 / / ro,noatime shared:1 - ext4 /dev/mmcblk0p2 ro\n', encoding='utf-8')
+        self.assertTrue(agent.root_filesystem_readonly(root))
+
     def tearDown(self):
         self.tmp.cleanup()
 
