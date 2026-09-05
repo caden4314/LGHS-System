@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up LGHS controller state daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=lghs-controller-backup.service
+
+[Install]
+WantedBy=timers.target

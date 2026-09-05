@@ -33,6 +33,7 @@ jobs:
             controller/lghs-fleet-notify \
             controller/lghsctl \
             controller/lghs-audit-sync \
+            controller/lghs-controller-backup \
             controller/lghs-remote-admin \
             controller/lghs-remote-shell \
             controller/lghs-bt-provision \
@@ -51,6 +52,7 @@ jobs:
             student/sudo \
             tests/test_command_plane.py \
             tests/test_fleet_database.py \
+            tests/test_controller_backup.py \
             tests/test_audit_ingest.py \
             tests/test_sudo_state.py \
             tests/test_fleet_api_integration.py \
@@ -61,6 +63,7 @@ jobs:
           python3 -m unittest -v \
             tests/test_command_plane.py \
             tests/test_fleet_database.py \
+            tests/test_controller_backup.py \
             tests/test_audit_ingest.py \
             tests/test_sudo_state.py \
             tests/test_fleet_api_integration.py \
@@ -194,6 +197,9 @@ jobs:
       - name: SQLite foundation invariants
         run: |
           grep -q 'journal_mode=WAL' controller/lghs/database.py
+          grep -q 'synchronous=FULL' controller/lghs/database.py
+          grep -q 'source.backup(destination' controller/lghs-controller-backup
+          grep -q 'PRAGMA quick_check' controller/lghs-controller-backup
           grep -q 'SCHEMA_VERSION = 4' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS device_tags' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS device_lifecycle' controller/lghs/database.py

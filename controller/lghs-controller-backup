@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Create verified, atomic online SQLite backups for the LGHS controller."""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+SOURCE = Path(os.environ.get('LGHS_FLEET_DB', '/var/lib/lghs/fleet.db'))
+ROOT = Path(os.environ.get('LGHS_BACKUP_ROOT', '/var/backups/lghs'))
+RETENTION = {'daily': 7, 'weekly': 4, 'monthly': 3}
+# Explicit non-secret allowlist. Never recursively copy /etc/lghs or /etc/lghs/secrets.
+CONFIG_FILES = (
+    Path('/etc/lghs/fleet.json'),
+    Path('/etc/lghs/role'),
+    Path('/etc/lghs/version'),
+    Path('/etc/lghs/update.env'),
+)
+
+
+def fsync_file(path: Path) -> None:
+    with path.open('rb') as handle:
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            if os.name == 'nt':
+                return
+            raise
+
+
+def fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    except OSError:
+        if os.name == 'nt':
+            return
+        raise
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_promote(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(target.parent, 0o750)
+    temp = target.with_name('.' + target.name + '.tmp')
+    temp.unlink(missing_ok=True)
+    try:
+        os.link(source, temp)
+    except OSError:
+        shutil.copy2(source, temp)
+        fsync_file(temp)
+    os.replace(temp, target)
+    fsync_dir(target.parent)
+
+
+def write_config_snapshot(target: Path, stamp: datetime) -> None:
+    files: dict[str, str] = {}
+    for source in CONFIG_FILES:
+        try:
+            if source.is_file():
+                files[str(source)] = source.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+    payload = {'schema': 1, 'created_at': stamp.timestamp(), 'files': files}
+    temp = target.with_name('.' + target.name + '.tmp')
+    temp.write_text(json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8')
+    os.chmod(temp, 0o640)
+    fsync_file(temp)
+    os.replace(temp, target)
+    fsync_dir(target.parent)
+
+
+def prune(directory: Path, keep: int) -> None:
+    rows = sorted(directory.glob('fleet-*.db'), key=lambda p: p.name, reverse=True)
+    for path in rows[keep:]:
+        path.unlink(missing_ok=True)
+        path.with_suffix('.config.json').unlink(missing_ok=True)
+    fsync_dir(directory)
+
+
+def backup(now: datetime | None = None) -> dict[str, object]:
+    if not SOURCE.is_file():
+        raise RuntimeError(f'Fleet database does not exist: {SOURCE}')
+    stamp = now or datetime.now(timezone.utc)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    os.chmod(ROOT, 0o750)
+    for tier in RETENTION:
+        path = ROOT / tier
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, 0o750)
+
+    fd, tmp_name = tempfile.mkstemp(prefix='.fleet-backup-', suffix='.db', dir=ROOT)
+    os.close(fd)
+    temp = Path(tmp_name)
+    try:
+        source = sqlite3.connect(f'file:{SOURCE}?mode=ro', uri=True, timeout=30)
+        destination = sqlite3.connect(temp, timeout=30)
+        try:
+            destination.execute('PRAGMA synchronous=FULL')
+            source.backup(destination, pages=256, sleep=0.02)
+            result = destination.execute('PRAGMA quick_check').fetchone()
+            if not result or str(result[0]).lower() != 'ok':
+                raise RuntimeError(f'backup quick_check failed: {result!r}')
+            destination.commit()
+        finally:
+            destination.close()
+            source.close()
+        os.chmod(temp, 0o640)
+        fsync_file(temp)
+
+        daily = ROOT / 'daily' / f'fleet-{stamp:%Y-%m-%d}.db'
+        daily_config = daily.with_suffix('.config.json')
+        os.replace(temp, daily)
+        fsync_dir(daily.parent)
+        write_config_snapshot(daily_config, stamp)
+        fsync_dir(ROOT)
+
+        iso_year, iso_week, _ = stamp.isocalendar()
+        if stamp.weekday() == 0:
+            weekly = ROOT / 'weekly' / f'fleet-{iso_year}-W{iso_week:02d}.db'
+            atomic_promote(daily, weekly)
+            atomic_promote(daily_config, weekly.with_suffix('.config.json'))
+        if stamp.day == 1:
+            monthly = ROOT / 'monthly' / f'fleet-{stamp:%Y-%m}.db'
+            atomic_promote(daily, monthly)
+            atomic_promote(daily_config, monthly.with_suffix('.config.json'))
+
+        for tier, keep in RETENTION.items():
+            prune(ROOT / tier, keep)
+
+        return {
+            'ok': True,
+            'source': str(SOURCE),
+            'daily': str(daily),
+            'config': str(daily_config),
+            'quick_check': 'ok',
+            'retention': RETENTION,
+            'created_at': stamp.timestamp(),
+        }
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def main() -> int:
+    try:
+        print(json.dumps(backup(), sort_keys=True))
+        return 0
+    except Exception as exc:
+        print(f'LGHS controller backup failed: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
