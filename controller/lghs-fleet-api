@@ -63,6 +63,17 @@ def legacy_cache(device,payload):
     CACHE.parent.mkdir(parents=True,exist_ok=True);cache=load_json(CACHE,{'version':1,'devices':{}})
     if not isinstance(cache,dict):cache={'version':1,'devices':{}}
     devices=cache.setdefault('devices',{});p=dict(payload);p.pop('audit_batches',None);p['device_id']=device;p['received_at']=time.time();p['fleet_commands']=[legacy_command_view(x) for x in DB.list_commands(device,16)];p['warnings']=DB.list_warnings(device,False,32);devices[device]=p;cache['updated_at']=time.time();tmp=CACHE.with_suffix('.tmp');tmp.write_text(json.dumps(cache,separators=(',',':'))+'\n',encoding='utf-8');os.chmod(tmp,0o640);os.replace(tmp,CACHE)
+def preserve_planned_lifecycle(device,payload,boot_id):
+    boot=str(boot_id or '').strip()
+    if not boot:return payload
+    cache=load_json(CACHE,{})
+    devices=cache.get('devices',{}) if isinstance(cache,dict) else {}
+    previous=devices.get(device,{}) if isinstance(devices,dict) else {}
+    lifecycle=previous.get('lifecycle',{}) if isinstance(previous,dict) else {}
+    if not isinstance(lifecycle,dict):return payload
+    if str(lifecycle.get('state') or '')!='planned_shutdown':return payload
+    if str(lifecycle.get('boot_id') or '').strip()!=boot:return payload
+    merged=dict(payload);merged['lifecycle']=dict(lifecycle);return merged
 def auth_device(handler,device):return authorized(device,bearer(handler))
 
 def sync_deployment_execution(command_id):
@@ -332,7 +343,7 @@ class Handler(BaseHTTPRequestHandler):
             if raw.get('protocol')==PROTOCOL_VERSION and 'payload' in raw:
                 env=TelemetryEnvelope.from_mapping(raw,now=now)
                 if env.device_id!=device:raise ProtocolError('device-mismatch')
-                report_agent_version=env.agent_version;payload=dict(env.payload);command_states=payload.get('command_states',[]);DB.record_telemetry(device,payload,received_at=now,sent_at=env.sent_at,agent_version=env.agent_version,protocol=env.protocol,boot_id=env.boot_id,sequence=env.sequence);audit_ack=record_batches(DB,device,payload.get('audit_batches',[]));record_snapshot(DB,device,payload.get('sudo_requests',[]))
+                report_agent_version=env.agent_version;payload=preserve_planned_lifecycle(device,dict(env.payload),env.boot_id);command_states=payload.get('command_states',[]);DB.record_telemetry(device,payload,received_at=now,sent_at=env.sent_at,agent_version=env.agent_version,protocol=env.protocol,boot_id=env.boot_id,sequence=env.sequence);audit_ack=record_batches(DB,device,payload.get('audit_batches',[]));record_snapshot(DB,device,payload.get('sudo_requests',[]))
             else:
                 claimed=str(raw.get('device_id') or raw.get('hostname') or device).upper()
                 if claimed!=device:raise ProtocolError('device-mismatch')

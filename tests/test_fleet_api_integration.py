@@ -65,13 +65,13 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=5) as response:
             return response.status, json.loads(response.read().decode())
 
-    def report(self, sequence, command_states=None, sudo_requests=None, current_commit=None):
+    def report(self, sequence, command_states=None, sudo_requests=None, current_commit=None, boot_id='boot-1'):
         current_commit = current_commit or ('a' * 40)
         return self.request('/v1/report/CS-999', 'POST', {
             'protocol': 1,
             'agent_version': '0.6.0-dev',
             'device_id': 'CS-999',
-            'boot_id': 'boot-1',
+            'boot_id': boot_id,
             'sequence': sequence,
             'sent_at': time.time(),
             'payload': {
@@ -102,17 +102,20 @@ class FleetAPIIntegrationTests(unittest.TestCase):
             },
         })
 
-    def test_planned_shutdown_lifecycle_is_nonfatal_and_clears_on_return(self):
-        self.report(1)
+    def test_planned_shutdown_lifecycle_survives_same_boot_and_clears_on_new_boot(self):
+        self.report(1,boot_id='boot-1')
         before=float(self.mod.DB.get_device('CS-999')['last_seen'])
         status,result=self.request('/v1/lifecycle/CS-999','POST',{'state':'planned_shutdown','reason':'poweroff','boot_id':'boot-1','sent_at':time.time()})
         self.assertEqual(status,202);self.assertEqual(result['lifecycle']['state'],'planned_shutdown')
         device=self.mod.DB.get_device('CS-999');self.assertEqual(device['health_state'],'maintenance');self.assertGreaterEqual(float(device['last_seen']),before)
         cache=json.loads(self.mod.CACHE.read_text(encoding='utf-8'))['devices']['CS-999'];self.assertEqual(cache['lifecycle']['state'],'planned_shutdown')
         with self.mod.DB.connect() as db:self.assertEqual(db.execute("SELECT kind FROM audit_events WHERE device_id='CS-999' ORDER BY id DESC LIMIT 1").fetchone()['kind'],'lifecycle')
-        self.report(2);self.assertEqual(self.mod.DB.get_device('CS-999')['health_state'],'healthy')
+        self.report(2,boot_id='boot-1')
+        self.assertEqual(self.mod.DB.get_device('CS-999')['health_state'],'maintenance')
+        cache=json.loads(self.mod.CACHE.read_text(encoding='utf-8'))['devices']['CS-999'];self.assertEqual(cache['lifecycle']['state'],'planned_shutdown')
+        self.report(1,boot_id='boot-2')
+        self.assertEqual(self.mod.DB.get_device('CS-999')['health_state'],'healthy')
         cache=json.loads(self.mod.CACHE.read_text(encoding='utf-8'))['devices']['CS-999'];self.assertNotIn('lifecycle',cache)
-
     def test_health_and_end_to_end_command_state(self):
         status, health = self.request('/health')
         self.assertEqual(status, 200)
