@@ -141,6 +141,20 @@ class CommandPlaneTests(unittest.TestCase):
         updater=(ROOT/'updater'/'lghs-update').read_text(encoding='utf-8');self.assertIn('persist_update_branch',updater);self.assertIn('LGHS_PERSIST_UPDATE_BRANCH',updater)
         shell=(ROOT/'controller'/'lghs-remote-shell').read_text(encoding='utf-8');self.assertIn('update-exact',shell);self.assertIn('set-channel',shell)
 
+    def test_status_uses_https_cache_as_runtime_liveness_authority(self):
+        mod=load_script('test_lghsctl_status','controller/lghsctl');now=time.time();commit='a'*40
+        base={'received_at':now,'version':'0.6.0','metrics':{'cpu_pct':1.0,'mem_pct':10.0,'disk_pct':20.0,'temp_c':40.0},'health':{'inventory':{'hostname':'CS-999','current_version':'0.6.0','current_commit':commit}},'health_report':{'health_version':2,'checks':[{'id':'service.lghs-agent','state':'pass','severity':'critical'}]}}
+        mod.targets_all=lambda:['CS-999'];mod.target_meta=lambda target:{'transport':'cloudflare'}
+        with mock.patch.object(mod,'remote_report',side_effect=AssertionError('fresh Fleet cache must not require SSH')):
+            mod.load_cache=lambda:{'CS-999':dict(base)};out=io.StringIO()
+            with contextlib.redirect_stdout(out):rc=mod.fleet_status()
+            self.assertEqual(rc,0);self.assertIn('OK',out.getvalue());self.assertIn(commit[:12],out.getvalue())
+            stale=dict(base);stale['received_at']=now-60;mod.load_cache=lambda:{'CS-999':stale};out=io.StringIO()
+            with contextlib.redirect_stdout(out):rc=mod.fleet_status()
+            self.assertEqual(rc,1);self.assertIn('OFFLINE',out.getvalue())
+            shutdown=dict(stale);shutdown['lifecycle']={'state':'planned_shutdown','reason':'reboot','boot_id':'old'};mod.load_cache=lambda:{'CS-999':shutdown};out=io.StringIO()
+            with contextlib.redirect_stdout(out):rc=mod.fleet_status()
+            self.assertEqual(rc,0);self.assertIn('SHUTDOWN',out.getvalue())
     def configure_queue_temp(self, queue, root):
         queue.QUEUE_DIR = root / 'netqueue'
         queue.JOBS_DIR = queue.QUEUE_DIR / 'jobs'

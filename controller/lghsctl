@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -228,38 +229,55 @@ def remote_report(target, mode, extra=None):
     return ssh_capture(target, cmd)
 
 
+def cache_fresh(report,now=None):
+    try:received=float(report.get('received_at') or 0)
+    except (TypeError,ValueError):received=0.0
+    ts=time.time() if now is None else float(now)
+    return bool(received and ts-received<=float(os.environ.get('LGHS_FLEET_STALE_SECONDS','15')))
+def cached_status(report,now=None):
+    if planned_shutdown(report):return 'SHUTDOWN'
+    if not cache_fresh(report,now):return 'OFFLINE'
+    health_report=report.get('health_report',{}) if isinstance(report,dict) else {}
+    checks=health_report.get('checks',[]) if isinstance(health_report,dict) else []
+    failed=[row for row in checks if isinstance(row,dict) and str(row.get('state') or '').lower()=='fail'] if isinstance(checks,list) else []
+    return 'CHECK' if failed else 'OK'
+def print_cached_status(target,transport,report,state):
+    metrics=report.get('metrics',{}) if isinstance(report.get('metrics'),dict) else {}
+    health=report.get('health',{}) if isinstance(report.get('health'),dict) else {}
+    inv=health.get('inventory',{}) if isinstance(health.get('inventory'),dict) else {}
+    host=str(report.get('hostname') or inv.get('hostname') or target)[:16]
+    version=str(report.get('version') or inv.get('current_version') or '?')[:8]
+    commit=str(inv.get('current_commit') or '?')[:12]
+    print(f"{host:16} {transport:11} {version:8} {str(metrics.get('cpu_pct','?'))+'%':6} {str(metrics.get('mem_pct','?'))+'%':6} {str(metrics.get('disk_pct','?'))+'%':6} {str(metrics.get('temp_c','?'))+'C':7} {commit:12} {state}")
 def fleet_status():
-    targets = targets_all()
+    targets=targets_all()
     if not targets:
-        print("No LGHS devices registered or discovered.")
+        print('No LGHS devices registered or discovered.')
         return 0
-    cache=load_cache();planned={t:cache.get(str(t).upper(),{}) for t in targets if planned_shutdown(cache.get(str(t).upper(),{}))}
-    live=[t for t in targets if t not in planned]
-    results = run_parallel(live, lambda t: remote_report(t, "summary")) if live else {}
-    bad = 0
+    cache=load_cache();cached={t:cache.get(str(t).upper(),{}) for t in targets}
+    uncached=[t for t in targets if not isinstance(cached.get(t),dict) or not cached.get(t)]
+    results=run_parallel(uncached,lambda t:remote_report(t,'summary')) if uncached else {}
+    bad=0;now=time.time()
     print(f"{'HOSTNAME':16} {'TRANSPORT':11} {'VER':8} {'CPU':6} {'RAM':6} {'DISK':6} {'TEMP':7} {'COMMIT':12} STATUS")
     for t in targets:
-        transport = target_meta(t).get('transport', 'direct')[:11]
-        if t in planned:
-            report=planned[t];metrics=report.get('metrics',{}) if isinstance(report.get('metrics'),dict) else {};health=report.get('health',{}) if isinstance(report.get('health'),dict) else {};inv=health.get('inventory',{}) if isinstance(health.get('inventory'),dict) else {}
-            print(f"{str(report.get('hostname') or t)[:16]:16} {transport:11} {str(report.get('version') or inv.get('current_version') or '?')[:8]:8} {str(metrics.get('cpu_pct','?'))+'%':6} {str(metrics.get('mem_pct','?'))+'%':6} {str(metrics.get('disk_pct','?'))+'%':6} {str(metrics.get('temp_c','?'))+'C':7} {str(inv.get('current_commit') or '?')[:12]:12} SHUTDOWN")
+        transport=target_meta(t).get('transport','direct')[:11]
+        report=cached.get(t)
+        if isinstance(report,dict) and report:
+            state=cached_status(report,now)
+            print_cached_status(t,transport,report,state)
+            if state in {'OFFLINE','CHECK'}:bad+=1
             continue
-        p = results[t]
-        if p.returncode != 0:
+        p=results[t]
+        if p.returncode!=0:
             print(f"{t[:16]:16} {transport:11} {'?':8} {'?':6} {'?':6} {'?':6} {'?':7} {'?':12} OFFLINE")
-            if p.stderr:
-                print(f"  {p.stderr.strip()}", file=sys.stderr)
-            bad += 1
-            continue
-        d = dict(line.split("=", 1) for line in p.stdout.splitlines() if "=" in line)
-        svc = [d.get("update_timer"), d.get("reconcile_timer")]
-        if d.get("role") == "student":
-            svc += [d.get("agent"), d.get("policy"), d.get("ssh")]
-        state = "OK" if all(x == "active" for x in svc if x is not None) else "CHECK"
-        bad += state != "OK"
+            if p.stderr:print(f"  {p.stderr.strip()}",file=sys.stderr)
+            bad+=1;continue
+        d=dict(line.split('=',1) for line in p.stdout.splitlines() if '=' in line)
+        svc=[d.get('update_timer'),d.get('reconcile_timer')]
+        if d.get('role')=='student':svc += [d.get('agent'),d.get('policy'),d.get('ssh')]
+        state='OK' if all(x=='active' for x in svc if x is not None) else 'CHECK';bad += state!='OK'
         print(f"{d.get('hostname',t)[:16]:16} {transport:11} {d.get('version','?')[:8]:8} {d.get('cpu_pct','?')+'%':6} {d.get('mem_pct','?')+'%':6} {d.get('disk_pct','?')+'%':6} {d.get('temp_c','?')+'C':7} {d.get('commit','?')[:12]:12} {state}")
     return 1 if bad else 0
-
 
 def fleet_dump(mode):
     targets = targets_all()
