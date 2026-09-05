@@ -20,6 +20,8 @@ CONFIG_FILES = (
     Path('/etc/lghs/role'),
     Path('/etc/lghs/version'),
     Path('/etc/lghs/update.env'),
+    Path('/var/lib/lghs/release/release-sequence'),
+    Path('/var/lib/lghs/release/current.json'),
 )
 
 

@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Manage the LGHS controller release-signing role."""
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, '/usr/local/lib/lghs-python')
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lghs.release import KEY_FILE, SEQUENCE_FILE, CURRENT_FILE, generate_key, issue_release, public_fingerprint, public_key_b64
+
+FLEET_COMMAND = '/usr/local/sbin/lghs-fleet-command'
+REGISTRY = Path('/etc/lghs/fleet.json')
+
+
+def devices_from_registry():
+    try:
+        raw = json.loads(REGISTRY.read_text(encoding='utf-8'))
+        devices = raw.get('devices', {}) if isinstance(raw, dict) else {}
+        return sorted(str(x).upper() for x in devices) if isinstance(devices, dict) else []
+    except Exception:
+        return []
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Run as root')
+    parser = argparse.ArgumentParser(description='LGHS signed release manager')
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('keygen')
+    sub.add_parser('status')
+    issue = sub.add_parser('issue')
+    issue.add_argument('--commit', required=True)
+    issue.add_argument('--channel', default='main')
+    issue.add_argument('--version')
+    issue.add_argument('--minimum-updater', default='0.6.0')
+    issue.add_argument('--ttl-seconds', type=int, default=7 * 86400)
+    issue.add_argument('--force-new', action='store_true')
+    install = sub.add_parser('install-key')
+    install.add_argument('devices', nargs='*')
+    install.add_argument('--all', action='store_true')
+    args = parser.parse_args()
+    if args.cmd == 'keygen':
+        key = generate_key()
+        print(json.dumps({'ok': True, 'public_key_b64': key, 'fingerprint_sha256': public_fingerprint()}, indent=2))
+        return 0
+    if args.cmd == 'status':
+        payload = {'key_exists': KEY_FILE.exists(), 'sequence': int(SEQUENCE_FILE.read_text().strip()) if SEQUENCE_FILE.exists() else 0, 'current_manifest': CURRENT_FILE.exists()}
+        if KEY_FILE.exists():
+            payload.update(public_key_b64=public_key_b64(), fingerprint_sha256=public_fingerprint())
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    if args.cmd == 'issue':
+        print(json.dumps(issue_release(args.commit, channel=args.channel, version=args.version, minimum_updater=args.minimum_updater, ttl_seconds=args.ttl_seconds, force_new=args.force_new), indent=2, sort_keys=True))
+        return 0
+    if args.cmd == 'install-key':
+        if not KEY_FILE.exists():
+            raise SystemExit('Generate the release signing key first with lghs-release keygen')
+        targets = devices_from_registry() if args.all else [x.upper() for x in args.devices]
+        if not targets:
+            raise SystemExit('No target devices selected')
+        payload = json.dumps({'public_key_b64': public_key_b64()}, separators=(',', ':'), sort_keys=True)
+        failed = 0
+        for device in targets:
+            proc = subprocess.run([FLEET_COMMAND, 'enqueue', device, 'release-key-install', '--payload-json', payload], text=True, capture_output=True)
+            if proc.returncode:
+                failed += 1
+                print(f'{device}: FAILED {(proc.stderr or proc.stdout).strip()}', file=sys.stderr)
+            else:
+                print(f'{device}: QUEUED {proc.stdout.strip()}')
+        return 1 if failed else 0
+    return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

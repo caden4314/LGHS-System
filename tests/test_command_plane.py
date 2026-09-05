@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -107,6 +108,16 @@ class CommandPlaneTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             executor.action_command('lghs-update', {'target_commit': 'release-0.6.0-fleet-operations'})
+        manifest_b64 = base64.b64encode(b'{"schema":1}').decode()
+        signature_b64 = base64.b64encode(b's' * 64).decode()
+        self.assertEqual(
+            executor.action_command('lghs-update', {'target_commit': target, 'release_manifest_b64': manifest_b64, 'release_signature_b64': signature_b64}, 'command-signed'),
+            [executor.NETQUEUE, 'enqueue', 'local-update', '--commit', target, '--release-manifest-b64', manifest_b64, '--release-signature-b64', signature_b64, '--idempotency-key', 'command-signed'],
+        )
+        with self.assertRaises(ValueError):
+            executor.action_command('lghs-update', {'target_commit': target, 'release_manifest_b64': manifest_b64})
+        public_key_b64 = base64.b64encode(b'k' * 32).decode()
+        self.assertEqual(executor.action_command('release-key-install', {'public_key_b64': public_key_b64}), [executor.RELEASE_KEY_INSTALL, '--key-b64', public_key_b64])
 
         queue = load_script('test_netqueue_pinned', 'updater/lghs-netqueue')
         job = {'kind': 'local-update', 'params': {'target_commit': target}}
@@ -122,6 +133,14 @@ class CommandPlaneTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(captured['cmd'], ['/usr/local/sbin/lghs-update'])
         self.assertEqual(captured['env']['LGHS_TARGET_COMMIT'], target)
+        signed_job = {'kind': 'local-update', 'params': {'target_commit': target, 'release_manifest_b64': manifest_b64, 'release_signature_b64': signature_b64}}
+        with mock.patch.object(queue.subprocess, 'run', side_effect=fake_run):
+            rc, _ = queue.run_job(signed_job)
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured['env']['LGHS_RELEASE_MANIFEST_B64'], manifest_b64)
+        self.assertEqual(captured['env']['LGHS_RELEASE_SIGNATURE_B64'], signature_b64)
+        with self.assertRaises(ValueError):
+            queue.command_for({'kind': 'local-update', 'params': {'target_commit': target, 'release_manifest_b64': manifest_b64}})
         with self.assertRaises(ValueError):
             queue.command_for({'kind': 'local-update', 'params': {'target_commit': 'main'}})
 
@@ -148,11 +167,20 @@ class CommandPlaneTests(unittest.TestCase):
         with self.assertRaises(ValueError):writer.validate_action_payload('lghs-update',{'target_commit':'a'*40,'extra':True})
         writer.validate_action_payload('lghs-update',{'target_commit':'a'*40})
         writer.validate_action_payload('lghs-update',{'target_channel':'main'})
+        public_key_b64=base64.b64encode(b'k'*32).decode()
+        writer.validate_action_payload('release-key-install',{'public_key_b64':public_key_b64})
+        with self.assertRaises(ValueError):writer.validate_action_payload('release-key-install',{'public_key_b64':'bad'})
+        sig=base64.b64encode(b's'*64).decode()
+        with self.assertRaises(ValueError):writer.validate_action_payload('lghs-update',{'target_commit':'a'*40,'release_manifest_b64':'!!!','release_signature_b64':sig})
         updater=(ROOT/'updater'/'lghs-update').read_text(encoding='utf-8')
         self.assertIn('LGHS_ALLOW_BRANCH_UPDATE',updater)
         self.assertIn('no exact commit authorized; branch-following is disabled',updater)
         self.assertIn('channel saved as $BRANCH; no software revision selected',updater)
         self.assertLess(updater.index('Controller-managed updates'),updater.index('git ls-remote'))
+        self.assertIn('signed release manifest required for managed student updates',updater)
+        self.assertIn('LGHS_ALLOW_UNSIGNED_RELEASE',updater)
+        self.assertIn('LGHS_ALLOW_RELEASE_ROLLBACK',(ROOT/'student'/'lghs-release-verify').read_text(encoding='utf-8'))
+        self.assertLess(updater.index('Signed release required'),updater.index('git ls-remote'))
         ctl=(ROOT/'controller'/'lghsctl').read_text(encoding='utf-8')
         tunnel=(ROOT/'controller'/'lghs-console-tunnel').read_text(encoding='utf-8')
         day2=(ROOT/'controller'/'lghs-console-day2').read_text(encoding='utf-8')

@@ -23,6 +23,7 @@ jobs:
             controller/lghs/database.py \
             controller/lghs/audit.py \
             controller/lghs/sudo_state.py \
+            controller/lghs/release.py \
             controller/lghs-db-migrate \
             controller/lghs-fleet-state \
             controller/lghs-console \
@@ -30,6 +31,7 @@ jobs:
             controller/lghs-console-day2 \
             controller/lghs-fleet-api \
             controller/lghs-fleet-command \
+            controller/lghs-release \
             controller/lghs-fleet-notify \
             controller/lghsctl \
             controller/lghs-audit-sync \
@@ -41,6 +43,8 @@ jobs:
             updater/lghs-netqueue \
             student/lghs-agent \
             student/lghs-command-executor \
+            student/lghs-release-verify \
+            student/lghs-release-key-install \
             student/lghs-bt-bootstrap \
             student/lghs-legacy-identity-cleanup \
             student/lghs-telemetry-push \
@@ -53,6 +57,7 @@ jobs:
             tests/test_command_plane.py \
             tests/test_fleet_database.py \
             tests/test_controller_backup.py \
+            tests/test_release_signing.py \
             tests/test_audit_ingest.py \
             tests/test_sudo_state.py \
             tests/test_fleet_api_integration.py \
@@ -64,6 +69,7 @@ jobs:
             tests/test_command_plane.py \
             tests/test_fleet_database.py \
             tests/test_controller_backup.py \
+            tests/test_release_signing.py \
             tests/test_audit_ingest.py \
             tests/test_sudo_state.py \
             tests/test_fleet_api_integration.py \
@@ -215,6 +221,19 @@ jobs:
           grep -q 'evaluate_health' controller/lghs/database.py
           grep -q 'min_redelivery' controller/lghs/database.py
           grep -q 'target_commit must be an exact 40-character Git commit SHA' controller/lghs/database.py
+          grep -q 'Ed25519PrivateKey' controller/lghs/release.py
+          grep -q 'release_sequence' controller/lghs/release.py
+          grep -q 'Ed25519PublicKey' student/lghs-release-verify
+          grep -q 'LGHS_ALLOW_RELEASE_ROLLBACK' student/lghs-release-verify
+          grep -q 'Signed release required' updater/lghs-update
+          grep -q 'LGHS_ALLOW_UNSIGNED_RELEASE' updater/lghs-update
+          grep -q 'release-key-install' controller/lghs/protocol.py
+          grep -q 'student/lghs-release-key-install' install.sh
+          grep -q "Path('/var/lib/lghs/release/release-sequence')" controller/lghs-controller-backup
+          if grep -q 'release-signing-key' controller/lghs-controller-backup; then
+            echo 'Release private key must not enter controller backups.' >&2
+            exit 1
+          fi
 
       - name: Canonical installer invariants
         run: |

@@ -11,6 +11,7 @@ sys.path.insert(0, '/usr/local/lib/lghs-python')
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lghs.database import FleetDB
 from lghs.protocol import ALLOWED_COMMANDS, normalize_device_id
+from lghs.release import augment_update_payload, validate_public_key_b64, validate_release_artifact
 
 REGISTRY = Path('/etc/lghs/fleet.json')
 DB = FleetDB()
@@ -29,9 +30,15 @@ def valid_channel(value):
 
 
 def validate_action_payload(action, payload):
+    if action == 'release-key-install':
+        extra = set(payload) - {'public_key_b64'}
+        if extra or not payload.get('public_key_b64'):
+            raise ValueError('release-key-install requires only public_key_b64')
+        validate_public_key_b64(payload['public_key_b64'])
+        return
     if action != 'lghs-update':
         return
-    extra = set(payload) - {'target_commit', 'target_channel'}
+    extra = set(payload) - {'target_commit', 'target_channel', 'release_manifest_b64', 'release_signature_b64'}
     if extra:
         raise ValueError('unsupported lghs-update payload fields: ' + ','.join(sorted(extra)))
     commit = payload.get('target_commit')
@@ -42,6 +49,12 @@ def validate_action_payload(action, payload):
         raise ValueError('target_commit must be an exact 40-character Git SHA')
     if channel and not valid_channel(channel):
         raise ValueError('invalid target_channel')
+    manifest = payload.get('release_manifest_b64')
+    signature = payload.get('release_signature_b64')
+    if bool(manifest) != bool(signature):
+        raise ValueError('release manifest and signature must be supplied together')
+    if manifest:
+        validate_release_artifact(manifest, signature)
 
 
 def known_devices():
@@ -81,6 +94,8 @@ def enqueue(device, action, payload=None, deadline=None):
     if known and d not in known:
         raise SystemExit(f'Unknown fleet device: {d}')
     payload = payload or {}
+    if action == 'lghs-update':
+        payload = augment_update_payload(payload)
     canonical_payload(payload)
     validate_action_payload(action, payload)
     DB.initialize()

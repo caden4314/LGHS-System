@@ -72,6 +72,9 @@ class ControllerBackupTests(unittest.TestCase):
         self.assertNotIn("'-shm'", text)
         self.assertNotIn("Path('/etc/lghs/secrets", text)
         self.assertNotIn("fleet-api-tokens", text)
+        self.assertIn("Path('/var/lib/lghs/release/release-sequence')", text)
+        self.assertIn("Path('/var/lib/lghs/release/current.json')", text)
+        self.assertNotIn("release-signing-key", text)
 
 
 if __name__ == '__main__':

@@ -21,7 +21,9 @@ jobs:
             controller/lghs/rollout_manager.py \
             controller/lghs/recovery.py \
             controller/lghs/maintenance.py \
+            controller/lghs/release.py \
             controller/lghs-fleet-command \
+            controller/lghs-release \
             controller/lghs-fleet-rollout \
             controller/lghs-fleet-maintenance \
             controller/lghs-rollout-manager \
@@ -32,8 +34,11 @@ jobs:
             updater/lghs-netqueue \
             student/lghs-agent \
             student/lghs-command-executor \
+            student/lghs-release-verify \
+            student/lghs-release-key-install \
             tests/test_command_plane.py \
             tests/test_controller_backup.py \
+            tests/test_release_signing.py \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
@@ -52,6 +57,7 @@ jobs:
           python3 -m unittest -v \
             tests/test_command_plane.py \
             tests/test_controller_backup.py \
+            tests/test_release_signing.py \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
@@ -126,6 +132,14 @@ jobs:
           grep -Fq "source.backup(destination" controller/lghs-controller-backup
           grep -Fq "RETENTION = {'daily': 7, 'weekly': 4, 'monthly': 3}" controller/lghs-controller-backup
           grep -Fq "lghs-controller-backup.timer" install.sh
+          grep -Fq "Ed25519PrivateKey" controller/lghs/release.py
+          grep -Fq "Ed25519PublicKey" student/lghs-release-verify
+          grep -Fq "release_sequence" controller/lghs/release.py
+          grep -Fq "Signed release required" updater/lghs-update
+          grep -Fq "LGHS_ALLOW_UNSIGNED_RELEASE" updater/lghs-update
+          grep -Fq "LGHS_ALLOW_RELEASE_ROLLBACK" student/lghs-release-verify
+          grep -Fq "release-key-install" controller/lghs/protocol.py
+          grep -Fq "student/lghs-release-key-install" install.sh
           grep -Fq "expected_reboot" controller/lghs/maintenance.py
           grep -Fq "lifecycle-boot-mismatch" controller/lghs-fleet-api
           grep -Fq "LGHS_FLEET_OFFLINE_SECONDS" controller/lghs-console-tunnel

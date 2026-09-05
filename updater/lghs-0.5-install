@@ -33,6 +33,7 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0644 "$ROOT/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
   install -m 0644 "$ROOT/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
   install -m 0644 "$ROOT/controller/lghs/maintenance.py" /usr/local/lib/lghs-python/lghs/maintenance.py
+  install -m 0644 "$ROOT/controller/lghs/release.py" /usr/local/lib/lghs-python/lghs/release.py
   install -m 0755 "$ROOT/controller/lghs-console-tunnel" /usr/local/libexec/lghs-console-base
   install -m 0755 "$ROOT/controller/lghs-console-responsive" /usr/local/libexec/lghs-console-responsive-core
   install -m 0755 "$ROOT/controller/lghs-console-day2" /usr/local/libexec/lghs-console-day2-core
@@ -41,6 +42,7 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0755 "$ROOT/controller/lghs-console-day5" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
+  install -m 0750 "$ROOT/controller/lghs-release" /usr/local/sbin/lghs-release
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
   install -m 0755 "$ROOT/controller/lghs-controller-backup" /usr/local/sbin/lghs-controller-backup
   install -m 0644 "$ROOT/systemd/lghs-controller-backup.service" /etc/systemd/system/lghs-controller-backup.service
@@ -77,6 +79,8 @@ install -d -o root -g root -m 0700 /var/lib/lghs/bootstrap
 install -m 0755 "$ROOT/student/lghs-agent" /usr/local/sbin/lghs-agent
 python3 "$ROOT/updater/patch-agent-status-guard.py" /usr/local/sbin/lghs-agent
 install -m 0750 "$ROOT/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
+install -m 0750 "$ROOT/student/lghs-release-verify" /usr/local/sbin/lghs-release-verify
+install -m 0750 "$ROOT/student/lghs-release-key-install" /usr/local/sbin/lghs-release-key-install
 install -m 0750 "$ROOT/student/lghs-service-recovery" /usr/local/sbin/lghs-service-recovery
 install -m 0755 "$ROOT/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
 install -m 0750 "$ROOT/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap

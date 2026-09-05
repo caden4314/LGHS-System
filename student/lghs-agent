@@ -498,10 +498,18 @@ def accept(commands: Any) -> None:
             result = {'ok': False, 'error': str(exc)}
         with LOCK:
             if result.get('ok'):
-                row['state'] = 'accepted'
-                row['accepted_at'] = float(result.get('accepted_at') or time.time())
-                row['updated_at'] = row['accepted_at']
-                row['stage'] = 'Accepted by executor'
+                accepted_at = float(result.get('accepted_at') or time.time())
+                terminal = str(result.get('terminal_state') or '').lower()
+                row['accepted_at'] = accepted_at
+                if terminal in TERMINAL_COMMAND_STATES:
+                    row['state'] = terminal
+                    row[terminal + '_at'] = float(result.get('completed_at') or accepted_at)
+                    row['updated_at'] = row[terminal + '_at']
+                    row['stage'] = 'Completed by executor'
+                else:
+                    row['state'] = 'accepted'
+                    row['updated_at'] = accepted_at
+                    row['stage'] = 'Accepted by executor'
                 row['message'] = result.get('message', 'Queued locally')
             else:
                 row['stage'] = 'Local acceptance retry pending'

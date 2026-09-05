@@ -2,6 +2,7 @@
 """Tiny privileged executor for typed LGHS 0.6 agent operations."""
 from __future__ import annotations
 
+import base64
 import grp
 import hashlib
 import json
@@ -16,6 +17,7 @@ from typing import Any
 
 SOCK = Path('/run/lghs-command-executor/socket')
 NETQUEUE = '/usr/local/sbin/lghs-netqueue'
+RELEASE_KEY_INSTALL = '/usr/local/sbin/lghs-release-key-install'
 SEEN = Path('/var/lib/lghs/executor-seen.json')
 REBOOT_PENDING = Path('/var/lib/lghs/reboot-pending.json')
 SUDO_DIR = Path('/var/lib/lghs/sudo-requests')
@@ -108,6 +110,18 @@ def action_command(action: str, payload: Any, command_id: str = '') -> list[str]
         payload = {}
     if not isinstance(payload, dict):
         raise ValueError('invalid-payload')
+    if action == 'release-key-install':
+        extra = set(payload) - {'public_key_b64'}
+        if extra:
+            raise ValueError('invalid-release-key-payload')
+        value = str(payload.get('public_key_b64') or '').strip()
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except Exception as exc:
+            raise ValueError('invalid-release-public-key') from exc
+        if len(raw) != 32:
+            raise ValueError('invalid-release-public-key')
+        return [RELEASE_KEY_INSTALL, '--key-b64', value]
     if action == 'reboot':
         schedule_id = str(payload.get('schedule_id') or '').strip()
         reason = str(payload.get('reason') or '')
@@ -122,10 +136,20 @@ def action_command(action: str, payload: Any, command_id: str = '') -> list[str]
     if action not in ACTIONS:
         raise ValueError('unsupported-action')
     command = list(ACTIONS[action])
+    if action == 'lghs-update':
+        extra = set(payload) - {'target_commit', 'target_channel', 'release_manifest_b64', 'release_signature_b64'}
+        if extra:
+            raise ValueError('invalid-update-payload')
+        manifest = str(payload.get('release_manifest_b64') or '').strip()
+        signature = str(payload.get('release_signature_b64') or '').strip()
+        if bool(manifest) != bool(signature):
+            raise ValueError('release-manifest-signature-mismatch')
     if action == 'lghs-update' and payload.get('target_commit'):
         command += ['--commit', normalize_target_commit(payload['target_commit'])]
     if action == 'lghs-update' and payload.get('target_channel'):
         command += ['--channel', normalize_target_channel(payload['target_channel'])]
+    if action == 'lghs-update' and payload.get('release_manifest_b64'):
+        command += ['--release-manifest-b64', str(payload['release_manifest_b64']), '--release-signature-b64', str(payload['release_signature_b64'])]
     if command_id:
         # The controller command ID is the local side-effect idempotency key.
         command += ['--idempotency-key', command_id]
@@ -347,6 +371,9 @@ def handle(client: socket.socket) -> None:
         for key, _ in sorted(seen.items(), key=lambda item: item[1])[:-256]:
             seen.pop(key, None)
     save_seen(seen)
+    if action == 'release-key-install':
+        reply(client, {'ok': True, 'message': 'Release verification key installed', 'accepted_at': accepted, 'terminal_state': 'succeeded', 'completed_at': accepted})
+        return
     message = 'Reboot armed locally' if action == 'reboot' else 'Queued locally'
     reply(client, {'ok': True, 'message': message, 'accepted_at': accepted})
 
