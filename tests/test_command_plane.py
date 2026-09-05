@@ -161,6 +161,21 @@ class CommandPlaneTests(unittest.TestCase):
             shutdown=dict(stale);shutdown['lifecycle']={'state':'planned_shutdown','reason':'reboot','boot_id':'old'};mod.load_cache=lambda:{'CS-999':shutdown};out=io.StringIO()
             with contextlib.redirect_stdout(out):rc=mod.fleet_status()
             self.assertEqual(rc,0);self.assertIn('SHUTDOWN',out.getvalue())
+    def test_health_diagnostics_reports_structured_failures(self):
+        mod=load_script('test_lghsctl_health','controller/lghsctl');now=time.time()
+        checks=[{'id':cid,'state':'pass','severity':'critical','observed':True,'expected':True} for cid in mod.STATUS_REQUIRED_CHECKS]
+        for row in checks:
+            if row['id']=='transport.controller':
+                row.update(state='fail',observed={'fresh':False,'age_seconds':99},expected='success within 30 seconds',remediation='inspect:fleet-api-connectivity')
+        report={'received_at':now,'health_report':{'health_version':2,'checks':checks}}
+        mod.load_cache=lambda:{'CS-999':report};mod.target_meta=lambda target:{'device':'CS-999'}
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out):rc=mod.fleet_health('CS-999')
+        text=out.getvalue()
+        self.assertEqual(rc,1);self.assertIn('status=CHECK',text);self.assertIn('transport.controller',text);self.assertIn('required=yes',text)
+        shell=(ROOT/'controller'/'lghs-remote-shell').read_text(encoding='utf-8')
+        self.assertIn('health DEVICE',shell);self.assertIn("action == 'health'",shell)
+
     def configure_queue_temp(self, queue, root):
         queue.QUEUE_DIR = root / 'netqueue'
         queue.JOBS_DIR = queue.QUEUE_DIR / 'jobs'

@@ -263,6 +263,48 @@ def print_cached_status(target,transport,report,state):
     version=str(report.get('version') or inv.get('current_version') or '?')[:8]
     commit=str(inv.get('current_commit') or '?')[:12]
     print(f"{host:16} {transport:11} {version:8} {str(metrics.get('cpu_pct','?'))+'%':6} {str(metrics.get('mem_pct','?'))+'%':6} {str(metrics.get('disk_pct','?'))+'%':6} {str(metrics.get('temp_c','?'))+'C':7} {commit:12} {state}")
+def fleet_health(target):
+    device=str(target_meta(target).get('device') or target).upper()
+    report=load_cache().get(device,{})
+    if not isinstance(report,dict) or not report:
+        print(f'device={device}')
+        print('status=NO_CACHE')
+        print('No Fleet telemetry cache exists for this device.')
+        return 1
+    now=time.time()
+    state=cached_status(report,now)
+    try:received=float(report.get('received_at') or 0)
+    except (TypeError,ValueError):received=0.0
+    age=max(0.0,now-received) if received else None
+    lifecycle=report.get('lifecycle',{}) if isinstance(report.get('lifecycle'),dict) else {}
+    health_report=report.get('health_report',{}) if isinstance(report.get('health_report'),dict) else {}
+    checks=health_report.get('checks',[]) if isinstance(health_report.get('checks',[]),list) else []
+    print(f'device={device}')
+    print(f'status={state}')
+    print(f'received_age_seconds={round(age,3) if age is not None else "unknown"}')
+    if lifecycle:
+        print(f'lifecycle={lifecycle.get("state","")}')
+        print(f'lifecycle_reason={lifecycle.get("reason","")}')
+        print(f'lifecycle_boot_id={lifecycle.get("boot_id","")}')
+    print(f'health_version={health_report.get("health_version","unknown")}')
+    failed=[]
+    for row in checks:
+        if not isinstance(row,dict):continue
+        if str(row.get('state') or '').lower()!='pass':failed.append(row)
+    print(f'failed_checks={len(failed)}')
+    for row in failed:
+        check_id=str(row.get('id') or 'unknown')
+        severity=str(row.get('severity') or 'warning').upper()
+        observed=json.dumps(row.get('observed'),separators=(',',':'),sort_keys=True)
+        expected=json.dumps(row.get('expected'),separators=(',',':'),sort_keys=True)
+        remediation=str(row.get('remediation') or '')
+        required='yes' if check_id in STATUS_REQUIRED_CHECKS else 'no'
+        print(f'{severity:8} {check_id} required={required} observed={observed} expected={expected} remediation={remediation}')
+    if not failed:
+        print('All structured health checks pass.')
+    return 1 if state in {'OFFLINE','CHECK'} else 0
+
+
 def fleet_status():
     targets=targets_all()
     if not targets:
@@ -433,6 +475,7 @@ def main():
         sub.add_parser(name)
     p = sub.add_parser("enroll"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true")
     p = sub.add_parser("info"); p.add_argument("target")
+    p = sub.add_parser("health"); p.add_argument("target")
     p = sub.add_parser("logs"); p.add_argument("target"); p.add_argument("group", nargs="?", default="all", choices=["all","update","agent","policy"])
     p = sub.add_parser("fleet-logs"); p.add_argument("kind", choices=["sudo","audit","update","os-update"]); p.add_argument("--lines", type=int, default=100)
     p = sub.add_parser("update"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true"); p.add_argument("--commit"); p.add_argument("--channel")
@@ -456,6 +499,7 @@ def main():
     if args.cmd == "fleet-logs": return show_fleet_logs(args.kind, args.lines)
     if args.cmd == "enroll": return enroll_all(targets_all() if args.all or not args.target else [args.target])
     if args.cmd == "info": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-report summary")
+    if args.cmd == "health": return fleet_health(args.target)
     if args.cmd == "logs": return ssh_cmd(args.target, f"sudo -n /usr/local/sbin/lghs-report logs {args.group}")
     if args.cmd == "sudo-list": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-sudo-admin list --json")
     if args.cmd == "sudo-test": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-sudo-selftest start")
