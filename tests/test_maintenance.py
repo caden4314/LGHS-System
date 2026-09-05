@@ -105,15 +105,17 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(action['boot_id_before'], 'boot-a')
         cid = action['command_id']
         self.assertEqual(self.db.get_command(cid)['action'], 'reboot')
+        lifecycle=self.db.list_lifecycle('CS-001');self.assertEqual(lifecycle[0]['event_type'],'expected_reboot');self.assertEqual(lifecycle[0]['expected'],1);self.assertEqual(lifecycle[0]['boot_id'],'boot-a')
         self.db.transition_command(cid, 'accepted', now=1101)
 
-        self.db.upsert_device('CS-001', boot_id='boot-b', last_seen=1110)
+        self.db.record_telemetry('CS-001',{},received_at=1110,boot_id='boot-b',sequence=1)
         verified = reconcile_reboot_schedule(self.db, 'reboot-test', now=1110)
         self.assertEqual(verified['actions'][0]['action'], 'verified')
         stored = get_reboot_schedule(self.db, 'reboot-test')
         self.assertEqual(stored['state'], 'succeeded')
         self.assertEqual(stored['executions']['CS-001']['boot_id_after'], 'boot-b')
         self.assertEqual(self.db.get_command(cid)['state'], 'succeeded')
+        lifecycle=self.db.list_lifecycle('CS-001')[0];self.assertIsNotNone(lifecycle['returned_at']);self.assertGreaterEqual(lifecycle['downtime_seconds'],0)
 
     def test_natural_reboot_before_dispatch_does_not_verify_scheduled_reboot(self):
         create_reboot_schedule(

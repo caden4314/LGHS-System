@@ -94,9 +94,15 @@ def planned_shutdown(d):
     value=d.get('lifecycle',{}) if isinstance(d,dict) else {}
     return isinstance(value,dict) and str(value.get('state') or '')=='planned_shutdown'
 
+def planned_lifecycle_state(d):
+    value=d.get('lifecycle',{}) if isinstance(d,dict) else {}
+    if not isinstance(value,dict) or str(value.get('state') or '')!='planned_shutdown':return None
+    return "REBOOTING" if str(value.get('reason') or '').lower()=="reboot" else "SHUTDOWN"
+
 def cache_state(d):
-    if planned_shutdown(d):
-        return "SHUTDOWN"
+    planned=planned_lifecycle_state(d)
+    if planned:
+        return planned
     age = d.get("cache_age")
     if age is None:
         return "OFFLINE"
@@ -270,7 +276,7 @@ def issues(devices, state):
     rows = []
     for d in devices:
         cstate = cache_state(d)
-        if cstate == "SHUTDOWN":
+        if cstate in ("SHUTDOWN", "REBOOTING"):
             continue
         if cstate == "STALE":
             rows.append((d, "WARNING", "STALE", f"telemetry age {cache_age_text(d)}"))

@@ -508,6 +508,8 @@ def reconcile_reboot_schedule(store: Any, schedule_id: str, *, now: float | None
                 actions.append({'device_id': device, 'action': 'waiting-for-boot-id'})
             continue
         row['boot_id_before'] = boot_now
+        if hasattr(store, 'record_lifecycle_event'):
+            store.record_lifecycle_event(device,'expected_reboot',reason=str(schedule.get('reason') or 'controller-scheduled-reboot'),boot_id=boot_now,reported_at=ts,received_at=ts,expected=True)
         command_id = _dispatch_reboot(store, schedule, device, now=ts)
         row.update({'state': 'dispatched', 'command_id': command_id, 'dispatched_at': ts, 'updated_at': ts, 'message': 'Reboot command dispatched'})
         executions[device] = row

@@ -240,11 +240,25 @@ def remote_report(target, mode, extra=None):
     return ssh_capture(target, cmd)
 
 
-def cache_fresh(report,now=None):
+def cache_age(report,now=None):
     try:received=float(report.get('received_at') or 0)
     except (TypeError,ValueError):received=0.0
+    if not received:return None
     ts=time.time() if now is None else float(now)
-    return bool(received and ts-received<=float(os.environ.get('LGHS_FLEET_STALE_SECONDS','15')))
+    return max(0.0,ts-received)
+
+
+def cache_fresh(report,now=None):
+    age=cache_age(report,now)
+    return bool(age is not None and age<=float(os.environ.get('LGHS_FLEET_STALE_SECONDS','15')))
+
+
+def planned_lifecycle_state(report):
+    value=report.get('lifecycle',{}) if isinstance(report,dict) else {}
+    if not isinstance(value,dict) or str(value.get('state') or '')!='planned_shutdown':return None
+    return 'REBOOTING' if str(value.get('reason') or '').lower()=='reboot' else 'SHUTDOWN'
+
+
 STATUS_REQUIRED_CHECKS = frozenset({
     'service.NetworkManager','service.lghs-policy','service.lghs-agent',
     'service.lghs-command-executor','storage.root','storage.root-writable',
@@ -253,8 +267,14 @@ STATUS_REQUIRED_CHECKS = frozenset({
 })
 
 def cached_status(report,now=None):
-    if planned_shutdown(report):return 'SHUTDOWN'
-    if not cache_fresh(report,now):return 'OFFLINE'
+    planned=planned_lifecycle_state(report)
+    if planned:return planned
+    age=cache_age(report,now)
+    if age is None:return 'OFFLINE'
+    fresh=float(os.environ.get('LGHS_FLEET_STALE_SECONDS','15'))
+    offline=max(fresh+5.0,float(os.environ.get('LGHS_FLEET_OFFLINE_SECONDS','60')))
+    if age>offline:return 'OFFLINE'
+    if age>fresh:return 'STALE'
     health_report=report.get('health_report',{}) if isinstance(report,dict) else {}
     checks=health_report.get('checks',[]) if isinstance(health_report,dict) else []
     if not isinstance(checks,list):return 'CHECK'
@@ -332,7 +352,7 @@ def fleet_status():
         if isinstance(report,dict) and report:
             state=cached_status(report,now)
             print_cached_status(t,transport,report,state)
-            if state in {'OFFLINE','CHECK'}:bad+=1
+            if state in {'OFFLINE','STALE','CHECK'}:bad+=1
             continue
         p=results[t]
         if p.returncode!=0:
