@@ -7,7 +7,7 @@ from typing import Any, Iterator, Mapping
 from .protocol import ALLOWED_COMMANDS, TERMINAL_COMMAND_STATES, normalize_command_state, normalize_device_id, state_can_advance
 
 DEFAULT_DB = Path('/var/lib/lghs/fleet.db')
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 OPEN_STATES = {'queued','delivered','received','accepted','running'}
 HEALTH_STATES = frozenset({'unknown','healthy','warning','critical','offline','maintenance'})
 COMMIT_RE = re.compile(r'^[0-9a-fA-F]{40}$')
@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS fleet_groups(group_id TEXT PRIMARY KEY,name TEXT NOT 
 CREATE TABLE IF NOT EXISTS group_members(group_id TEXT NOT NULL REFERENCES fleet_groups(group_id) ON DELETE CASCADE,device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,created_at REAL NOT NULL,PRIMARY KEY(group_id,device_id));
 CREATE INDEX IF NOT EXISTS idx_group_members_device ON group_members(device_id,group_id);
 CREATE TABLE IF NOT EXISTS telemetry_latest(device_id TEXT PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,received_at REAL NOT NULL,sent_at REAL,boot_id TEXT,sequence INTEGER,payload_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS device_lifecycle(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,event_type TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',boot_id TEXT NOT NULL,reported_at REAL,received_at REAL NOT NULL,offline_at REAL,returned_at REAL,downtime_seconds REAL,expected INTEGER NOT NULL DEFAULT 0,UNIQUE(device_id,boot_id,event_type));
+CREATE INDEX IF NOT EXISTS idx_device_lifecycle_device_time ON device_lifecycle(device_id,received_at DESC);
 CREATE TABLE IF NOT EXISTS commands(command_id TEXT PRIMARY KEY,device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,action TEXT NOT NULL,state TEXT NOT NULL,stage TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '',progress REAL,created_at REAL NOT NULL,updated_at REAL NOT NULL,deadline_at REAL,delivered_at REAL,received_at REAL,accepted_at REAL,started_at REAL,completed_at REAL,last_delivery_at REAL,deliveries INTEGER NOT NULL DEFAULT 0,payload_json TEXT NOT NULL DEFAULT '{}');
 CREATE INDEX IF NOT EXISTS idx_commands_device_created ON commands(device_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_commands_state ON commands(state,updated_at);
@@ -168,13 +170,35 @@ class FleetDB:
             r=db.execute('SELECT * FROM deployments WHERE deployment_id=?',(deployment_id,)).fetchone();return dict(r) if r else None
     def list_deployment_executions(self,deployment_id:str)->list[dict[str,Any]]:
         with self.connect() as db:return [dict(x) for x in db.execute('SELECT * FROM deployment_executions WHERE deployment_id=? ORDER BY phase,device_id',(deployment_id,)).fetchall()]
-    def record_telemetry(self,device_id:str,payload:Mapping[str,Any],*,received_at=None,sent_at=None,agent_version=None,protocol=None,boot_id=None,sequence=None)->None:
-        d=normalize_device_id(device_id);received=time.time() if received_at is None else float(received_at)
+    def record_lifecycle_event(self,device_id:str,event_type:str,*,reason='',boot_id='',reported_at=None,received_at=None,expected=False)->dict[str,Any]:
+        d=normalize_device_id(device_id);event=str(event_type or '').strip().lower();boot=str(boot_id or '').strip();ts=time.time() if received_at is None else float(received_at)
+        if event not in {'planned_shutdown','expected_reboot'}:raise ValueError('invalid lifecycle event_type')
+        if not boot or len(boot)>128:raise ValueError('invalid lifecycle boot_id')
+        why=str(reason or '')[:500];reported=float(reported_at) if reported_at is not None else None;offline=ts if event=='planned_shutdown' else None
         with self.transaction() as db:
-            old=db.execute('SELECT boot_id,last_sequence FROM devices WHERE device_id=?',(d,)).fetchone()
-            if old and boot_id and old['boot_id']==boot_id and sequence is not None and old['last_sequence'] is not None and int(sequence)<int(old['last_sequence']):raise ValueError('out-of-order telemetry sequence')
-            self.upsert_device(d,agent_version=agent_version,protocol=protocol,boot_id=boot_id,sequence=sequence,last_seen=received,db=db)
-            db.execute('''INSERT INTO telemetry_latest(device_id,received_at,sent_at,boot_id,sequence,payload_json) VALUES(?,?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET received_at=excluded.received_at,sent_at=excluded.sent_at,boot_id=excluded.boot_id,sequence=excluded.sequence,payload_json=excluded.payload_json''',(d,received,sent_at,boot_id,sequence,_json(dict(payload))))
+            self.upsert_device(d,db=db)
+            db.execute("""INSERT INTO device_lifecycle(device_id,event_type,reason,boot_id,reported_at,received_at,offline_at,expected) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(device_id,boot_id,event_type) DO UPDATE SET reason=excluded.reason,reported_at=COALESCE(device_lifecycle.reported_at,excluded.reported_at),received_at=MIN(device_lifecycle.received_at,excluded.received_at),offline_at=COALESCE(device_lifecycle.offline_at,excluded.offline_at),expected=MAX(device_lifecycle.expected,excluded.expected)""",(d,event,why,boot,reported,ts,offline,1 if expected else 0))
+            return dict(db.execute('SELECT * FROM device_lifecycle WHERE device_id=? AND boot_id=? AND event_type=?',(d,boot,event)).fetchone())
+    def list_lifecycle(self,device_id=None,limit=200)->list[dict[str,Any]]:
+        count=max(1,min(int(limit),1000))
+        with self.connect() as db:
+            if device_id:
+                rows=db.execute('SELECT * FROM device_lifecycle WHERE device_id=? ORDER BY received_at DESC LIMIT ?',(normalize_device_id(device_id),count)).fetchall()
+            else:
+                rows=db.execute('SELECT * FROM device_lifecycle ORDER BY received_at DESC LIMIT ?',(count,)).fetchall()
+            return [dict(row) for row in rows]
+    def record_telemetry(self,device_id:str,payload:Mapping[str,Any],*,received_at=None,sent_at=None,agent_version=None,protocol=None,boot_id=None,sequence=None)->None:
+        d=normalize_device_id(device_id);received=time.time() if received_at is None else float(received_at);boot=str(boot_id or '').strip() or None
+        with self.transaction() as db:
+            old=db.execute('SELECT boot_id,last_sequence FROM devices WHERE device_id=?',(d,)).fetchone();old_boot=str(old['boot_id'] or '').strip() if old else ''
+            if old and boot and old_boot==boot and sequence is not None and old['last_sequence'] is not None and int(sequence)<int(old['last_sequence']):raise ValueError('out-of-order telemetry sequence')
+            if old_boot and boot and old_boot!=boot:
+                rows=db.execute('SELECT id,COALESCE(offline_at,received_at) AS down_from FROM device_lifecycle WHERE device_id=? AND boot_id=? AND returned_at IS NULL',(d,old_boot)).fetchall()
+                for row in rows:
+                    down_from=float(row['down_from'] or received)
+                    db.execute('UPDATE device_lifecycle SET returned_at=?,downtime_seconds=? WHERE id=?',(received,max(0.0,received-down_from),row['id']))
+            self.upsert_device(d,agent_version=agent_version,protocol=protocol,boot_id=boot,sequence=sequence,last_seen=received,db=db)
+            db.execute("""INSERT INTO telemetry_latest(device_id,received_at,sent_at,boot_id,sequence,payload_json) VALUES(?,?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET received_at=excluded.received_at,sent_at=excluded.sent_at,boot_id=excluded.boot_id,sequence=excluded.sequence,payload_json=excluded.payload_json""",(d,received,sent_at,boot,sequence,_json(dict(payload))))
     def create_command(self,device_id:str,action:str,*,payload=None,deadline_at=None,command_id=None,now=None,dedupe=True)->str:
         d=normalize_device_id(device_id)
         if action not in ALLOWED_COMMANDS:raise ValueError(f'unsupported command: {action}')

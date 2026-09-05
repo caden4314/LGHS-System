@@ -186,14 +186,21 @@ def record_lifecycle(device,raw,now):
     if state!='planned_shutdown':raise ProtocolError('unsupported-lifecycle-state')
     reason=str(raw.get('reason') or 'shutdown').strip().lower()[:64]
     boot=str(raw.get('boot_id') or '').strip()[:128]
+    if not boot:raise ProtocolError('missing-lifecycle-boot-id')
     try:sent=float(raw.get('sent_at') or now)
     except (TypeError,ValueError):raise ProtocolError('invalid-lifecycle-time') from None
-    latest=DB.latest_telemetry(device);payload=dict((latest or {}).get('payload') or {})
-    payload['lifecycle']={'state':state,'reason':reason,'boot_id':boot,'sent_at':sent,'received_at':now}
+    if sent < now-600 or sent > now+60:raise ProtocolError('implausible-lifecycle-time')
+    latest=DB.latest_telemetry(device) or {};current_boot=str(latest.get('boot_id') or '').strip()
+    if not current_boot or boot!=current_boot:raise ProtocolError('lifecycle-boot-mismatch')
+    latest_payload=dict(latest.get('payload') or {})
+    lifecycle={'state':state,'reason':reason,'boot_id':boot,'sent_at':sent,'received_at':now}
+    DB.record_lifecycle_event(device,'planned_shutdown',reason=reason,boot_id=boot,reported_at=sent,received_at=now,expected=False)
+    latest_payload['lifecycle']=lifecycle
     DB.upsert_device(device,last_seen=now)
     DB.update_device_inventory(device,health_state='maintenance',now=now)
-    with DB.transaction() as db:db.execute('INSERT INTO audit_events(device_id,kind,severity,created_at,sequence,detail_json) VALUES(?,?,?,?,?,?)',(device,'lifecycle','info',now,None,json.dumps(payload['lifecycle'],separators=(',',':'))))
-    legacy_cache(device,payload);return payload['lifecycle']
+    with DB.transaction() as db:db.execute('INSERT INTO audit_events(device_id,kind,severity,created_at,sequence,detail_json) VALUES(?,?,?,?,?,?)',(device,'lifecycle','info',now,None,json.dumps(lifecycle,separators=(',',':'))))
+    legacy_cache(device,latest_payload);return lifecycle
+
 def target_from_request(raw):
     if isinstance(raw.get('target'),dict):return raw['target']
     keys=[key for key in ('device_id','device_ids','group_id','tag','all') if raw.get(key) not in (None,False,'',[])]
@@ -216,6 +223,9 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(value,dict):raise ProtocolError('body must be an object')
         return value
     def admin_get(self,path):
+        if path=='/v1/admin/lifecycle':self.reply(200,{'ok':True,'lifecycle':DB.list_lifecycle(limit=200)});return True
+        if path.startswith('/v1/admin/lifecycle/'):
+            device=normalize_device_id(path[len('/v1/admin/lifecycle/'):]);self.reply(200,{'ok':True,'device_id':device,'lifecycle':DB.list_lifecycle(device,limit=200)});return True
         if path=='/v1/admin/devices':self.reply(200,{'ok':True,'devices':list_devices()});return True
         if path=='/v1/admin/maintenance/policies':self.reply(200,{'ok':True,'policies':list_policies(DB)});return True
         if path.startswith('/v1/admin/maintenance/devices/'):
@@ -295,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ProtocolError,ValueError,TypeError) as exc:self.reply(400,{'ok':False,'error':str(exc)});return True
         return False
     def do_GET(self):
-        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':2,'fleet_operations':1,'exact_commit_deployments':True,'inventory_reporting':True,'desired_state_reconciliation':True,'frozen_target_rollouts':True,'deployment_recovery_controls':True,'maintenance_windows':True,'scheduled_reboots':True,'typed_reboot_command':True,'structured_health_gates':True,'deployment_wave_audit':True,'planned_shutdown_reporting':True,'time':time.time()});return
+        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':2,'fleet_operations':1,'exact_commit_deployments':True,'inventory_reporting':True,'desired_state_reconciliation':True,'frozen_target_rollouts':True,'deployment_recovery_controls':True,'maintenance_windows':True,'scheduled_reboots':True,'typed_reboot_command':True,'structured_health_gates':True,'deployment_wave_audit':True,'planned_shutdown_reporting':True,'lifecycle_history':True,'time':time.time()});return
         parsed=urllib.parse.urlparse(self.path)
         if parsed.path.startswith('/v1/admin/'):
             if not auth_admin(self):self.reply(401,{'ok':False,'error':'unauthorized'});return
@@ -327,8 +337,8 @@ class Handler(BaseHTTPRequestHandler):
             except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
             if not auth_device(self,device):self.reply(401,{'ok':False,'error':'unauthorized'});return
             try:raw=self.read_json();lifecycle=record_lifecycle(device,raw,time.time())
-            except ValueError as exc:self.reply(413,{'ok':False,'error':str(exc)});return
             except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
+            except ValueError as exc:self.reply(413,{'ok':False,'error':str(exc)});return
             self.reply(202,{'ok':True,'device_id':device,'lifecycle':lifecycle});return
         prefix='/v1/report/'
         if not parsed.path.startswith(prefix):self.reply(404,{'ok':False});return

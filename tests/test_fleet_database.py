@@ -17,7 +17,7 @@ class FleetDBTests(unittest.TestCase):
     def tearDown(self):self.tmp.cleanup()
     def test_wal_and_schema(self):
         with self.store.connect() as db:
-            self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0].lower(),'wal');self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],'3');tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0].lower(),'wal');self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],'4');tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         for name in {'devices','device_tags','fleet_groups','group_members','telemetry_latest','commands','command_events','warnings','warning_events','deployments','deployment_executions','sudo_requests','audit_events','notifications','settings'}:self.assertIn(name,tables)
     def test_v2_schema_upgrades_in_place(self):
         old=self.root/'old.db';db=sqlite3.connect(old)
@@ -35,7 +35,7 @@ CREATE TABLE deployment_executions(deployment_id TEXT NOT NULL REFERENCES deploy
             device_cols={r['name'] for r in db.execute('PRAGMA table_info(devices)')};execution_cols={r['name'] for r in db.execute('PRAGMA table_info(deployment_executions)')}
             self.assertTrue({'hostname','role','model','ram_mb','serial','current_commit','current_version','desired_commit','health_state'} <= device_cols)
             self.assertTrue({'stage','target_commit','previous_commit','attempt','started_at','completed_at','error_code','error_message'} <= execution_cols)
-            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],'3')
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],'4')
     def test_inventory_tags_groups_and_deployment_foundation(self):
         current='a'*40;target='b'*40
         row=self.store.update_device_inventory('CS-999',hostname='CS-999',role='student',model='Raspberry Pi 5',ram_mb=8192,serial='10000000abcdef01',current_commit=current,current_version='0.6.0-dev',health_state='healthy')

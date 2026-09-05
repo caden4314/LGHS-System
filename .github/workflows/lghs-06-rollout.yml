@@ -37,6 +37,7 @@ jobs:
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
             tests/test_fleet_api_recovery.py \
+            tests/test_fleet_api_integration.py \
             tests/test_fleet_api_maintenance.py \
             tests/test_fleet_api_structured_health.py \
             tests/test_hardware_upgrade_regressions.py \
@@ -53,6 +54,7 @@ jobs:
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
             tests/test_fleet_api_recovery.py \
+            tests/test_fleet_api_integration.py \
             tests/test_fleet_api_maintenance.py \
             tests/test_fleet_api_structured_health.py \
             tests/test_hardware_upgrade_regressions.py \
@@ -117,6 +119,11 @@ jobs:
           grep -Fq "'health_schema':2" controller/lghs-fleet-api
           grep -Fq "'structured_health_gates':True" controller/lghs-fleet-api
           grep -Fq "'deployment_wave_audit':True" controller/lghs-fleet-api
+          grep -Fq "device_lifecycle" controller/lghs/database.py
+          grep -Fq "expected_reboot" controller/lghs/maintenance.py
+          grep -Fq "lifecycle-boot-mismatch" controller/lghs-fleet-api
+          grep -Fq "LGHS_FLEET_OFFLINE_SECONDS" controller/lghs-console-tunnel
+          grep -Fq "REBOOTING" controller/lghsctl
           grep -Fq "Deployments / Updates" controller/lghs-console-day2
           grep -Fq "L Rollback" controller/lghs-console-day2
           grep -Fq 'ord("l"), ord("L")' controller/lghs-console-day2

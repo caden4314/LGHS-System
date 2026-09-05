@@ -21,7 +21,8 @@ REGISTRY_FILE = Path("/etc/lghs/fleet.json")
 CACHE_FILE = Path("/var/lib/lghs/fleet-cache.json")
 FLEET_COMMAND = "/usr/local/sbin/lghs-fleet-command"
 CLOUDFLARED = shutil.which("cloudflared") or "/usr/local/bin/cloudflared"
-STALE_SECONDS = float(os.environ.get("LGHS_FLEET_STALE_SECONDS", "15"))
+FRESH_SECONDS = max(3.0, float(os.environ.get("LGHS_FLEET_STALE_SECONDS", "15")))
+OFFLINE_SECONDS = max(FRESH_SECONDS + 5.0, float(os.environ.get("LGHS_FLEET_OFFLINE_SECONDS", "60")))
 HTTPS_UPDATE_COMMANDS = {
     "sudo -n /usr/local/sbin/lghs-update": "lghs-update",
     "sudo -n /usr/local/sbin/lghs-os-update": "os-update",
@@ -131,8 +132,11 @@ def refresh_fleet(discovered):
             received = float(d.get("received_at") or 0)
         except Exception:
             received = 0.0
-        d["online"] = bool(received and now - received <= STALE_SECONDS)
-        d["cache_age"] = max(0.0, now - received) if received else None
+        age = max(0.0, now - received) if received else None
+        d["fresh"] = bool(age is not None and age <= FRESH_SECONDS)
+        d["stale"] = bool(age is not None and FRESH_SECONDS < age <= OFFLINE_SECONDS)
+        d["online"] = bool(age is not None and age <= OFFLINE_SECONDS)
+        d["cache_age"] = age
         out.append(d)
 
     return sorted(out, key=lambda d: (

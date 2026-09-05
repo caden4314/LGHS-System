@@ -110,12 +110,20 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         device=self.mod.DB.get_device('CS-999');self.assertEqual(device['health_state'],'maintenance');self.assertGreaterEqual(float(device['last_seen']),before)
         cache=json.loads(self.mod.CACHE.read_text(encoding='utf-8'))['devices']['CS-999'];self.assertEqual(cache['lifecycle']['state'],'planned_shutdown')
         with self.mod.DB.connect() as db:self.assertEqual(db.execute("SELECT kind FROM audit_events WHERE device_id='CS-999' ORDER BY id DESC LIMIT 1").fetchone()['kind'],'lifecycle')
+        rows=self.mod.DB.list_lifecycle('CS-999');self.assertEqual(len(rows),1);self.assertEqual(rows[0]['event_type'],'planned_shutdown');self.assertEqual(rows[0]['expected'],0);self.assertIsNone(rows[0]['returned_at'])
+        status,_=self.request('/v1/lifecycle/CS-999','POST',{'state':'planned_shutdown','reason':'poweroff','boot_id':'boot-1','sent_at':time.time()})
+        self.assertEqual(status,202);self.assertEqual(len(self.mod.DB.list_lifecycle('CS-999')),1)
+        status,history=self.request('/v1/admin/lifecycle/CS-999',token='admin-secret');self.assertEqual(status,200);self.assertEqual(len(history['lifecycle']),1)
         self.report(2,boot_id='boot-1')
         self.assertEqual(self.mod.DB.get_device('CS-999')['health_state'],'maintenance')
         cache=json.loads(self.mod.CACHE.read_text(encoding='utf-8'))['devices']['CS-999'];self.assertEqual(cache['lifecycle']['state'],'planned_shutdown')
         self.report(1,boot_id='boot-2')
         self.assertEqual(self.mod.DB.get_device('CS-999')['health_state'],'healthy')
         cache=json.loads(self.mod.CACHE.read_text(encoding='utf-8'))['devices']['CS-999'];self.assertNotIn('lifecycle',cache)
+        closed=self.mod.DB.list_lifecycle('CS-999')[0];self.assertIsNotNone(closed['returned_at']);self.assertGreaterEqual(closed['downtime_seconds'],0)
+        with self.assertRaises(urllib.error.HTTPError) as mismatch:
+            self.request('/v1/lifecycle/CS-999','POST',{'state':'planned_shutdown','reason':'poweroff','boot_id':'boot-1','sent_at':time.time()})
+        self.assertEqual(mismatch.exception.code,400)
     def test_health_and_end_to_end_command_state(self):
         status, health = self.request('/health')
         self.assertEqual(status, 200)
@@ -128,6 +136,7 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         self.assertTrue(health['desired_state_reconciliation'])
         self.assertTrue(health['frozen_target_rollouts'])
         self.assertTrue(health['deployment_recovery_controls'])
+        self.assertTrue(health['lifecycle_history'])
 
         cid = self.mod.DB.create_command('CS-999', 'lghs-update', command_id='cmd-http')
         status, first = self.report(1)
