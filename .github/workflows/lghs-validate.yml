@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  validate:
+  lghs-validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
