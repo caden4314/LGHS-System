@@ -2,10 +2,12 @@ name: LGHS 0.6 Rollout Validate
 
 on:
   pull_request:
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  rollout:
+  rollout-validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
