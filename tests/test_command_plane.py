@@ -176,6 +176,26 @@ class CommandPlaneTests(unittest.TestCase):
         shell=(ROOT/'controller'/'lghs-remote-shell').read_text(encoding='utf-8')
         self.assertIn('health DEVICE',shell);self.assertIn("action == 'health'",shell)
 
+    def test_service_recovery_is_typed_and_allowlisted(self):
+        helper=(ROOT/'student'/'lghs-service-recovery').read_text(encoding='utf-8')
+        for token in ('agent) unit=lghs-agent.service','executor) unit=lghs-command-executor.service','policy) unit=lghs-policy.service','ssh) unit=ssh.service','update-timer) unit=lghs-update.timer','reconcile-timer) unit=lghs-reconcile.timer'):
+            self.assertIn(token,helper)
+        self.assertIn("Unsupported LGHS recovery service.",helper)
+        self.assertNotIn('eval ',helper)
+        ctl=(ROOT/'controller'/'lghsctl').read_text(encoding='utf-8')
+        shell=(ROOT/'controller'/'lghs-remote-shell').read_text(encoding='utf-8')
+        console=(ROOT/'controller'/'lghs-console-responsive').read_text(encoding='utf-8')
+        sudoers=(ROOT/'policies'/'sudoers'/'99-lghs-admin').read_text(encoding='utf-8')
+        install=(ROOT/'install.sh').read_text(encoding='utf-8')
+        self.assertIn('sub.add_parser("restart-service")',ctl)
+        self.assertIn('/usr/local/sbin/lghs-service-recovery {args.service}',ctl)
+        self.assertIn('restart-service DEVICE',shell)
+        self.assertIn("action == 'restart-service'",shell)
+        self.assertIn('/usr/local/sbin/lghs-service-recovery {svc}',console)
+        self.assertNotIn('sudo -n systemctl restart {svc}',console)
+        self.assertIn('/usr/local/sbin/lghs-service-recovery *',sudoers)
+        self.assertIn('student/lghs-service-recovery',install)
+
     def configure_queue_temp(self, queue, root):
         queue.QUEUE_DIR = root / 'netqueue'
         queue.JOBS_DIR = queue.QUEUE_DIR / 'jobs'
