@@ -937,7 +937,7 @@ def quick_actions(stdscr, state, d):
 
 def recovery_popup(stdscr, state, d, kind):
     opts = ["Run lghs-check", "Re-apply policy + check", "Restart related service", "Open live logs", "LGHS update", "Reboot Pi"]
-    service_map = {"SSH": "ssh.service", "POLICY": "lghs-policy.service", "UPDATE": "lghs-update.timer", "RECONCILE": "lghs-reconcile.timer"}
+    service_map = {"SSH": "ssh", "POLICY": "policy", "UPDATE": "update-timer", "RECONCILE": "reconcile-timer", "AGENT": "agent", "EXECUTOR": "executor"}
     sel = 0
     while True:
         win, ph, _ = modal_window(stdscr, 14, 78, f"RECOVERY - {hostname(d)} - {kind}")
@@ -963,7 +963,7 @@ def recovery_popup(stdscr, state, d, kind):
             svc = service_map.get(kind)
             if not svc:
                 popup(stdscr, state, "Recovery", f"No specific service mapping for {kind}."); continue
-            start_job(state, f"Restart {svc} - {hostname(d)}", [d], f"sudo -n systemctl restart {svc}"); return
+            start_job(state, f"Restart {svc} - {hostname(d)}", [d], f"sudo -n /usr/local/sbin/lghs-service-recovery {svc}"); return
         if sel == 3:
             start_job(state, f"Logs - {hostname(d)}", [d], "sudo -n /usr/local/sbin/lghs-report logs all"); return
         if sel == 4:

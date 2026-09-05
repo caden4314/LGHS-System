@@ -196,6 +196,7 @@ else
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-local-exec" /usr/local/sbin/lghs-local-exec
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-selftest" /usr/local/sbin/lghs-sudo-selftest
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-service-recovery" /usr/local/sbin/lghs-service-recovery
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-legacy-identity-cleanup" /usr/local/sbin/lghs-legacy-identity-cleanup
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-cloudflare-install" /usr/local/sbin/lghs-cloudflare-install

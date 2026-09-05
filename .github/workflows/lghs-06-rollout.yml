@@ -62,6 +62,9 @@ jobs:
       - name: Security and Fleet Control invariants
         run: |
           set -euxo pipefail
+          bash -n student/lghs-service-recovery
+          grep -Fq "Unsupported LGHS recovery service." student/lghs-service-recovery
+          grep -Fq "lghs-service-recovery {svc}" controller/lghs-console-responsive
           grep -Fq "target selector matched no enrolled devices" controller/lghs/rollout.py
           grep -Fq "resolved_devices" controller/lghs/rollout.py
           grep -Fq "canary failure" controller/lghs/rollout.py
