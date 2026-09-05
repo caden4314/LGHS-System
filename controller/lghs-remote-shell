@@ -33,6 +33,7 @@ def usage():
   console
   status | versions | services | update-state | controller-runtime
   info DEVICE
+  health DEVICE
   update DEVICE | os-update DEVICE
   update-exact DEVICE SHA [CHANNEL]
   set-channel DEVICE CHANNEL
@@ -78,6 +79,8 @@ def main():
 
     if action == 'info' and len(argv) == 2 and valid_device(argv[1]):
         return run(['/usr/local/sbin/lghsctl', 'info', argv[1].upper()])
+    if action == 'health' and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghsctl', 'health', argv[1].upper()])
     if action in ('update', 'os-update', 'check', 'enforce', 'reboot') and len(argv) == 2 and valid_device(argv[1]):
         return run(['/usr/local/sbin/lghsctl', action, argv[1].upper()])
     if action == 'ssh' and len(argv) == 2 and valid_device(argv[1]):
