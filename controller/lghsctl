@@ -241,7 +241,10 @@ def fleet_dump(mode):
     for t in targets:
         p = results[t]
         print(f"\n===== {t} ({target_meta(t).get('transport','direct')}) =====")
-        print((p.stdout if p.returncode == 0 else p.stderr).rstrip())
+        output = p.stdout if p.stdout.strip() else p.stderr
+        print(output.rstrip())
+        if p.returncode != 0:
+            print(f"[exit {p.returncode}]", file=sys.stderr)
     return 0
 
 
