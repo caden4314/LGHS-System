@@ -20,6 +20,26 @@ log(){ logger -t LGHS-POLICY "$*"; echo "[LGHS] $*"; }
 getent passwd "$STUDENT" >/dev/null || { log "Missing student account: $STUDENT"; exit 1; }
 getent passwd "$ADMIN" >/dev/null || { log "Missing admin account: $ADMIN"; exit 1; }
 
+quarantine_legacy_account() {
+    local legacy="$1" expected="$2" grp
+    [[ "$legacy" != "$expected" ]] || return 0
+    id "$legacy" >/dev/null 2>&1 || return 0
+    for grp in sudo adm systemd-journal lghs-admin; do
+        if id -nG "$legacy" 2>/dev/null | tr ' ' '\n' | grep -qx "$grp"; then
+            gpasswd -d "$legacy" "$grp" >/dev/null 2>&1 || true
+        fi
+    done
+    usermod -L -s /usr/sbin/nologin "$legacy"
+    log "Quarantined unexpected legacy account $legacy; home directory preserved"
+}
+
+# Early stock-provisioning bugs could create legacy identities alongside the
+# canonical cs-## / cs-admin accounts. Preserve their home directories for
+# recovery, but remove privileged groups and disable login so they cannot remain
+# shadow administrators after migration.
+quarantine_legacy_account lg_cs_cont "$STUDENT"
+quarantine_legacy_account cs_admin "$ADMIN"
+
 if id -nG "$STUDENT" | tr ' ' '\n' | grep -qx sudo; then
     gpasswd -d "$STUDENT" sudo >/dev/null
     log "Removed $STUDENT from sudo group"
