@@ -156,9 +156,9 @@ if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
         write_status "validating" "Reconciling current install" 85 "LGHS is already current"
         /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true
     fi
-    if [[ -x ./updater/lghs-0.5-install ]]; then
-        ./updater/lghs-0.5-install "$ROLE"
-    fi
+    # Already-current checks must be non-disruptive. Reconcile reapplies
+    # policy/liveness state without reinstalling the managed layer or restarting
+    # healthy Fleet processes. The layer installer runs only for real updates.
     write_status "complete" "LGHS is current" 100 "Already at ${TARGET_COMMIT:0:12}"
     echo "LGHS is already current at ${TARGET_COMMIT:0:12}."
     exit 0
