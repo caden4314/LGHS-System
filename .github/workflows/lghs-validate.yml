@@ -116,6 +116,11 @@ jobs:
           grep -q "LEGACY_STUDENT = 'lg' + '_cs' + '_cont'" student/lghs-legacy-identity-cleanup
           grep -q 'owned_outside_home' student/lghs-legacy-identity-cleanup
           grep -q 'supplementary_groups' student/lghs-legacy-identity-cleanup
+          grep -q '/bin/bash ./install.sh "$ROLE" || return 1' updater/lghs-update
+          grep -q '/usr/local/sbin/lghs-check || return 1' updater/lghs-update
+          grep -q 'validate_student_05 || return 1' updater/lghs-update
+          grep -q 'validate_controller || return 1' updater/lghs-update
+          grep -q "journalctl --no-pager -n 220 -u lghs-update.service" student/lghs-report
 
       - name: Legacy telemetry rollback invariants
         run: |

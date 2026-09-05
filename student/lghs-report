@@ -53,7 +53,7 @@ case "$MODE" in
  logs)
   service="${ARG:-all}";case "$service" in
    all) journalctl --no-pager -n 100 -u lghs-update.service -u lghs-agent.service -u lghs-policy.service -u lghs-reconcile.service -u lghs-netqueue.service 2>/dev/null||true;echo;echo '===== LGHS UPDATE =====';tail -n 80 /var/log/lghs-update.log 2>/dev/null||true;echo;echo '===== OS UPDATE =====';tail -n 80 /var/log/lghs-os-update.log 2>/dev/null||true;echo;echo '===== NETWORK QUEUE =====';tail -n 80 /var/log/lghs-netqueue.log 2>/dev/null||true;echo;echo '===== LGHS SUDO AUDIT =====';tail -n 80 /var/log/lghs-sudo-audit.jsonl 2>/dev/null||true;echo;echo '===== SUDO =====';tail -n 80 /var/log/sudo.log 2>/dev/null||true;;
-   update) tail -n 200 /var/log/lghs-update.log 2>/dev/null||true;;
+   update) journalctl --no-pager -n 220 -u lghs-update.service 2>/dev/null||true;echo;echo '===== LGHS UPDATE FILE =====';tail -n 200 /var/log/lghs-update.log 2>/dev/null||true;;
    os-update) tail -n 200 /var/log/lghs-os-update.log 2>/dev/null||true;;
    netqueue) tail -n 200 /var/log/lghs-netqueue.log 2>/dev/null||true;;
    agent) journalctl --no-pager -n 160 -u lghs-agent.service 2>/dev/null||true;;

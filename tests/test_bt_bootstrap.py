@@ -171,6 +171,20 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn('LEGACY_ADMIN="cs""_admin"', check)
         self.assertIn('LEGACY_STUDENT="lg""_cs""_cont"', check)
 
+    def test_update_validation_cannot_be_masked_by_later_success(self):
+        updater = (ROOT / "updater" / "lghs-update").read_text(encoding="utf-8")
+        self.assertIn('/bin/bash ./install.sh "$ROLE" || return 1', updater)
+        self.assertIn('/usr/local/sbin/lghs-check || return 1', updater)
+        self.assertIn('validate_student_05 || return 1', updater)
+        self.assertIn('validate_controller || return 1', updater)
+
+    def test_legacy_cleanup_archives_home_before_account_removal(self):
+        src = (ROOT / "student" / "lghs-legacy-identity-cleanup").read_text(encoding="utf-8")
+        self.assertIn("Path('/home/.lghs-legacy')", src)
+        self.assertIn("os.replace(home, archive)", src)
+        self.assertIn("run(['/usr/sbin/userdel', name])", src)
+        self.assertNotIn("run(['/usr/sbin/userdel', '-r', name])", src)
+
     def test_no_static_wifi_secret_in_repository_protocol(self):
         combined = "\n".join([
             (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8"),

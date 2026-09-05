@@ -81,33 +81,52 @@ def safety_reasons(entry):
     if owned:
         reasons.append('owned-file=' + owned)
     home = Path(entry.pw_dir or f'/home/{name}')
-    if home.exists():
-        try:
-            if any(home.iterdir()):
-                reasons.append(f'nonempty-home={home}')
-        except OSError as exc:
-            reasons.append(f'home-unreadable={exc}')
+    expected_home = Path('/home') / name
+    if home != expected_home:
+        reasons.append(f'unexpected-home={home}')
+    elif home.is_symlink():
+        reasons.append(f'symlink-home={home}')
     return reasons
 
 
 def remove_identity(entry):
     name = entry.pw_name
+    home = Path(entry.pw_dir or f'/home/{name}')
+    archive = None
+    if home.exists():
+        archive_root = Path('/home/.lghs-legacy')
+        archive_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(archive_root, 0, 0)
+        os.chmod(archive_root, 0o700)
+        archive = archive_root / name
+        suffix = 1
+        while archive.exists():
+            archive = archive_root / f'{name}.{suffix}'
+            suffix += 1
+        os.replace(home, archive)
+
     key = Path('/etc/ssh/authorized_keys') / name
     if key.exists() and key.stat().st_size == 0:
         key.unlink()
-    p = run(['/usr/sbin/userdel', '-r', name])
+    p = run(['/usr/sbin/userdel', name])
     if p.returncode != 0:
+        if archive is not None and archive.exists() and not home.exists():
+            os.replace(archive, home)
         detail = (p.stderr or p.stdout).strip()
         raise RuntimeError(detail or f'userdel failed rc={p.returncode}')
+    if archive is not None:
+        os.chown(archive, 0, 0)
+        os.chmod(archive, 0o700)
     try:
         group = grp.getgrnam(name)
     except KeyError:
-        return
+        return archive
     if group.gr_gid == entry.pw_gid and not group.gr_mem:
         p = run(['/usr/sbin/groupdel', name])
         if p.returncode != 0:
             detail = (p.stderr or p.stdout).strip()
             raise RuntimeError(detail or f'groupdel failed rc={p.returncode}')
+    return archive
 
 
 def main():
@@ -140,12 +159,15 @@ def main():
             print(f'SAFE {name}: eligible for removal')
             continue
         try:
-            remove_identity(entry)
+            archive = remove_identity(entry)
         except Exception as exc:
             blocked += 1
             print(f'BLOCKED {name}: removal-failed={exc}')
             continue
-        print(f'REMOVED {name}')
+        if archive is None:
+            print(f'REMOVED {name}')
+        else:
+            print(f'REMOVED {name}: archived-home={archive}')
     return 2 if blocked else 0
 
 

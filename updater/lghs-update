@@ -174,8 +174,8 @@ printf '%s\n' "$TARGET_COMMIT" > .lghs-source-commit
 chmod 0755 install.sh updater/lghs-update updater/lghs-0.5-install 2>/dev/null || true
 
 validate_controller() {
-    [[ "$(cat /etc/lghs/role)" == "controller" ]]
-    /usr/local/sbin/lghsctl --help >/dev/null
+    [[ "$(cat /etc/lghs/role)" == "controller" ]] || return 1
+    /usr/local/sbin/lghsctl --help >/dev/null || return 1
     python3 -m py_compile \
         /usr/local/sbin/lghs-console \
         /usr/local/sbin/lghs-fleet-api \
@@ -185,24 +185,24 @@ validate_controller() {
         /usr/local/libexec/lghs-console-base \
         /usr/local/libexec/lghsctl-real \
         /usr/local/lib/lghs-python/lghs/database.py \
-        /usr/local/lib/lghs-python/lghs/protocol.py
-    systemctl is-active --quiet lghs-update.timer
-    systemctl is-active --quiet lghs-reconcile.timer
-    systemctl is-active --quiet lghs-audit-sync.timer
-    systemctl is-active --quiet lghs-fleet-notify.service
-    systemctl is-active --quiet lghs-fleet-api.service
-    [[ -s /var/lib/lghs/fleet.db ]]
-    [[ -s /etc/lghs/secrets/controller_ed25519 ]]
-    [[ "$(stat -c %a /etc/lghs/secrets/controller_ed25519 2>/dev/null)" == "600" ]]
+        /usr/local/lib/lghs-python/lghs/protocol.py || return 1
+    systemctl is-active --quiet lghs-update.timer || return 1
+    systemctl is-active --quiet lghs-reconcile.timer || return 1
+    systemctl is-active --quiet lghs-audit-sync.timer || return 1
+    systemctl is-active --quiet lghs-fleet-notify.service || return 1
+    systemctl is-active --quiet lghs-fleet-api.service || return 1
+    [[ -s /var/lib/lghs/fleet.db ]] || return 1
+    [[ -s /etc/lghs/secrets/controller_ed25519 ]] || return 1
+    [[ "$(stat -c %a /etc/lghs/secrets/controller_ed25519 2>/dev/null)" == "600" ]] || return 1
 }
 
 validate_student_05() {
-    /usr/local/sbin/lghs-check
-    systemctl is-active --quiet lghs-command-executor.service
-    systemctl is-active --quiet lghs-agent.service
-    [[ "$(systemctl is-active lghs-telemetry-push.service 2>/dev/null || true)" != "active" ]]
-    [[ -S /run/lghs-command-executor/socket ]]
-    [[ -s /var/lib/lghs-agent/fleet-api-token ]]
+    /usr/local/sbin/lghs-check || return 1
+    systemctl is-active --quiet lghs-command-executor.service || return 1
+    systemctl is-active --quiet lghs-agent.service || return 1
+    [[ "$(systemctl is-active lghs-telemetry-push.service 2>/dev/null || true)" != "active" ]] || return 1
+    [[ -S /run/lghs-command-executor/socket ]] || return 1
+    [[ -s /var/lib/lghs-agent/fleet-api-token ]] || return 1
 }
 
 cleanup_legacy_student_services() {
@@ -217,7 +217,7 @@ cleanup_legacy_student_services() {
 
 apply_install() {
     write_status "installing" "Applying LGHS configuration" 55 "Running install.sh for $ROLE"
-    /bin/bash ./install.sh "$ROLE"
+    /bin/bash ./install.sh "$ROLE" || return 1
     # install.sh is the canonical installer for the current architecture.
     # Older revisions may not contain the managed layer; only those downgrade
     # targets need the legacy cleanup path. Avoid a second installer pass here
@@ -227,19 +227,20 @@ apply_install() {
         cleanup_legacy_student_services
     fi
     write_status "installing" "Reloading services" 75 "Refreshing systemd units"
-    systemctl daemon-reload
+    systemctl daemon-reload || return 1
     write_status "validating" "Validating installation" 88 "Running post-update checks"
     if [[ "$ROLE" == "student" ]]; then
         if [[ -x ./updater/lghs-0.5-install ]]; then
-            validate_student_05
+            validate_student_05 || return 1
         else
-            /usr/local/sbin/lghs-check
-            systemctl is-active --quiet lghs-telemetry-push.service
-            [[ "$(systemctl is-active lghs-command-executor.service 2>/dev/null || true)" != "active" ]]
+            /usr/local/sbin/lghs-check || return 1
+            systemctl is-active --quiet lghs-telemetry-push.service || return 1
+            [[ "$(systemctl is-active lghs-command-executor.service 2>/dev/null || true)" != "active" ]] || return 1
         fi
     else
-        validate_controller
+        validate_controller || return 1
     fi
+    return 0
 }
 
 record_success() {
