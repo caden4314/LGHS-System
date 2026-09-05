@@ -79,6 +79,17 @@ def live_jobs(state):
     return rows
 
 
+def controller_current_commit():
+    for path in (Path('/var/lib/lghs/update/current-commit'), Path('/etc/lghs/source-commit')):
+        try:
+            value = path.read_text(encoding='utf-8').strip()
+        except Exception:
+            continue
+        if len(value) == 40 and all(ch in '0123456789abcdefABCDEF' for ch in value):
+            return value.lower()
+    raise RuntimeError('controller exact commit is unavailable')
+
+
 def network_update_runner(targets, action):
     def runner():
         if not COMMAND_HELPER.exists():
@@ -86,7 +97,10 @@ def network_update_runner(targets, action):
         out, rc = [], 0
         for d in targets:
             did = ui.device_id(d)
-            p = subprocess.run([sys.executable, str(COMMAND_HELPER), "enqueue", did, action], text=True, capture_output=True, timeout=10)
+            cmd = [sys.executable, str(COMMAND_HELPER), "enqueue", did, action]
+            if action == "lghs-update":
+                cmd += ["--payload-json", json.dumps({"target_commit": controller_current_commit()}, separators=(",", ":"), sort_keys=True)]
+            p = subprocess.run(cmd, text=True, capture_output=True, timeout=10)
             rc = rc or p.returncode
             command_id = (p.stdout or "").strip()
             detail = command_id if p.returncode == 0 else ((p.stderr or p.stdout or "queue failed").strip())

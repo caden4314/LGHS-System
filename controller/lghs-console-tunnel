@@ -141,13 +141,28 @@ def refresh_fleet(discovered):
     ))
 
 
+def controller_current_commit():
+    for path in (Path('/var/lib/lghs/update/current-commit'), Path('/etc/lghs/source-commit')):
+        try:
+            value = path.read_text(encoding='utf-8').strip()
+        except Exception:
+            continue
+        if len(value) == 40 and all(ch in '0123456789abcdefABCDEF' for ch in value):
+            return value.lower()
+    raise RuntimeError('controller exact commit is unavailable')
+
+
 def queue_https_update(target, action):
     """Delegate all command creation to the canonical serialized writer."""
     device = str(target_meta(target).get("device") or target).upper()
     if not device or len(device) > 64:
         raise RuntimeError("invalid fleet device")
+    cmd = [FLEET_COMMAND, "enqueue", device, action]
+    if action == "lghs-update":
+        payload = {"target_commit": controller_current_commit()}
+        cmd += ["--payload-json", json.dumps(payload, separators=(",", ":"), sort_keys=True)]
     p = subprocess.run(
-        [FLEET_COMMAND, "enqueue", device, action],
+        cmd,
         text=True,
         capture_output=True,
     )

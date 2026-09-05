@@ -125,6 +125,17 @@ def valid_channel(value):
     return bool(value) and len(value)<=128 and '..' not in value and not value.startswith(('/', '-')) and not value.endswith('/') and all(ch.isalnum() or ch in '._/-' for ch in value)
 
 
+def controller_current_commit():
+    for path in (Path('/var/lib/lghs/update/current-commit'), Path('/etc/lghs/source-commit')):
+        try:
+            value=path.read_text(encoding='utf-8').strip()
+        except Exception:
+            continue
+        if valid_commit(value):
+            return value.lower()
+    raise RuntimeError('controller does not have a valid installed exact commit')
+
+
 def ssh_base(target, batch=True):
     ensure_dirs()
     meta = target_meta(target)
@@ -516,6 +527,9 @@ def main():
         if args.commit:
             if not valid_commit(args.commit):print('Invalid exact commit SHA',file=sys.stderr);return 2
             payload['target_commit']=args.commit.lower()
+        elif not args.channel:
+            try:payload['target_commit']=controller_current_commit()
+            except RuntimeError as exc:print(str(exc),file=sys.stderr);return 2
         if args.channel:
             if not valid_channel(args.channel):print('Invalid update channel',file=sys.stderr);return 2
             payload['target_channel']=args.channel

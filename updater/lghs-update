@@ -11,6 +11,7 @@ ENV_CHECKOUT="${LGHS_UPDATE_CHECKOUT-}"
 # pinned target from update.env or the fallback timer would remain pinned.
 ENV_TARGET_COMMIT="${LGHS_TARGET_COMMIT-}"
 PERSIST_UPDATE_BRANCH="${LGHS_PERSIST_UPDATE_BRANCH:-0}"
+ALLOW_BRANCH_UPDATE="${LGHS_ALLOW_BRANCH_UPDATE:-0}"
 if [[ -r "$UPDATE_ENV" ]]; then
     # shellcheck disable=SC1090
     source "$UPDATE_ENV"
@@ -76,6 +77,16 @@ os.replace(tmp, path)
 PY
 }
 
+persist_update_branch() {
+    [[ "$PERSIST_UPDATE_BRANCH" == "1" ]] || return 0
+    local tmp
+    tmp="$(mktemp /etc/lghs/update.env.XXXXXX)" || return 1
+    if [[ -f "$UPDATE_ENV" ]]; then grep -v '^LGHS_UPDATE_BRANCH=' "$UPDATE_ENV" > "$tmp" || true; fi
+    printf 'LGHS_UPDATE_BRANCH=%s\n' "$BRANCH" >> "$tmp"
+    chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$UPDATE_ENV" || { rm -f "$tmp"; return 1; }
+}
+
 if [[ -n "$REQUESTED_TARGET_COMMIT" ]]; then
     write_status "checking" "Starting pinned LGHS update" 2 "Preparing exact commit ${REQUESTED_TARGET_COMMIT:0:12}"
 else
@@ -86,6 +97,26 @@ if ! flock -n 9; then
     write_status "busy" "Update already running" 0 "Another LGHS update process owns the lock"
     echo "Another LGHS update is already running."
     exit 0
+fi
+
+# Student software selection is controller-authoritative. A channel-only Fleet
+# command may persist metadata, but it must never resolve that channel to Git
+# HEAD. Unpinned branch updates require an explicit local-root recovery opt-in.
+if [[ "$ROLE" == "student" && -z "$REQUESTED_TARGET_COMMIT" ]]; then
+    if [[ "$PERSIST_UPDATE_BRANCH" == "1" && -n "$ENV_BRANCH" ]]; then
+        if ! persist_update_branch; then
+            write_status "failed" "Saving update channel failed" 100 "Could not persist branch $BRANCH"
+            exit 1
+        fi
+        write_status "complete" "Update channel saved" 100 "Channel $BRANCH saved; no software revision selected"
+        echo "LGHS student updater: channel saved as $BRANCH; no software revision selected."
+        exit 0
+    fi
+    if [[ "$ALLOW_BRANCH_UPDATE" != "1" ]]; then
+        write_status "complete" "Controller-managed updates" 100 "No exact commit authorized; branch-following disabled on students"
+        echo "LGHS student updater: no exact commit authorized; branch-following is disabled."
+        exit 0
+    fi
 fi
 
 queue_for_network() {
@@ -150,16 +181,6 @@ else
     TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/$BRANCH^{commit}")"
 fi
 write_status "preparing" "Comparing versions" 28 "Target ${TARGET_COMMIT:0:12}"
-
-persist_update_branch() {
-    [[ "$PERSIST_UPDATE_BRANCH" == "1" ]] || return 0
-    local tmp
-    tmp="$(mktemp /etc/lghs/update.env.XXXXXX)" || return 1
-    if [[ -f "$UPDATE_ENV" ]]; then grep -v '^LGHS_UPDATE_BRANCH=' "$UPDATE_ENV" > "$tmp" || true; fi
-    printf 'LGHS_UPDATE_BRANCH=%s\n' "$BRANCH" >> "$tmp"
-    chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$UPDATE_ENV" || { rm -f "$tmp"; return 1; }
-}
 
 if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
     git reset --hard "$TARGET_COMMIT" >/dev/null
