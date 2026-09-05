@@ -185,6 +185,16 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn("run(['/usr/sbin/userdel', name])", src)
         self.assertNotIn("run(['/usr/sbin/userdel', '-r', name])", src)
 
+    def test_remote_controller_runtime_is_read_only_and_fixed_scope(self):
+        ctl = (ROOT / "controller" / "lghsctl").read_text(encoding="utf-8")
+        shell = (ROOT / "controller" / "lghs-remote-shell").read_text(encoding="utf-8")
+        self.assertIn('def controller_runtime():', ctl)
+        self.assertIn("'lghs-fleet-api.service'", ctl)
+        self.assertIn("'InvocationID'", ctl)
+        self.assertIn("'NRestarts'", ctl)
+        self.assertIn("'controller-runtime'", shell)
+        self.assertNotIn("controller-runtime DEVICE", shell)
+
     def test_no_static_wifi_secret_in_repository_protocol(self):
         combined = "\n".join([
             (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8"),

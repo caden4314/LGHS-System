@@ -316,10 +316,61 @@ def show_fleet_logs(kind, lines):
     return p.returncode
 
 
+def controller_runtime():
+    try:
+        role = Path('/etc/lghs/role').read_text(encoding='utf-8').strip()
+    except Exception:
+        role = ''
+    if role != 'controller':
+        print('controller-runtime is only available on the LGHS controller', file=sys.stderr)
+        return 2
+    commit = 'unknown'
+    for path in (Path('/var/lib/lghs/update/current-commit'), Path('/etc/lghs/source-commit')):
+        try:
+            value = path.read_text(encoding='utf-8').strip()
+            if value:
+                commit = value
+                break
+        except Exception:
+            pass
+    print(f'controller_commit={commit}')
+    units = (
+        'lghs-fleet-api.service', 'lghs-fleet-notify.service',
+        'lghs-rollout-manager.service', 'lghs-bt-provision.service',
+        'lghs-update.service', 'lghs-reconcile.service',
+    )
+    properties = ('ActiveState', 'SubState', 'MainPID', 'NRestarts', 'InvocationID', 'ExecMainStartTimestamp')
+    print('UNIT                         ACTIVE     SUB          PID      RESTARTS  INVOCATION                           STARTED')
+    for unit in units:
+        cmd = ['systemctl', 'show', unit, '--no-pager']
+        for prop in properties:
+            cmd.extend(['-p', prop])
+        result = run(cmd)
+        values = {}
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                key, sep, value = line.partition('=')
+                if sep:
+                    values[key] = value
+        print(f"{unit:28} {values.get('ActiveState','?'):10} {values.get('SubState','?'):12} "
+              f"{values.get('MainPID','?'):8} {values.get('NRestarts','?'):9} "
+              f"{values.get('InvocationID','?')[:36]:36} {values.get('ExecMainStartTimestamp','?')}")
+    for timer in ('lghs-update.timer', 'lghs-reconcile.timer'):
+        result = run(['systemctl', 'show', timer, '--no-pager', '-p', 'LastTriggerUSec', '-p', 'NextElapseUSecRealtime'])
+        values = {}
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                key, sep, value = line.partition('=')
+                if sep:
+                    values[key] = value
+        print(f"{timer}: last={values.get('LastTriggerUSec','?')} next={values.get('NextElapseUSecRealtime','?')}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="lghsctl", description="LGHS encrypted classroom fleet controller")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("discover", "status", "versions", "services", "update-state", "audit-sync"):
+    for name in ("discover", "status", "versions", "services", "update-state", "audit-sync", "controller-runtime"):
         sub.add_parser(name)
     p = sub.add_parser("enroll"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true")
     p = sub.add_parser("info"); p.add_argument("target")
@@ -342,6 +393,7 @@ def main():
     if args.cmd == "services": return fleet_dump("services")
     if args.cmd == "update-state": return fleet_dump("update-state")
     if args.cmd == "audit-sync": return subprocess.call(["sudo", "-n", "/usr/local/sbin/lghs-audit-sync"])
+    if args.cmd == "controller-runtime": return controller_runtime()
     if args.cmd == "fleet-logs": return show_fleet_logs(args.kind, args.lines)
     if args.cmd == "enroll": return enroll_all(targets_all() if args.all or not args.target else [args.target])
     if args.cmd == "info": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-report summary")

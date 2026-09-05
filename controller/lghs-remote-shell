@@ -25,7 +25,7 @@ def valid_request(value):
 def usage():
     print('''LGHS remote management commands:
   console
-  status | versions | services | update-state
+  status | versions | services | update-state | controller-runtime
   info DEVICE
   update DEVICE | os-update DEVICE
   check DEVICE | enforce DEVICE | reboot DEVICE
@@ -57,7 +57,7 @@ def main():
         usage(); return 0
     if action == 'console' and len(argv) == 1:
         return run(['/usr/local/sbin/lghs-console'], replace=True)
-    if action in ('status', 'versions', 'services', 'update-state') and len(argv) == 1:
+    if action in ('status', 'versions', 'services', 'update-state', 'controller-runtime') and len(argv) == 1:
         return run(['/usr/local/sbin/lghsctl', action])
     if action == 'update-controller' and len(argv) == 1:
         return run(['/usr/local/sbin/lghs-update'])

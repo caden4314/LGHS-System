@@ -110,6 +110,9 @@ jobs:
           grep -q 'AuthenticationMethods publickey' controller/install-remote-admin
           grep -q 'no-port-forwarding' controller/lghs-remote-admin
           grep -q 'sudo-approve' controller/lghs-remote-shell
+          grep -q 'controller-runtime' controller/lghs-remote-shell
+          grep -q 'def controller_runtime' controller/lghsctl
+          grep -q "'InvocationID'" controller/lghsctl
           grep -q 'lghs-sudo-selftest' install.sh
           grep -q 'lghs-legacy-identity-cleanup --remove-safe' install.sh
           grep -q "LEGACY_ADMIN = 'cs' + '_admin'" student/lghs-legacy-identity-cleanup
