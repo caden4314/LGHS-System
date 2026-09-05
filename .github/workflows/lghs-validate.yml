@@ -194,8 +194,9 @@ jobs:
       - name: SQLite foundation invariants
         run: |
           grep -q 'journal_mode=WAL' controller/lghs/database.py
-          grep -q 'SCHEMA_VERSION = 3' controller/lghs/database.py
+          grep -q 'SCHEMA_VERSION = 4' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS device_tags' controller/lghs/database.py
+          grep -q 'CREATE TABLE IF NOT EXISTS device_lifecycle' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS fleet_groups' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS group_members' controller/lghs/database.py
           grep -q 'CREATE TABLE IF NOT EXISTS commands' controller/lghs/database.py
