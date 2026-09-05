@@ -224,6 +224,19 @@ def controller_transport_state() -> dict[str, Any]:
     }
 
 
+def root_filesystem_readonly(mountinfo: Path = Path('/proc/1/mountinfo')) -> bool:
+    """Measure the host root mount, not this service sandbox mount namespace."""
+    try:
+        for line in mountinfo.read_text(encoding='utf-8').splitlines():
+            fields = line.split()
+            if len(fields) >= 6 and fields[4] == '/':
+                return 'rw' not in fields[5].split(',')
+    except Exception:
+        pass
+    stat = os.statvfs('/')
+    return bool(stat.f_flag & getattr(os, 'ST_RDONLY', 1))
+
+
 def metrics() -> dict[str, Any]:
     mem: dict[str, int] = {}
     for line in Path('/proc/meminfo').read_text().splitlines():
@@ -236,7 +249,7 @@ def metrics() -> dict[str, Any]:
     free = stat.f_bavail * stat.f_frsize
     inode_total = stat.f_files
     inode_free = stat.f_favail
-    root_readonly = bool(stat.f_flag & getattr(os, 'ST_RDONLY', 1))
+    root_readonly = root_filesystem_readonly()
     try:
         temp = round(int(Path('/sys/class/thermal/thermal_zone0/temp').read_text()) / 1000, 1)
     except Exception:
