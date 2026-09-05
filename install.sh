@@ -78,6 +78,7 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0644 "$ROOT_DIR/controller/lghs/rollout_manager.py" /usr/local/lib/lghs-python/lghs/rollout_manager.py
   install -m 0644 "$ROOT_DIR/controller/lghs/recovery.py" /usr/local/lib/lghs-python/lghs/recovery.py
   install -m 0644 "$ROOT_DIR/controller/lghs/maintenance.py" /usr/local/lib/lghs-python/lghs/maintenance.py
+  install -m 0644 "$ROOT_DIR/controller/lghs/release.py" /usr/local/lib/lghs-python/lghs/release.py
   install -m 0755 "$ROOT_DIR/controller/lghsctl" /usr/local/libexec/lghsctl-real
   install -m 0755 "$ROOT_DIR/controller/lghsctl-wrapper" /usr/local/sbin/lghsctl
   install -m 0755 "$ROOT_DIR/controller/lghs-console" /usr/local/libexec/lghs-console-legacy
@@ -88,6 +89,7 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghs-console-day4" /usr/local/libexec/lghs-console-day4-core
   install -m 0755 "$ROOT_DIR/controller/lghs-console-day5" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
+  install -m 0750 "$ROOT_DIR/controller/lghs-release" /usr/local/sbin/lghs-release
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-notify" /usr/local/sbin/lghs-fleet-notify
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
   install -m 0755 "$ROOT_DIR/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
@@ -191,6 +193,8 @@ else
     python3 "$ROOT_DIR/updater/patch-agent-status-guard.py" /usr/local/sbin/lghs-agent
   fi
   install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
+  install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-release-verify" /usr/local/sbin/lghs-release-verify
+  install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-release-key-install" /usr/local/sbin/lghs-release-key-install
   install -o root -g root -m 0755 "$ROOT_DIR/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
   install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-network-ui-apply" /usr/local/sbin/lghs-network-ui-apply

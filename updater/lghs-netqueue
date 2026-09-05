@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Persistent, idempotent LGHS offline job queue."""
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -20,6 +21,32 @@ MAX_BACKOFF = 900
 IDEMPOTENCY_LIMIT = 2048
 COMMIT_RE = re.compile(r'^[0-9a-fA-F]{40}$')
 IDEMPOTENCY_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$')
+
+
+def normalize_release_blob(value, label, *, expected_bytes=None, max_bytes=4096):
+    text = str(value or '').strip()
+    if not text:
+        raise ValueError(f'{label} is required')
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except Exception as exc:
+        raise ValueError(f'invalid {label} base64') from exc
+    if expected_bytes is not None and len(raw) != expected_bytes:
+        raise ValueError(f'{label} has invalid length')
+    if not raw or len(raw) > max_bytes:
+        raise ValueError(f'{label} is too large')
+    return text
+
+
+def validate_release_pair(params):
+    manifest = params.get('release_manifest_b64')
+    signature = params.get('release_signature_b64')
+    if bool(manifest) != bool(signature):
+        raise ValueError('release manifest and signature must be supplied together')
+    if manifest:
+        normalize_release_blob(manifest, 'release manifest', max_bytes=4096)
+        normalize_release_blob(signature, 'release signature', expected_bytes=64, max_bytes=64)
+
 
 ALLOWED_FLEET_ACTIONS = {
     'update': ['update'],
@@ -261,6 +288,7 @@ def command_for(job):
             normalize_commit(target)
         if params.get('target_channel'):
             normalize_channel(params['target_channel'])
+        validate_release_pair(params)
         return ['/usr/local/sbin/lghs-update']
     if kind == 'os-update':
         return ['/usr/local/sbin/lghs-os-update']
@@ -282,6 +310,12 @@ def run_job(job):
     if job.get('kind') == 'local-update' and job.get('params', {}).get('target_channel'):
         env['LGHS_UPDATE_BRANCH'] = normalize_channel(job['params']['target_channel'])
         env['LGHS_PERSIST_UPDATE_BRANCH'] = '1'
+    if job.get('kind') == 'local-update':
+        params = job.get('params', {})
+        validate_release_pair(params)
+        if params.get('release_manifest_b64'):
+            env['LGHS_RELEASE_MANIFEST_B64'] = str(params['release_manifest_b64'])
+            env['LGHS_RELEASE_SIGNATURE_B64'] = str(params['release_signature_b64'])
     if job.get('idempotency_key'):
         env['LGHS_IDEMPOTENCY_KEY'] = str(job['idempotency_key'])
     try:
@@ -453,6 +487,8 @@ def main():
     enqueue_parser.add_argument('action', nargs='?')
     enqueue_parser.add_argument('--commit')
     enqueue_parser.add_argument('--channel')
+    enqueue_parser.add_argument('--release-manifest-b64')
+    enqueue_parser.add_argument('--release-signature-b64')
     enqueue_parser.add_argument('--reboot', action='store_true')
     enqueue_parser.add_argument('--idempotency-key')
 
@@ -476,21 +512,25 @@ def main():
     try:
         if args.kind == 'local-update':
             if args.target or args.action or args.reboot:
-                raise ValueError('local-update usage: lghs-netqueue enqueue local-update [--commit SHA] [--channel BRANCH] [--idempotency-key KEY]')
+                raise ValueError('local-update usage: lghs-netqueue enqueue local-update [--commit SHA] [--channel BRANCH] [--release-manifest-b64 B64 --release-signature-b64 B64] [--idempotency-key KEY]')
             params = {}
             if args.commit:
                 params['target_commit'] = normalize_commit(args.commit)
             if args.channel:
                 params['target_channel'] = normalize_channel(args.channel)
+            if args.release_manifest_b64 or args.release_signature_b64:
+                params['release_manifest_b64'] = normalize_release_blob(args.release_manifest_b64, 'release manifest', max_bytes=4096)
+                params['release_signature_b64'] = normalize_release_blob(args.release_signature_b64, 'release signature', expected_bytes=64, max_bytes=64)
+                validate_release_pair(params)
             enqueue('local-update', params, args.idempotency_key)
             return 0
         if args.kind == 'os-update':
-            if args.target or args.action or args.commit or args.channel:
+            if args.target or args.action or args.commit or args.channel or args.release_manifest_b64 or args.release_signature_b64:
                 raise ValueError('os-update usage: lghs-netqueue enqueue os-update [--reboot] [--idempotency-key KEY]')
             enqueue('os-update', {'reboot': bool(args.reboot)}, args.idempotency_key)
             return 0
         if args.kind == 'fleet':
-            if not args.target or not args.action or args.commit or args.channel or args.reboot:
+            if not args.target or not args.action or args.commit or args.channel or args.release_manifest_b64 or args.release_signature_b64 or args.reboot:
                 raise ValueError('fleet queue usage: lghs-netqueue enqueue fleet TARGET ACTION [--idempotency-key KEY]')
             if args.action not in ALLOWED_FLEET_ACTIONS:
                 raise ValueError('unsupported queued fleet action')

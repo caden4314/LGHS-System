@@ -21,12 +21,19 @@ jobs:
             controller/lghsctl \
             controller/lghs-fleet-api \
             controller/lghs-fleet-command \
+            controller/lghs/release.py \
+            controller/lghs-release \
             controller/lghs-bt-provision \
             bluetooth/lghs_bt_protocol.py \
             student/lghs-agent \
             student/lghs-command-executor \
+            student/lghs-release-verify \
+            student/lghs-release-key-install \
             student/lghs-bt-bootstrap \
             student/lghs-legacy-identity-cleanup \
-            tests/test_bt_bootstrap.py
+            tests/test_bt_bootstrap.py \
+            tests/test_release_signing.py
       - name: Bluetooth bootstrap tests
         run: python3 -m unittest -v tests/test_bt_bootstrap.py
+      - name: Signed release tests
+        run: python3 -m unittest -v tests/test_release_signing.py

@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Install the one-time LGHS release-verification public key."""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import os
+from pathlib import Path
+
+TARGET = Path('/etc/lghs/release-public-key')
+
+
+def validate(value: str) -> tuple[str, bytes]:
+    text = str(value or '').strip()
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except Exception as exc:
+        raise ValueError('invalid Ed25519 public key encoding') from exc
+    if len(raw) != 32:
+        raise ValueError('Ed25519 public key must be exactly 32 bytes')
+    return base64.b64encode(raw).decode('ascii'), raw
+
+
+def install(value: str) -> str:
+    canonical, raw = validate(value)
+    if TARGET.exists():
+        existing, _ = validate(TARGET.read_text(encoding='utf-8'))
+        if existing != canonical:
+            raise ValueError('release public key is already enrolled; rotation requires local root recovery')
+        return hashlib.sha256(raw).hexdigest()
+    TARGET.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TARGET.with_name('.' + TARGET.name + '.tmp')
+    with tmp.open('w', encoding='utf-8') as handle:
+        handle.write(canonical + '\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, TARGET)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        raise SystemExit('Run as root')
+    parser = argparse.ArgumentParser(description='Install LGHS release verification key')
+    parser.add_argument('--key-b64', required=True)
+    args = parser.parse_args()
+    try:
+        fingerprint = install(args.key_b64)
+    except Exception as exc:
+        print(f'LGHS release key install failed: {exc}', file=os.sys.stderr)
+        return 65
+    print(f'fingerprint_sha256={fingerprint}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
