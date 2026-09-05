@@ -159,6 +159,18 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertNotIn("releases/latest/download", src)
         self.assertIn("--token-file /etc/cloudflared/token", src)
 
+    def test_legacy_cleanup_survives_stock_identity_filter(self):
+        src = (ROOT / "student" / "lghs-legacy-identity-cleanup").read_text(encoding="utf-8")
+        install = (ROOT / "install.sh").read_text(encoding="utf-8")
+        check = (ROOT / "student" / "lghs-check").read_text(encoding="utf-8")
+        self.assertIn("LEGACY_ADMIN = 'cs' + '_admin'", src)
+        self.assertIn("LEGACY_STUDENT = 'lg' + '_cs' + '_cont'", src)
+        self.assertNotIn("LEGACY_ADMIN = 'cs_admin'", src)
+        self.assertNotIn("LEGACY_STUDENT = 'lg_cs_cont'", src)
+        self.assertIn("lghs-legacy-identity-cleanup --remove-safe", install)
+        self.assertIn('LEGACY_ADMIN="cs""_admin"', check)
+        self.assertIn('LEGACY_STUDENT="lg""_cs""_cont"', check)
+
     def test_no_static_wifi_secret_in_repository_protocol(self):
         combined = "\n".join([
             (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8"),

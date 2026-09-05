@@ -195,6 +195,7 @@ else
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-local-exec" /usr/local/sbin/lghs-local-exec
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-selftest" /usr/local/sbin/lghs-sudo-selftest
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-legacy-identity-cleanup" /usr/local/sbin/lghs-legacy-identity-cleanup
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-cloudflare-install" /usr/local/sbin/lghs-cloudflare-install
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-telemetry-configure" /usr/local/sbin/lghs-telemetry-configure
@@ -284,6 +285,9 @@ fi
 systemctl enable lghs-install-success-notify.service
 systemctl start --no-block lghs-install-success-notify.service >/dev/null 2>&1 || true
 /usr/local/sbin/lghs-access-enforce
+if [[ "$ROLE" == "student" ]]; then
+  /usr/local/sbin/lghs-legacy-identity-cleanup --remove-safe || true
+fi
 if systemctl is-system-running --quiet 2>/dev/null || systemctl is-system-running 2>/dev/null | grep -Eq 'running|degraded'; then
   systemctl try-restart avahi-daemon.service || true
   systemctl start --no-block lghs-netqueue.service >/dev/null 2>&1 || true

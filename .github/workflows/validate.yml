@@ -26,6 +26,7 @@ jobs:
             student/lghs-agent \
             student/lghs-command-executor \
             student/lghs-bt-bootstrap \
+            student/lghs-legacy-identity-cleanup \
             tests/test_bt_bootstrap.py
       - name: Bluetooth bootstrap tests
         run: python3 -m unittest -v tests/test_bt_bootstrap.py

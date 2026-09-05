@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+import argparse
+import grp
+import os
+import pwd
+import re
+import subprocess
+from pathlib import Path
+
+ROLE = Path('/etc/lghs/role')
+STUDENT_FILE = Path('/etc/lghs/student-user')
+ADMIN_FILE = Path('/etc/lghs/admin-user')
+LEGACY_ADMIN = 'cs' + '_admin'
+LEGACY_STUDENT = 'lg' + '_cs' + '_cont'
+CANDIDATES = (LEGACY_ADMIN, LEGACY_STUDENT)
+SAFE_SHELLS = {'/usr/sbin/nologin', '/bin/false', '/usr/bin/false'}
+ACTIVE_CONFIG = (
+    '/etc/sudoers', '/etc/sudoers.d', '/etc/ssh', '/etc/lghs',
+    '/etc/systemd/system', '/etc/NetworkManager',
+)
+
+
+def read_text(path, fallback=''):
+    try:
+        value = Path(path).read_text(encoding='utf-8').strip()
+        return value or fallback
+    except Exception:
+        return fallback
+
+
+def run(args):
+    return subprocess.run(args, text=True, capture_output=True)
+
+
+def config_references(name):
+    pattern = rf'(^|[^A-Za-z0-9_-]){re.escape(name)}([^A-Za-z0-9_-]|$)'
+    refs = []
+    for target in ACTIVE_CONFIG:
+        if not Path(target).exists():
+            continue
+        p = run(['grep', '-RIlE', '--binary-files=without-match', pattern, target])
+        if p.returncode == 0:
+            refs.extend(line for line in p.stdout.splitlines() if line)
+    return sorted(set(refs))
+
+
+def supplementary_groups(name, primary_gid):
+    out = []
+    for entry in grp.getgrall():
+        if name in entry.gr_mem and entry.gr_gid != primary_gid:
+            out.append(entry.gr_name)
+    return sorted(set(out))
+
+
+def owned_outside_home(entry):
+    home = entry.pw_dir or f'/home/{entry.pw_name}'
+    p = run(['find', '/', '-xdev', '-uid', str(entry.pw_uid),
+             '-not', '-path', home, '-not', '-path', home + '/*',
+             '-print', '-quit'])
+    return p.stdout.strip()
+
+
+def safety_reasons(entry):
+    name = entry.pw_name
+    reasons = []
+    if entry.pw_shell not in SAFE_SHELLS:
+        reasons.append(f'login-shell={entry.pw_shell}')
+    groups = supplementary_groups(name, entry.pw_gid)
+    if groups:
+        reasons.append('supplementary-groups=' + ','.join(groups))
+    if run(['pgrep', '-u', str(entry.pw_uid)]).returncode == 0:
+        reasons.append('running-processes')
+    key = Path('/etc/ssh/authorized_keys') / name
+    if key.exists() and key.stat().st_size:
+        reasons.append(f'authorized-key={key}')
+    refs = config_references(name)
+    refs = [p for p in refs if p not in {str(STUDENT_FILE), str(ADMIN_FILE)}]
+    if refs:
+        reasons.append('config-references=' + ','.join(refs[:5]))
+    owned = owned_outside_home(entry)
+    if owned:
+        reasons.append('owned-file=' + owned)
+    home = Path(entry.pw_dir or f'/home/{name}')
+    if home.exists():
+        try:
+            if any(home.iterdir()):
+                reasons.append(f'nonempty-home={home}')
+        except OSError as exc:
+            reasons.append(f'home-unreadable={exc}')
+    return reasons
+
+
+def remove_identity(entry):
+    name = entry.pw_name
+    key = Path('/etc/ssh/authorized_keys') / name
+    if key.exists() and key.stat().st_size == 0:
+        key.unlink()
+    p = run(['/usr/sbin/userdel', '-r', name])
+    if p.returncode != 0:
+        detail = (p.stderr or p.stdout).strip()
+        raise RuntimeError(detail or f'userdel failed rc={p.returncode}')
+    try:
+        group = grp.getgrnam(name)
+    except KeyError:
+        return
+    if group.gr_gid == entry.pw_gid and not group.gr_mem:
+        p = run(['/usr/sbin/groupdel', name])
+        if p.returncode != 0:
+            detail = (p.stderr or p.stdout).strip()
+            raise RuntimeError(detail or f'groupdel failed rc={p.returncode}')
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Safely remove inert legacy LGHS student identities')
+    ap.add_argument('--remove-safe', action='store_true', help='remove identities that pass every safety gate')
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        raise SystemExit('Run as root')
+    if read_text(ROLE) != 'student':
+        print('SKIP role is not student')
+        return 0
+    student = read_text(STUDENT_FILE, LEGACY_STUDENT)
+    admin = read_text(ADMIN_FILE, LEGACY_ADMIN)
+    blocked = 0
+    for name in CANDIDATES:
+        if name in {student, admin}:
+            print(f'SKIP {name}: current identity')
+            continue
+        try:
+            entry = pwd.getpwnam(name)
+        except KeyError:
+            print(f'ABSENT {name}')
+            continue
+        reasons = safety_reasons(entry)
+        if reasons:
+            blocked += 1
+            print(f'BLOCKED {name}: ' + '; '.join(reasons))
+            continue
+        if not args.remove_safe:
+            print(f'SAFE {name}: eligible for removal')
+            continue
+        try:
+            remove_identity(entry)
+        except Exception as exc:
+            blocked += 1
+            print(f'BLOCKED {name}: removal-failed={exc}')
+            continue
+        print(f'REMOVED {name}')
+    return 2 if blocked else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

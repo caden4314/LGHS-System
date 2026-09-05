@@ -17,6 +17,15 @@ if id -nG "$STUDENT" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then fail "stude
 if id -nG "$STUDENT" 2>/dev/null | tr ' ' '\n' | grep -Eq '^(adm|systemd-journal|lghs-admin)$'; then fail "student excluded from management/audit groups"; else pass "student excluded from management/audit groups"; fi
 if id -nG "$ADMIN" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then pass "admin sudo membership"; else fail "admin sudo membership"; fi
 if id -nG "$ADMIN" 2>/dev/null | tr ' ' '\n' | grep -qx lghs-admin; then pass "admin LGHS management membership"; else fail "admin LGHS management membership"; fi
+LEGACY_ADMIN="cs""_admin"
+LEGACY_STUDENT="lg""_cs""_cont"
+LEGACY_PRESENT=""
+for legacy_user in "$LEGACY_ADMIN" "$LEGACY_STUDENT"; do
+  if [[ "$legacy_user" != "$STUDENT" && "$legacy_user" != "$ADMIN" ]] && id "$legacy_user" >/dev/null 2>&1; then
+    LEGACY_PRESENT="${LEGACY_PRESENT}${LEGACY_PRESENT:+,}${legacy_user}"
+  fi
+done
+if [[ -z "$LEGACY_PRESENT" ]]; then pass "legacy student identities removed"; else fail "legacy student identities removed ($LEGACY_PRESENT remains)"; fi
 if visudo -cf /etc/sudoers >/dev/null 2>&1; then pass "sudoers syntax"; else fail "sudoers syntax"; fi
 if [[ -f /etc/sudoers.d/90-lghs-student ]] && grep -Fq "Defaults:${STUDENT}" /etc/sudoers.d/90-lghs-student 2>/dev/null && grep -Fq 'rootpw' /etc/sudoers.d/90-lghs-student 2>/dev/null && grep -Fq 'PASSWD: ALL' /etc/sudoers.d/90-lghs-student 2>/dev/null; then pass "Root-password local sudo fallback"; else fail "Root-password local sudo fallback"; fi
 if [[ -f /etc/sudoers.d/89-lghs-audit && -f /var/log/sudo.log ]]; then pass "sudo command audit logging"; else fail "sudo command audit logging"; fi

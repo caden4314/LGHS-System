@@ -41,6 +41,7 @@ jobs:
             student/lghs-agent \
             student/lghs-command-executor \
             student/lghs-bt-bootstrap \
+            student/lghs-legacy-identity-cleanup \
             student/lghs-telemetry-push \
             student/lghs-sudo-broker \
             student/lghs-approved-exec \
@@ -110,6 +111,11 @@ jobs:
           grep -q 'no-port-forwarding' controller/lghs-remote-admin
           grep -q 'sudo-approve' controller/lghs-remote-shell
           grep -q 'lghs-sudo-selftest' install.sh
+          grep -q 'lghs-legacy-identity-cleanup --remove-safe' install.sh
+          grep -q "LEGACY_ADMIN = 'cs' + '_admin'" student/lghs-legacy-identity-cleanup
+          grep -q "LEGACY_STUDENT = 'lg' + '_cs' + '_cont'" student/lghs-legacy-identity-cleanup
+          grep -q 'owned_outside_home' student/lghs-legacy-identity-cleanup
+          grep -q 'supplementary_groups' student/lghs-legacy-identity-cleanup
 
       - name: Legacy telemetry rollback invariants
         run: |
