@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+import json
+import os
+import pwd
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path('/var/lib/lghs/sudo-selftest')
+STATE_FILE = STATE_DIR / 'state.json'
+LOG_FILE = STATE_DIR / 'last.log'
+REQUEST_DIR = Path('/var/lib/lghs/sudo-requests')
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise SystemExit('Run through sudo.')
+
+
+def student_user():
+    try:
+        value = Path('/etc/lghs/student-user').read_text(encoding='utf-8').strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return 'lg_cs_cont'
+
+
+def process_running(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def read_state():
+    try:
+        return json.loads(STATE_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def request_ids():
+    REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    return {path.stem for path in REQUEST_DIR.glob('*.json')}
+
+
+def request_data(rid):
+    try:
+        return json.loads((REQUEST_DIR / f'{rid}.json').read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def start_test():
+    current = read_state()
+    if current and process_running(current.get('pid')):
+        raise SystemExit(f"Self-test already running for request {current.get('request_id', '?')}")
+
+    student = student_user()
+    account = pwd.getpwnam(student)
+    before = request_ids()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    log = LOG_FILE.open('w', encoding='utf-8')
+    cmd = [
+        '/usr/sbin/runuser', '-u', student, '--', '/usr/bin/env',
+        f'USER={student}', f'LOGNAME={student}', f'HOME={account.pw_dir}',
+        'PATH=/usr/local/bin:/usr/bin:/bin', '/usr/local/bin/sudo', '/usr/bin/id'
+    ]
+    child = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        text=True,
+    )
+    log.close()
+
+    rid = None
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        new_ids = request_ids() - before
+        candidates = []
+        for item in new_ids:
+            data = request_data(item)
+            if data.get('requester') == student and data.get('argv') == ['/usr/bin/id']:
+                candidates.append((float(data.get('requested_epoch', 0)), item))
+        if candidates:
+            rid = max(candidates)[1]
+            break
+        if child.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    if not rid:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGTERM)
+        detail = LOG_FILE.read_text(encoding='utf-8', errors='replace') if LOG_FILE.exists() else ''
+        raise SystemExit('Managed sudo self-test did not create a request.\n' + detail)
+
+    state = {'pid': child.pid, 'request_id': rid, 'student': student, 'started_at': time.time()}
+    STATE_FILE.write_text(json.dumps(state, separators=(',', ':')) + '\n', encoding='utf-8')
+    os.chmod(STATE_FILE, 0o600)
+    print(json.dumps({'ok': True, **state}, separators=(',', ':')))
+
+
+def show_status():
+    state = read_state()
+    if not state:
+        print(json.dumps({'ok': True, 'running': False, 'request_id': None, 'request_status': 'none', 'log': ''}, separators=(',', ':')))
+        return
+    rid = str(state.get('request_id') or '')
+    data = request_data(rid) if rid else {}
+    log = LOG_FILE.read_text(encoding='utf-8', errors='replace') if LOG_FILE.exists() else ''
+    print(json.dumps({
+        'ok': True,
+        'running': process_running(state.get('pid')),
+        'pid': state.get('pid'),
+        'request_id': rid or None,
+        'request_status': data.get('status', 'unknown'),
+        'command': data.get('command'),
+        'log': log[-4096:],
+    }, separators=(',', ':')))
+
+
+def cleanup():
+    state = read_state()
+    pid = state.get('pid') if state else None
+    if process_running(pid):
+        try:
+            os.killpg(int(pid), signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        STATE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    print(json.dumps({'ok': True, 'cleaned': True}, separators=(',', ':')))
+
+
+def main():
+    require_root()
+    action = sys.argv[1] if len(sys.argv) > 1 else 'status'
+    if action == 'start':
+        start_test()
+    elif action == 'status':
+        show_status()
+    elif action == 'cleanup':
+        cleanup()
+    else:
+        raise SystemExit('Usage: lghs-sudo-selftest {start|status|cleanup}')
+
+
+if __name__ == '__main__':
+    main()

@@ -101,6 +101,10 @@ def target_meta(target):
     return {'device': target, 'host': target, 'cloudflare': False, 'transport': 'direct'}
 
 
+def valid_request_id(value):
+    return len(value) == 24 and all(ch in '0123456789abcdefABCDEF' for ch in value)
+
+
 def ssh_base(target, batch=True):
     ensure_dirs()
     meta = target_meta(target)
@@ -323,8 +327,10 @@ def main():
     p = sub.add_parser("fleet-logs"); p.add_argument("kind", choices=["sudo","audit","update","os-update"]); p.add_argument("--lines", type=int, default=100)
     p = sub.add_parser("update"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true")
     p = sub.add_parser("os-update"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true"); p.add_argument("--reboot", action="store_true")
-    for name in ("check", "enforce", "reboot", "ssh"):
+    for name in ("check", "enforce", "reboot", "ssh", "sudo-list", "sudo-test", "sudo-test-status"):
         p = sub.add_parser(name); p.add_argument("target")
+    for name in ("sudo-approve", "sudo-deny"):
+        p = sub.add_parser(name); p.add_argument("target"); p.add_argument("request_id")
     args = ap.parse_args()
 
     if args.cmd == "discover":
@@ -340,6 +346,14 @@ def main():
     if args.cmd == "enroll": return enroll_all(targets_all() if args.all or not args.target else [args.target])
     if args.cmd == "info": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-report summary")
     if args.cmd == "logs": return ssh_cmd(args.target, f"sudo -n /usr/local/sbin/lghs-report logs {args.group}")
+    if args.cmd == "sudo-list": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-sudo-admin list --json")
+    if args.cmd == "sudo-test": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-sudo-selftest start")
+    if args.cmd == "sudo-test-status": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-sudo-selftest status")
+    if args.cmd in ("sudo-approve", "sudo-deny"):
+        if not valid_request_id(args.request_id):
+            print("Invalid sudo request ID", file=sys.stderr); return 2
+        action = "approve" if args.cmd == "sudo-approve" else "deny"
+        return ssh_cmd(args.target, f"sudo -n /usr/local/sbin/lghs-sudo-admin {action} {args.request_id.lower()}")
     if args.cmd == "update":
         return queue_https_commands(targets_all() if args.all or not args.target else [args.target], "lghs-update", "LGHS UPDATE")
     if args.cmd == "os-update":

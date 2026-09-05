@@ -106,6 +106,7 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0644 "$ROOT_DIR/systemd/lghs-rollout-manager.service" /etc/systemd/system/lghs-rollout-manager.service
   install -m 0750 "$ROOT_DIR/controller/lghs-bt-provision" /usr/local/sbin/lghs-bt-provision
   install -m 0644 "$ROOT_DIR/systemd/lghs-bt-provision.service" /etc/systemd/system/lghs-bt-provision.service
+  install -m 0755 "$ROOT_DIR/controller/install-remote-admin" /usr/local/sbin/lghs-install-remote-admin
 
   # Raw RFCOMM sockets are not automatically published in BlueZ SDP. The
   # controller uses the compatibility SDP interface only to advertise the
@@ -155,18 +156,22 @@ EOF
   /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
   chmod 0640 /var/lib/lghs/db-migration-last.json
 
-  # Older Fleet Web preview installs used a PathExists watcher to mirror
-  # fleet-cache.json. The current gateway reads the local Fleet API directly,
-  # so that bridge is obsolete and can enter a systemd start-limit loop.
-  if [[ -e /etc/systemd/system/lghs-fleet-web-cache-sync.path || -e /etc/systemd/system/lghs-fleet-web-cache-sync.service ]]; then
-    systemctl disable --now lghs-fleet-web-cache-sync.path >/dev/null 2>&1 || true
-    systemctl stop lghs-fleet-web-cache-sync.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/lghs-fleet-web-cache-sync.path \
-          /etc/systemd/system/lghs-fleet-web-cache-sync.service \
-          /usr/local/sbin/lghs-fleet-web-cache-sync
-    systemctl daemon-reload
-    systemctl reset-failed lghs-fleet-web-cache-sync.path lghs-fleet-web-cache-sync.service >/dev/null 2>&1 || true
-  fi
+  # The Fleet Web UI is intentionally shelved. Preserve its application/config
+  # files for possible future work, but remove all live systemd entrypoints so
+  # it consumes no controller resources and cannot reappear after reboot.
+  for unit in lghs-fleet-web-cloudflared.service lghs-fleet-web.service lghs-fleet-web-ops.service lghs-fleet-web-cache-sync.path lghs-fleet-web-cache-sync.service; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done
+  rm -f /etc/systemd/system/lghs-fleet-web-cloudflared.service \
+        /etc/systemd/system/lghs-fleet-web.service \
+        /etc/systemd/system/lghs-fleet-web-ops.service \
+        /etc/systemd/system/lghs-fleet-web-cache-sync.path \
+        /etc/systemd/system/lghs-fleet-web-cache-sync.service \
+        /usr/local/sbin/lghs-fleet-web-cache-sync
+  systemctl daemon-reload
+  systemctl reset-failed >/dev/null 2>&1 || true
+
+  /bin/bash "$ROOT_DIR/controller/install-remote-admin"
 else
   rm -f /etc/systemd/system/bluetooth.service.d/50-lghs-sdp-compat.conf
   getent group lghs-agent >/dev/null 2>&1 || groupadd --system lghs-agent
@@ -189,6 +194,7 @@ else
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-approved-exec" /usr/local/sbin/lghs-approved-exec
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-local-exec" /usr/local/sbin/lghs-local-exec
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-admin" /usr/local/sbin/lghs-sudo-admin
+  install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-sudo-selftest" /usr/local/sbin/lghs-sudo-selftest
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-audit-export" /usr/local/sbin/lghs-audit-export
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-cloudflare-install" /usr/local/sbin/lghs-cloudflare-install
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-telemetry-configure" /usr/local/sbin/lghs-telemetry-configure

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+import os
+import shlex
+import sys
+
+SUDO = ['sudo', '-n']
+HEX = set('0123456789abcdefABCDEF')
+
+
+def run(args, replace=False):
+    cmd = SUDO + args
+    if replace:
+        os.execvp(cmd[0], cmd)
+    return os.spawnvp(os.P_WAIT, cmd[0], cmd)
+
+
+def valid_device(value):
+    return bool(value) and len(value) <= 64 and all(ch.isalnum() or ch in '-_' for ch in value)
+
+
+def valid_request(value):
+    return len(value) == 24 and all(ch in HEX for ch in value)
+
+
+def usage():
+    print('''LGHS remote management commands:
+  console
+  status | versions | services | update-state
+  info DEVICE
+  update DEVICE | os-update DEVICE
+  check DEVICE | enforce DEVICE | reboot DEVICE
+  logs DEVICE [GROUP]
+  ssh DEVICE
+  sudo-list DEVICE
+  sudo-approve DEVICE REQUEST_ID
+  sudo-deny DEVICE REQUEST_ID
+  sudo-test DEVICE | sudo-test-status DEVICE
+  update-controller
+  help
+''')
+
+
+def main():
+    original = os.environ.get('SSH_ORIGINAL_COMMAND', '').strip()
+    if not original:
+        return run(['/usr/local/sbin/lghs-console'], replace=True)
+    try:
+        argv = shlex.split(original)
+    except ValueError:
+        print('Invalid LGHS remote command', file=sys.stderr)
+        return 2
+    if not argv:
+        return run(['/usr/local/sbin/lghs-console'], replace=True)
+
+    action = argv[0].lower()
+    if action in ('help', '-h', '--help') and len(argv) == 1:
+        usage(); return 0
+    if action == 'console' and len(argv) == 1:
+        return run(['/usr/local/sbin/lghs-console'], replace=True)
+    if action in ('status', 'versions', 'services', 'update-state') and len(argv) == 1:
+        return run(['/usr/local/sbin/lghsctl', action])
+    if action == 'update-controller' and len(argv) == 1:
+        return run(['/usr/local/sbin/lghs-update'])
+
+    if action == 'info' and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghsctl', 'info', argv[1].upper()])
+    if action in ('update', 'os-update', 'check', 'enforce', 'reboot') and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghsctl', action, argv[1].upper()])
+    if action == 'ssh' and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghsctl', 'ssh', argv[1].upper()], replace=True)
+
+    if action == 'logs' and len(argv) in (2, 3) and valid_device(argv[1]):
+        group = argv[2] if len(argv) == 3 else 'all'
+        if group not in {'all','update','os-update','netqueue','agent','policy','sudo'}:
+            print('Invalid log group', file=sys.stderr); return 2
+        return run(['/usr/local/sbin/lghsctl', 'logs', argv[1].upper(), group])
+    if action in ('sudo-list', 'sudo-test', 'sudo-test-status') and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghsctl', action, argv[1].upper()])
+    if action in ('sudo-approve', 'sudo-deny') and len(argv) == 3 and valid_device(argv[1]) and valid_request(argv[2]):
+        return run(['/usr/local/sbin/lghsctl', action, argv[1].upper(), argv[2].lower()])
+
+    print('Command is not permitted by the LGHS remote management shell.', file=sys.stderr)
+    usage()
+    return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
