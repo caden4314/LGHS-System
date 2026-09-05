@@ -143,12 +143,18 @@ class CommandPlaneTests(unittest.TestCase):
 
     def test_status_uses_https_cache_as_runtime_liveness_authority(self):
         mod=load_script('test_lghsctl_status','controller/lghsctl');now=time.time();commit='a'*40
-        base={'received_at':now,'version':'0.6.0','metrics':{'cpu_pct':1.0,'mem_pct':10.0,'disk_pct':20.0,'temp_c':40.0},'health':{'inventory':{'hostname':'CS-999','current_version':'0.6.0','current_commit':commit}},'health_report':{'health_version':2,'checks':[{'id':'service.lghs-agent','state':'pass','severity':'critical'}]}}
+        base={'received_at':now,'version':'0.6.0','metrics':{'cpu_pct':1.0,'mem_pct':10.0,'disk_pct':20.0,'temp_c':40.0},'health':{'inventory':{'hostname':'CS-999','current_version':'0.6.0','current_commit':commit}},'health_report':{'health_version':2,'checks':[{'id':cid,'state':'pass','severity':'critical'} for cid in mod.STATUS_REQUIRED_CHECKS]}}
         mod.targets_all=lambda:['CS-999'];mod.target_meta=lambda target:{'transport':'cloudflare'}
         with mock.patch.object(mod,'remote_report',side_effect=AssertionError('fresh Fleet cache must not require SSH')):
             mod.load_cache=lambda:{'CS-999':dict(base)};out=io.StringIO()
             with contextlib.redirect_stdout(out):rc=mod.fleet_status()
             self.assertEqual(rc,0);self.assertIn('OK',out.getvalue());self.assertIn(commit[:12],out.getvalue())
+            advisory=dict(base);advisory['health_report']={'health_version':2,'checks':[{'id':cid,'state':'pass','severity':'critical'} for cid in mod.STATUS_REQUIRED_CHECKS]+[{'id':'network.wifi-signal','state':'fail','severity':'warning'}]};mod.load_cache=lambda:{'CS-999':advisory};out=io.StringIO()
+            with contextlib.redirect_stdout(out):rc=mod.fleet_status()
+            self.assertEqual(rc,0);self.assertIn('OK',out.getvalue())
+            blocked=dict(base);blocked['health_report']={'health_version':2,'checks':[{'id':cid,'state':('fail' if cid=='transport.controller' else 'pass'),'severity':'critical'} for cid in mod.STATUS_REQUIRED_CHECKS]};mod.load_cache=lambda:{'CS-999':blocked};out=io.StringIO()
+            with contextlib.redirect_stdout(out):rc=mod.fleet_status()
+            self.assertEqual(rc,1);self.assertIn('CHECK',out.getvalue())
             stale=dict(base);stale['received_at']=now-60;mod.load_cache=lambda:{'CS-999':stale};out=io.StringIO()
             with contextlib.redirect_stdout(out):rc=mod.fleet_status()
             self.assertEqual(rc,1);self.assertIn('OFFLINE',out.getvalue())

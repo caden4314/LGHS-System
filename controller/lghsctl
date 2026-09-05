@@ -234,13 +234,27 @@ def cache_fresh(report,now=None):
     except (TypeError,ValueError):received=0.0
     ts=time.time() if now is None else float(now)
     return bool(received and ts-received<=float(os.environ.get('LGHS_FLEET_STALE_SECONDS','15')))
+STATUS_REQUIRED_CHECKS = frozenset({
+    'service.NetworkManager','service.lghs-policy','service.lghs-agent',
+    'service.lghs-command-executor','storage.root','storage.root-writable',
+    'clock.synchronized','power.undervoltage','hardware.throttling',
+    'system.reboot-required','transport.controller',
+})
+
 def cached_status(report,now=None):
     if planned_shutdown(report):return 'SHUTDOWN'
     if not cache_fresh(report,now):return 'OFFLINE'
     health_report=report.get('health_report',{}) if isinstance(report,dict) else {}
     checks=health_report.get('checks',[]) if isinstance(health_report,dict) else []
-    failed=[row for row in checks if isinstance(row,dict) and str(row.get('state') or '').lower()=='fail'] if isinstance(checks,list) else []
-    return 'CHECK' if failed else 'OK'
+    if not isinstance(checks,list):return 'CHECK'
+    by_id={str(row.get('id') or ''):row for row in checks if isinstance(row,dict) and row.get('id')}
+    for check_id in STATUS_REQUIRED_CHECKS:
+        row=by_id.get(check_id)
+        if row is None or str(row.get('state') or '').lower()!='pass':return 'CHECK'
+    for row in by_id.values():
+        if str(row.get('state') or '').lower()!='pass' and str(row.get('severity') or 'warning').lower()=='critical':return 'CHECK'
+    return 'OK'
+
 def print_cached_status(target,transport,report,state):
     metrics=report.get('metrics',{}) if isinstance(report.get('metrics'),dict) else {}
     health=report.get('health',{}) if isinstance(report.get('health'),dict) else {}
