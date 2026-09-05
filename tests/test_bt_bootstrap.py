@@ -195,6 +195,18 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn("'controller-runtime'", shell)
         self.assertNotIn("controller-runtime DEVICE", shell)
 
+    def test_stock_docs_match_password_derived_zero_touch_flow(self):
+        stock = (ROOT / "bootstrap" / "STOCK-SETUP.md").read_text(encoding="utf-8")
+        hardware = (ROOT / "bluetooth" / "HARDWARE-TESTING.md").read_text(encoding="utf-8")
+        self.assertIn("lghs-stock-bootstrap-secret", stock)
+        self.assertIn("30 days", stock)
+        self.assertIn("No token copy", stock)
+        self.assertNotIn("TOKEN_PRINTED", stock)
+        self.assertNotIn("Register the one-time token", stock)
+        self.assertIn("controller-verified Cloudflare SSH", hardware)
+        self.assertIn("Only after that proof", hardware)
+        self.assertNotIn("installs the per-device Fleet API token", hardware)
+
     def test_no_static_wifi_secret_in_repository_protocol(self):
         combined = "\n".join([
             (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8"),

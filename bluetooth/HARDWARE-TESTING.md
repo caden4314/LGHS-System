@@ -1,213 +1,156 @@
-# LGHS Bluetooth Zero-Touch Hardware Acceptance
+# LGHS Bluetooth / Stock-OS Hardware Acceptance
 
-Pre-release validation only.
+This document describes the current classroom path: stock Raspberry Pi OS, password-derived Bluetooth bootstrap, controller-verified Cloudflare SSH, then Fleet enrollment.
+
+The older custom-image flow that installed a Fleet token before Bluetooth is obsolete and must not be used for fresh classroom devices.
+
+## Required topology
 
 - Controller: `LGCSCONT`
-- Tonight live student test: `CS-999`
-- First fresh class flash tomorrow: `CS-01`
+- Student devices: `CS-01`, `CS-02`, ... with matching users `cs-01`, `cs-02`, ...
+- Student management user: `cs-admin`
+- Runtime management: HTTPS Fleet plane plus per-device Cloudflare SSH
+- Bluetooth: bootstrap only
 
-Do not mass-deploy or promote this branch from the CS-999 live test alone.
+## Non-negotiable enrollment order
 
-## Two different tests
+1. Student boots stock Raspberry Pi OS and has Internet access.
+2. `bootstrap/install-stock.sh` installs LGHS without starting Fleet.
+3. Student and controller mutually authenticate using the password-derived per-device bootstrap credential.
+4. Bluetooth transfers Cloudflare bootstrap data and the controller SSH public key inside the encrypted session.
+5. Student brings up its per-device Cloudflare tunnel.
+6. LGCSCONT verifies SSH through the Cloudflare hostname using the controller key.
+7. Only after that proof does LGCSCONT mint and send the per-device Fleet token.
+8. Student starts Fleet agent, command executor, and policy services.
+9. Bootstrap credential is consumed and Bluetooth bootstrap becomes permanently inactive.
 
-### Tonight: live CS-999 validation
+If Fleet starts before step 6 succeeds, the test fails.
 
-CS-999 is **not reflashed**. Use it to validate the hardened Bluetooth service lifecycle, the controller Cloudflare credential, per-device tunnel creation/update, encrypted Bluetooth exchange, and service behavior on an already-running LGHS student.
+## Controller preflight
 
-Install the branch on LGCSCONT and CS-999 with `bluetooth/install-live-test.sh`. Installation alone preserves the existing `/var/lib/lghs/bootstrap/wifi-provisioned.json` marker and will not trigger a new Wi-Fi provisioning cycle.
-
-Only when intentionally testing the full BT flow on CS-999, use the explicit `--rearm` option on CS-999. The installer backs up the prior provisioning marker before removing it. This can re-apply Wi-Fi and the CS-999 Cloudflare tunnel, so do not use `--rearm` accidentally.
-
-### Tomorrow: fresh CS-01 class acceptance
-
-The valid fresh zero-touch acceptance starts from a newly flashed CS-01 card with no manually configured Wi-Fi. Do not SSH into CS-01 or manually create a NetworkManager profile to help the test succeed.
-
-The intended sequence is:
-
-1. First boot consumes the Imager provisioning files.
-2. First boot creates unique SSH host keys and installs the per-device Fleet API token.
-3. `lghs-bt-bootstrap.service` starts only after firstboot identity is ready.
-4. CS-01 discovers LGCSCONT over Bluetooth.
-5. Controller and student mutually authenticate using the CS-01 per-device token and ephemeral X25519 session keys.
-6. Wi-Fi/tunnel provisioning payload is transferred only inside AES-GCM ciphertext.
-7. CS-01 creates the NetworkManager Wi-Fi connection and reaches the Fleet API.
-8. The pinned/verified Cloudflare connector is installed when needed and the student-specific tunnel token is applied.
-9. Controller finalization completes and CS-01 becomes reachable through the managed transport.
-
-## Tonight: prepare LGCSCONT
-
-After pulling the BT PR branch:
+Arm credentials for the classroom set:
 
 ```bash
-sudo bash ./bluetooth/install-live-test.sh --start
+sudo python3 /opt/lghs/repo/controller/lghs-stock-bootstrap-secret
+sudo python3 /opt/lghs/repo/controller/lghs-stock-bootstrap-secret --status
 ```
 
-The installer also runs the safe read-only Cloudflare credential probe. You can repeat it without exposing the token:
+No arguments arm `CS-01` through `CS-14` for 30 days. Use `--device CS-##` to re-arm one device.
+
+Confirm controller services:
 
 ```bash
-sudo /usr/local/sbin/lghs-cloudflare-token-check
+systemctl is-active bluetooth.service lghs-bt-prepare.service lghs-bt-provision.service lghs-fleet-api.service
+systemctl --failed --no-pager
 ```
 
-Confirm services and Fleet registry health:
+Do not print Cloudflare tokens, Fleet tokens, bootstrap credentials, or the derived master during testing.
 
+## Fresh student acceptance
+
+Flash Raspberry Pi OS Desktop 64-bit with hostname `CS-##`, matching student user `cs-##`, working Internet Wi-Fi, and SSH enabled. Do not manually create `cs-admin`.
+
+Run locally as the student:
 ```bash
-sudo systemctl status bluetooth.service --no-pager
-sudo systemctl status lghs-bt-prepare.service --no-pager
-sudo systemctl status lghs-bt-provision.service --no-pager
-sudo test -s /etc/lghs/fleet-api-tokens.json && echo 'Fleet token registry: OK'
-sudo visudo -c
+curl -fsSL https://raw.githubusercontent.com/caden4314/LGHS-System/main/bootstrap/install-stock.sh -o /tmp/lghs-stock.sh && sudo bash /tmp/lghs-stock.sh
 ```
 
-Confirm CS-999 has a per-device Fleet token without printing it:
+Enter the same provisioning password armed on LGCSCONT. After the installer says zero-touch provisioning started, leave the Pi powered on near the controller.
 
-```bash
-sudo python3 - <<'PY'
-import json
-from pathlib import Path
-p = Path('/etc/lghs/fleet-api-tokens.json')
-data = json.loads(p.read_text())
-entry = data.get('devices', {}).get('CS-999') if isinstance(data, dict) else None
-print('CS-999 token registry:', 'OK' if entry else 'MISSING')
-PY
-```
-
-## Tonight: install on CS-999 without re-provisioning
-
-After pulling the BT PR branch on CS-999:
-
-```bash
-sudo bash ./bluetooth/install-live-test.sh
-```
-
-This installs/enables the hardened files but intentionally preserves the existing provisioned state.
-
-When ready for the deliberate live Bluetooth reprovision test:
-
-```bash
-sudo bash ./bluetooth/install-live-test.sh --rearm
-```
-
-At the same time on LGCSCONT:
+Watch the controller:
 
 ```bash
 sudo journalctl -fu lghs-bt-provision.service
 ```
 
-On CS-999 in a second terminal if its current SSH path remains available:
-
-```bash
-sudo journalctl -fu lghs-bt-bootstrap.service
-```
-
-## Tomorrow: preflight for CS-01
-
-Before flashing CS-01, confirm the controller is ready and CS-01 has been enrolled by the Imager with a per-device Fleet token. Check presence without printing the token:
-
-```bash
-sudo python3 - <<'PY'
-import json
-from pathlib import Path
-p = Path('/etc/lghs/fleet-api-tokens.json')
-data = json.loads(p.read_text())
-entry = data.get('devices', {}).get('CS-01') if isinstance(data, dict) else None
-print('CS-01 token registry:', 'OK' if entry else 'MISSING')
-PY
-```
-
-Observe LGCSCONT during CS-01 first boot:
-
-```bash
-sudo journalctl -fu lghs-bt-provision.service
-```
-
-In a second controller terminal:
-
-```bash
-watch -n 2 'systemctl --no-pager --full status bluetooth.service lghs-bt-provision.service | sed -n "1,35p"'
-```
-
-## Student checks after zero-touch completes
-
-Only after the automatic sequence has completed and the student is reachable:
-
-```bash
-sudo systemctl status lghs-firstboot-provision.service --no-pager
-sudo systemctl status lghs-bt-bootstrap.service --no-pager
-sudo systemctl status NetworkManager.service --no-pager
-sudo systemctl status lghs-agent.service --no-pager
-sudo systemctl status lghs-cloudflared.service --no-pager
-```
-
-Verify unique host keys exist:
-
-```bash
-sudo ls -l /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
-sudo sshd -t && echo 'sshd config: OK'
-```
-
-Verify bootstrap state without exposing secrets:
-
-```bash
-sudo test -s /etc/lghs/secrets/fleet-api-token && echo 'Fleet token: present'
-sudo test -f /var/lib/lghs/bootstrap/wifi-provisioned.json && echo 'Wi-Fi bootstrap: complete'
-sudo test -f /var/lib/lghs/provisioned && echo 'Firstboot: complete'
-```
-
-Network/Fleet checks:
-
-```bash
-nmcli -t -f GENERAL.STATE,GENERAL.CONNECTION device show wlan0
-ip route
-sudo /usr/local/sbin/lghs-report summary 2>/dev/null || true
-```
-
-Cloudflare connector version/hash check when `/usr/local/bin/cloudflared` is installed:
-
-```bash
-/usr/local/bin/cloudflared --version
-sha256sum /usr/local/bin/cloudflared
-```
-
-For the pinned ARM64 2026.8.1 test build, expected SHA-256 is:
+Required final controller evidence:
 
 ```text
-6d517efc10dfce17440177bd7011909166eab44bae0f6998182183df717c7dba
+Cloudflare VERIFIED CS-##: cs-admin@ssh-cs-##.scenicrouteservers.com
+READY CS-##: Bluetooth -> Cloudflare verified -> Fleet enrolled
 ```
 
-## Logs to capture on any failure
+Then verify the student's provision record includes this exact order:
 
-Controller:
+```json
+["bluetooth","cloudflare","cloudflare-verified","fleet"]
+```
+
+`lghs-bt-bootstrap.service` being inactive after `READY` is expected.
+## Student validation
+
+Run on the student or through Fleet:
 
 ```bash
-sudo journalctl -u bluetooth.service -u lghs-bt-prepare.service -u lghs-bt-provision.service -b --no-pager > /tmp/lghs-controller-bt.log
+sudo /usr/local/sbin/lghs-check
+systemctl --failed --no-pager
+getent passwd cs-## cs-admin cs_admin lg_cs_cont
+systemctl is-active lghs-cloudflared.service lghs-agent.service lghs-command-executor.service lghs-policy.service
+systemctl is-enabled lghs-update.timer
 ```
 
-Student:
+Required result:
 
-```bash
-sudo journalctl \
-  -u lghs-firstboot-provision.service \
-  -u bluetooth.service \
-  -u lghs-bt-prepare.service \
-  -u lghs-bt-bootstrap.service \
-  -u NetworkManager.service \
-  -u lghs-cloudflared.service \
-  -u lghs-agent.service \
-  -b --no-pager > /tmp/lghs-student-bootstrap.log
+- every `lghs-check` item passes
+- zero failed systemd units
+- only the canonical `cs-##` and `cs-admin` human identities remain
+- Cloudflare, agent, executor, and policy are active
+- update timer is enabled
+- no persistent network queue work remains
+
+## Fleet command acceptance
+
+Queue an LGHS update from the controller and verify the device reports the exact target commit after execution. A successful command response alone is not enough; telemetry must converge to the target SHA.
+
+Duplicate delivery of the same command must not enqueue or execute the local update twice.
+## Fleet sudo acceptance
+
+Use the built-in noninteractive self-test from the controller:
+
+```text
+sudo-test CS-##
+sudo-list CS-##
+sudo-approve CS-## REQUEST_ID
+sudo-test-status CS-##
 ```
 
-Do not include Fleet API tokens, Wi-Fi passwords, tunnel tokens, `/etc/lghs/secrets/*`, or `/etc/cloudflared/token` in shared logs.
+Approval passes only when the final self-test log contains root identity output and the request reaches `completed`.
 
-## Fresh CS-01 pass criteria
+Also test denial on a separate request:
 
-The first class zero-touch test is a pass only if all of these are true without manual Wi-Fi assistance:
+```text
+sudo-test CS-##
+sudo-deny CS-## REQUEST_ID
+sudo-test-status CS-##
+```
 
-- firstboot finishes successfully;
-- unique SSH host keys exist and `sshd -t` succeeds;
-- Bluetooth mutual-auth provisioning succeeds;
-- Wi-Fi is connected by the bootstrap flow;
-- Fleet agent becomes healthy/reachable;
-- Cloudflare connector starts with the CS-01-specific token;
-- bootstrap state is one-shot and does not continually reprovision after success;
-- no credentials appear in journal output;
-- rebooting CS-01 does not repeat provisioning or break connectivity.
+A denied request must stop without executing the privileged command.
+
+## Update / reconcile stability
+
+An already-current update must be non-disruptive. Capture controller runtime state before and after a no-op update:
+
+```text
+controller-runtime
+update-controller
+controller-runtime
+```
+For healthy Fleet services, PID, restart count, invocation ID, and start timestamp must remain unchanged across the no-op updater run.
+
+Post-update validation is fail-closed: if `lghs-check` or a required service validation fails, the updater must not record the target as successfully installed.
+
+## Current classroom rollout gate
+
+Do not mass-deploy the next student set until all of these are true on the current runtime commit:
+
+- all three GitHub validation workflows are green
+- LGCSCONT is healthy on the same validated runtime
+- at least one fresh stock student completed Bluetooth -> Cloudflare verification -> Fleet in the required order
+- a second fresh stock student has clean canonical identities and passes `lghs-check`
+- Fleet command delivery has updated a student to the expected exact commit
+- Fleet sudo approval has executed the test command only after approval
+- Fleet sudo denial has prevented execution
+- no-op controller updates do not restart healthy Fleet services
+- there are no pending network-queue jobs or sudo requests
+
+Power-loss, rollback, phased rollout, structured-health, and scheduled-reboot release-candidate tests remain tracked separately in `docs/0.6-RC-HARDWARE-VALIDATION.md` and should not be inferred from this bootstrap acceptance.
