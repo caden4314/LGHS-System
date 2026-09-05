@@ -33,12 +33,17 @@ quarantine_legacy_account() {
     log "Quarantined unexpected legacy account $legacy; home directory preserved"
 }
 
+# Build the old aliases at runtime so the stock checkout's identity-smudge
+# filter cannot rewrite the migration targets before this script is installed.
+LEGACY_STUDENT="lg""_cs_cont"
+LEGACY_ADMIN="cs""_admin"
+
 # Early stock-provisioning bugs could create legacy identities alongside the
 # canonical cs-## / cs-admin accounts. Preserve their home directories for
 # recovery, but remove privileged groups and disable login so they cannot remain
 # shadow administrators after migration.
-quarantine_legacy_account lg_cs_cont "$STUDENT"
-quarantine_legacy_account cs_admin "$ADMIN"
+quarantine_legacy_account "$LEGACY_STUDENT" "$STUDENT"
+quarantine_legacy_account "$LEGACY_ADMIN" "$ADMIN"
 
 if id -nG "$STUDENT" | tr ' ' '\n' | grep -qx sudo; then
     gpasswd -d "$STUDENT" sudo >/dev/null
