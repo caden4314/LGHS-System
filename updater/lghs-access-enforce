@@ -35,6 +35,10 @@ if id lghs-agent >/dev/null 2>&1 && [[ -e /usr/local/sbin/lghs-agent ]]; then
   chown root:lghs-agent /usr/local/sbin/lghs-agent
   chmod 0750 /usr/local/sbin/lghs-agent
 fi
+if id lghs-agent >/dev/null 2>&1 && [[ -e /usr/local/sbin/lghs-lifecycle-notify ]]; then
+  chown root:lghs-agent /usr/local/sbin/lghs-lifecycle-notify
+  chmod 0750 /usr/local/sbin/lghs-lifecycle-notify
+fi
 # lghs_remote is deliberately not a member of lghs-admin. Its SSH session is
 # forced through this one root-owned public entrypoint, which then uses a strict
 # command allowlist and command-specific sudo rules.

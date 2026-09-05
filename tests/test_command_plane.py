@@ -130,6 +130,17 @@ class CommandPlaneTests(unittest.TestCase):
         self.assertIn('enqueue local-update --commit "$REQUESTED_TARGET_COMMIT"', updater)
         self.assertIn('git cat-file -e "${REQUESTED_TARGET_COMMIT}^{commit}"', updater)
 
+    def test_update_channel_is_typed_and_persisted(self):
+        executor=load_script('test_executor_channel','student/lghs-command-executor');target='a'*40
+        self.assertEqual(executor.action_command('lghs-update',{'target_commit':target,'target_channel':'main'}),[executor.NETQUEUE,'enqueue','local-update','--commit',target,'--channel','main'])
+        with self.assertRaises(ValueError):executor.action_command('lghs-update',{'target_channel':'../bad'})
+        queue=load_script('test_queue_channel','updater/lghs-netqueue');captured={}
+        def fake_run(cmd,**kwargs):captured.update(cmd=cmd,env=kwargs.get('env',{}));return subprocess.CompletedProcess(cmd,0,'ok','')
+        with mock.patch.object(queue.subprocess,'run',side_effect=fake_run):rc,_=queue.run_job({'kind':'local-update','params':{'target_channel':'main'}})
+        self.assertEqual(rc,0);self.assertEqual(captured['env']['LGHS_UPDATE_BRANCH'],'main');self.assertEqual(captured['env']['LGHS_PERSIST_UPDATE_BRANCH'],'1')
+        updater=(ROOT/'updater'/'lghs-update').read_text(encoding='utf-8');self.assertIn('persist_update_branch',updater);self.assertIn('LGHS_PERSIST_UPDATE_BRANCH',updater)
+        shell=(ROOT/'controller'/'lghs-remote-shell').read_text(encoding='utf-8');self.assertIn('update-exact',shell);self.assertIn('set-channel',shell)
+
     def configure_queue_temp(self, queue, root):
         queue.QUEUE_DIR = root / 'netqueue'
         queue.JOBS_DIR = queue.QUEUE_DIR / 'jobs'

@@ -182,6 +182,7 @@ else
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-enforce" /usr/local/sbin/lghs-enforce
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
   install -o root -g root -m 0755 "$ROOT_DIR/student/lghs-agent" /usr/local/sbin/lghs-agent
+  install -o root -g root -m 0755 "$ROOT_DIR/student/lghs-lifecycle-notify" /usr/local/sbin/lghs-lifecycle-notify
   if [[ -f "$ROOT_DIR/updater/patch-agent-status-guard.py" ]]; then
     python3 "$ROOT_DIR/updater/patch-agent-status-guard.py" /usr/local/sbin/lghs-agent
   fi
@@ -202,6 +203,7 @@ else
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-telemetry-push" /usr/local/sbin/lghs-telemetry-push
   install -m 0644 "$ROOT_DIR/systemd/lghs-telemetry-push.service" /etc/systemd/system/lghs-telemetry-push.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-agent.service" /etc/systemd/system/lghs-agent.service
+  install -m 0644 "$ROOT_DIR/systemd/lghs-lifecycle.service" /etc/systemd/system/lghs-lifecycle.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-command-executor.service" /etc/systemd/system/lghs-command-executor.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-discovery-advertise.service" /etc/systemd/system/lghs-discovery-advertise.service
   install -m 0644 "$ROOT_DIR/systemd/lghs-bt-bootstrap.service" /etc/systemd/system/lghs-bt-bootstrap.service
@@ -266,7 +268,7 @@ systemctl restart lghs-bt-prepare.service
 systemctl enable --now lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer
 if [[ "$ROLE" == "student" ]]; then
   systemctl disable --now lghs-telemetry-push.service >/dev/null 2>&1 || true
-  systemctl enable --now lghs-policy.service lghs-command-executor.service lghs-agent.service lghs-discovery-advertise.service ssh.service
+  systemctl enable --now lghs-policy.service lghs-command-executor.service lghs-agent.service lghs-lifecycle.service lghs-discovery-advertise.service ssh.service
   systemctl enable lghs-bt-bootstrap.service
   systemctl reset-failed lghs-bt-bootstrap.service >/dev/null 2>&1 || true
   if [[ -f /etc/lghs/bluetooth-bootstrap-enabled && ! -f /var/lib/lghs/bootstrap/wifi-provisioned.json ]]; then

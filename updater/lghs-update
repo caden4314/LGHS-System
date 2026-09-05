@@ -10,6 +10,7 @@ ENV_CHECKOUT="${LGHS_UPDATE_CHECKOUT-}"
 # Exact deployment targets are deliberately request-scoped. Never inherit a
 # pinned target from update.env or the fallback timer would remain pinned.
 ENV_TARGET_COMMIT="${LGHS_TARGET_COMMIT-}"
+PERSIST_UPDATE_BRANCH="${LGHS_PERSIST_UPDATE_BRANCH:-0}"
 if [[ -r "$UPDATE_ENV" ]]; then
     # shellcheck disable=SC1090
     source "$UPDATE_ENV"
@@ -150,11 +151,25 @@ else
 fi
 write_status "preparing" "Comparing versions" 28 "Target ${TARGET_COMMIT:0:12}"
 
+persist_update_branch() {
+    [[ "$PERSIST_UPDATE_BRANCH" == "1" ]] || return 0
+    local tmp
+    tmp="$(mktemp /etc/lghs/update.env.XXXXXX)" || return 1
+    if [[ -f "$UPDATE_ENV" ]]; then grep -v '^LGHS_UPDATE_BRANCH=' "$UPDATE_ENV" > "$tmp" || true; fi
+    printf 'LGHS_UPDATE_BRANCH=%s\n' "$BRANCH" >> "$tmp"
+    chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$UPDATE_ENV" || { rm -f "$tmp"; return 1; }
+}
+
 if [[ "$INSTALLED_COMMIT" == "$TARGET_COMMIT" ]]; then
     git reset --hard "$TARGET_COMMIT" >/dev/null
     if [[ -x /usr/local/sbin/lghs-reconcile ]]; then
         write_status "validating" "Reconciling current install" 85 "LGHS is already current"
         /usr/local/sbin/lghs-reconcile >/dev/null 2>&1 || true
+    fi
+    if ! persist_update_branch; then
+        write_status "failed" "Saving update channel failed" 100 "Could not persist branch $BRANCH"
+        exit 1
     fi
     # Already-current checks must be non-disruptive. Reconcile reapplies
     # policy/liveness state without reinstalling the managed layer or restarting
@@ -240,6 +255,7 @@ apply_install() {
     else
         validate_controller || return 1
     fi
+    persist_update_branch || return 1
     return 0
 }
 

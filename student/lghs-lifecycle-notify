@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Report an intentional system shutdown before network teardown."""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+STATE_ROOT = Path('/var/lib/lghs-agent')
+CONF = STATE_ROOT / 'fleet-api.conf'
+TOKEN = STATE_ROOT / 'fleet-api-token'
+BOOT = Path('/proc/sys/kernel/random/boot_id')
+TIMEOUT = 3.0
+
+
+def parse_conf() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in CONF.read_text(encoding='utf-8').splitlines():
+        if '=' in line and not line.lstrip().startswith('#'):
+            key, value = line.split('=', 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+def system_state() -> str:
+    try:
+        proc = subprocess.run(
+            ['systemctl', 'is-system-running'],
+            text=True, capture_output=True, timeout=2,
+        )
+        return (proc.stdout or '').strip().lower()
+    except Exception:
+        return ''
+
+
+def shutdown_kind() -> str:
+    for target, label in (
+        ('reboot.target', 'reboot'),
+        ('poweroff.target', 'poweroff'),
+        ('halt.target', 'halt'),
+    ):
+        try:
+            proc = subprocess.run(
+                ['systemctl', 'is-active', '--quiet', target],
+                timeout=1,
+            )
+            if proc.returncode == 0:
+                return label
+        except Exception:
+            pass
+    return 'shutdown'
+
+
+def post_lifecycle(force: bool = False) -> int:
+    state = system_state()
+    if not force and state != 'stopping':
+        print(f'LGHS lifecycle: skip; system state is {state or "unknown"}')
+        return 0
+    if not CONF.exists() or not TOKEN.exists():
+        print('LGHS lifecycle: Fleet endpoint/token unavailable', file=sys.stderr)
+        return 0
+    base = parse_conf().get('URL', '').rstrip('/')
+    if not base.startswith('https://'):
+        print('LGHS lifecycle: invalid Fleet URL', file=sys.stderr)
+        return 0
+    device = socket.gethostname().upper()
+    body = {
+        'state': 'planned_shutdown',
+        'reason': shutdown_kind(),
+        'boot_id': BOOT.read_text(encoding='utf-8').strip() if BOOT.exists() else '',
+        'sent_at': time.time(),
+    }
+    data = json.dumps(body, separators=(',', ':')).encode()
+    req = urllib.request.Request(
+        f'{base}/v1/lifecycle/{device}', data=data, method='POST',
+        headers={
+            'Authorization': 'Bearer ' + TOKEN.read_text(encoding='utf-8').strip(),
+            'Content-Type': 'application/json',
+            'User-Agent': 'LGHS-Lifecycle/0.6',
+        },
+    )
+    last_error = ''
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+                if 200 <= int(response.status) < 300:
+                    print(f'LGHS lifecycle: reported {body["reason"]}')
+                    return 0
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < 2:
+                time.sleep(0.2 * (attempt + 1))
+    print(f'LGHS lifecycle: report failed: {last_error}', file=sys.stderr)
+    return 0
+
+
+def main() -> int:
+    force = sys.argv[1:] == ['--force']
+    if sys.argv[1:] not in ([], ['--system-stop'], ['--force']):
+        raise SystemExit('Usage: lghs-lifecycle-notify [--system-stop|--force]')
+    return post_lifecycle(force=force)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -15,6 +15,7 @@ KNOWN_HOSTS = "/var/lib/lghs/ssh_known_hosts"
 CONTROL_DIR = "/run/lghs-ssh"
 FLEET_LOG_DIR = Path('/var/log/lghs-fleet')
 REGISTRY_FILE = Path('/etc/lghs/fleet.json')
+CACHE_FILE = Path('/var/lib/lghs/fleet-cache.json')
 FLEET_COMMAND = '/usr/local/sbin/lghs-fleet-command'
 CLOUDFLARED = shutil.which('cloudflared') or '/usr/local/bin/cloudflared'
 
@@ -39,6 +40,17 @@ def load_registry():
     except Exception as exc:
         raise RuntimeError(f"Invalid {REGISTRY_FILE}: {exc}")
 
+
+def load_cache():
+    if not CACHE_FILE.exists():return {}
+    try:
+        data=json.loads(CACHE_FILE.read_text(encoding='utf-8'));devices=data.get('devices',{})
+        return devices if isinstance(devices,dict) else {}
+    except Exception:return {}
+
+def planned_shutdown(report):
+    value=report.get('lifecycle',{}) if isinstance(report,dict) else {}
+    return isinstance(value,dict) and str(value.get('state') or '')=='planned_shutdown'
 
 def local_discover_devices():
     if not shutil.which("avahi-browse"):
@@ -103,6 +115,13 @@ def target_meta(target):
 
 def valid_request_id(value):
     return len(value) == 24 and all(ch in '0123456789abcdefABCDEF' for ch in value)
+
+def valid_commit(value):
+    return len(str(value or ''))==40 and all(ch in '0123456789abcdefABCDEF' for ch in str(value))
+
+def valid_channel(value):
+    value=str(value or '').strip()
+    return bool(value) and len(value)<=128 and '..' not in value and not value.startswith(('/', '-')) and not value.endswith('/') and all(ch.isalnum() or ch in '._/-' for ch in value)
 
 
 def ssh_base(target, batch=True):
@@ -214,12 +233,18 @@ def fleet_status():
     if not targets:
         print("No LGHS devices registered or discovered.")
         return 0
-    results = run_parallel(targets, lambda t: remote_report(t, "summary"))
+    cache=load_cache();planned={t:cache.get(str(t).upper(),{}) for t in targets if planned_shutdown(cache.get(str(t).upper(),{}))}
+    live=[t for t in targets if t not in planned]
+    results = run_parallel(live, lambda t: remote_report(t, "summary")) if live else {}
     bad = 0
     print(f"{'HOSTNAME':16} {'TRANSPORT':11} {'VER':8} {'CPU':6} {'RAM':6} {'DISK':6} {'TEMP':7} {'COMMIT':12} STATUS")
     for t in targets:
-        p = results[t]
         transport = target_meta(t).get('transport', 'direct')[:11]
+        if t in planned:
+            report=planned[t];metrics=report.get('metrics',{}) if isinstance(report.get('metrics'),dict) else {};health=report.get('health',{}) if isinstance(report.get('health'),dict) else {};inv=health.get('inventory',{}) if isinstance(health.get('inventory'),dict) else {}
+            print(f"{str(report.get('hostname') or t)[:16]:16} {transport:11} {str(report.get('version') or inv.get('current_version') or '?')[:8]:8} {str(metrics.get('cpu_pct','?'))+'%':6} {str(metrics.get('mem_pct','?'))+'%':6} {str(metrics.get('disk_pct','?'))+'%':6} {str(metrics.get('temp_c','?'))+'C':7} {str(inv.get('current_commit') or '?')[:12]:12} SHUTDOWN")
+            continue
+        p = results[t]
         if p.returncode != 0:
             print(f"{t[:16]:16} {transport:11} {'?':8} {'?':6} {'?':6} {'?':6} {'?':7} {'?':12} OFFLINE")
             if p.stderr:
@@ -270,7 +295,7 @@ def run_fleet_command(targets, remote, label):
     return 1 if failures else 0
 
 
-def queue_https_commands(targets, action, label):
+def queue_https_commands(targets, action, label, payload=None):
     """Queue remote maintenance without opening an SSH session to a Pi."""
     if not targets:
         print("No LGHS devices registered or discovered.")
@@ -281,7 +306,9 @@ def queue_https_commands(targets, action, label):
     failures = 0
     for target in targets:
         device = target_meta(target).get('device', target).upper()
-        p = run(["sudo", "-n", FLEET_COMMAND, "enqueue", device, action])
+        cmd=["sudo","-n",FLEET_COMMAND,"enqueue",device,action]
+        if payload:cmd += ["--payload-json",json.dumps(payload,separators=(',',':'),sort_keys=True)]
+        p = run(cmd)
         if p.returncode == 0:
             command_id = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else "unknown"
             print(f"{device:20} {label:14} QUEUED  {command_id}")
@@ -376,7 +403,7 @@ def main():
     p = sub.add_parser("info"); p.add_argument("target")
     p = sub.add_parser("logs"); p.add_argument("target"); p.add_argument("group", nargs="?", default="all", choices=["all","update","agent","policy"])
     p = sub.add_parser("fleet-logs"); p.add_argument("kind", choices=["sudo","audit","update","os-update"]); p.add_argument("--lines", type=int, default=100)
-    p = sub.add_parser("update"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true")
+    p = sub.add_parser("update"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true"); p.add_argument("--commit"); p.add_argument("--channel")
     p = sub.add_parser("os-update"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true"); p.add_argument("--reboot", action="store_true")
     for name in ("check", "enforce", "reboot", "ssh", "sudo-list", "sudo-test", "sudo-test-status"):
         p = sub.add_parser(name); p.add_argument("target")
@@ -407,7 +434,14 @@ def main():
         action = "approve" if args.cmd == "sudo-approve" else "deny"
         return ssh_cmd(args.target, f"sudo -n /usr/local/sbin/lghs-sudo-admin {action} {args.request_id.lower()}")
     if args.cmd == "update":
-        return queue_https_commands(targets_all() if args.all or not args.target else [args.target], "lghs-update", "LGHS UPDATE")
+        payload={}
+        if args.commit:
+            if not valid_commit(args.commit):print('Invalid exact commit SHA',file=sys.stderr);return 2
+            payload['target_commit']=args.commit.lower()
+        if args.channel:
+            if not valid_channel(args.channel):print('Invalid update channel',file=sys.stderr);return 2
+            payload['target_channel']=args.channel
+        return queue_https_commands(targets_all() if args.all or not args.target else [args.target], "lghs-update", "LGHS UPDATE", payload)
     if args.cmd == "os-update":
         if args.reboot:
             print("--reboot is intentionally not queued with HTTPS OS updates in 0.4.1; reboot separately after the device reports reboot_required.", file=sys.stderr)

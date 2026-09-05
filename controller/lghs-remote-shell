@@ -21,6 +21,12 @@ def valid_device(value):
 def valid_request(value):
     return len(value) == 24 and all(ch in HEX for ch in value)
 
+def valid_commit(value):
+    return len(value)==40 and all(ch in HEX for ch in value)
+
+def valid_channel(value):
+    return bool(value) and len(value)<=128 and '..' not in value and not value.startswith(('/', '-')) and not value.endswith('/') and all(ch.isalnum() or ch in '._/-' for ch in value)
+
 
 def usage():
     print('''LGHS remote management commands:
@@ -28,6 +34,8 @@ def usage():
   status | versions | services | update-state | controller-runtime
   info DEVICE
   update DEVICE | os-update DEVICE
+  update-exact DEVICE SHA [CHANNEL]
+  set-channel DEVICE CHANNEL
   check DEVICE | enforce DEVICE | reboot DEVICE
   logs DEVICE [GROUP]
   ssh DEVICE
@@ -61,6 +69,12 @@ def main():
         return run(['/usr/local/sbin/lghsctl', action])
     if action == 'update-controller' and len(argv) == 1:
         return run(['/usr/local/sbin/lghs-update'])
+    if action == 'update-exact' and len(argv) in (3,4) and valid_device(argv[1]) and valid_commit(argv[2]) and (len(argv)==3 or valid_channel(argv[3])):
+        cmd=['/usr/local/sbin/lghsctl','update',argv[1].upper(),'--commit',argv[2].lower()]
+        if len(argv)==4:cmd += ['--channel',argv[3]]
+        return run(cmd)
+    if action == 'set-channel' and len(argv) == 3 and valid_device(argv[1]) and valid_channel(argv[2]):
+        return run(['/usr/local/sbin/lghsctl','update',argv[1].upper(),'--channel',argv[2]])
 
     if action == 'info' and len(argv) == 2 and valid_device(argv[1]):
         return run(['/usr/local/sbin/lghsctl', 'info', argv[1].upper()])

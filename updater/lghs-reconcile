@@ -57,6 +57,6 @@ else
     start_if_enabled \
         lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer \
         lghs-policy.service lghs-command-executor.service \
-        lghs-agent.service lghs-discovery-advertise.service \
+        lghs-agent.service lghs-lifecycle.service lghs-discovery-advertise.service \
         ssh.service NetworkManager.service avahi-daemon.service
 fi

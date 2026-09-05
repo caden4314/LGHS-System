@@ -207,6 +207,14 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn("Only after that proof", hardware)
         self.assertNotIn("installs the per-device Fleet API token", hardware)
 
+    def test_planned_shutdown_reporting_is_installed_and_nonfatal(self):
+        install=(ROOT/'install.sh').read_text(encoding='utf-8');check=(ROOT/'student'/'lghs-check').read_text(encoding='utf-8')
+        unit=(ROOT/'systemd'/'lghs-lifecycle.service').read_text(encoding='utf-8');notify=(ROOT/'student'/'lghs-lifecycle-notify').read_text(encoding='utf-8')
+        api=(ROOT/'controller'/'lghs-fleet-api').read_text(encoding='utf-8');fleet_notify=(ROOT/'controller'/'lghs-fleet-notify').read_text(encoding='utf-8')
+        self.assertIn('lghs-lifecycle.service',install);self.assertIn('planned shutdown reporting',check)
+        self.assertIn('ExecStop=/usr/local/sbin/lghs-lifecycle-notify --system-stop',unit);self.assertIn("state': 'planned_shutdown'",notify)
+        self.assertIn('/v1/lifecycle/',api);self.assertIn('planned_shutdown_reporting',api);self.assertIn('Planned shutdown',fleet_notify)
+
     def test_no_static_wifi_secret_in_repository_protocol(self):
         combined = "\n".join([
             (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8"),

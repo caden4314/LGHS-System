@@ -84,10 +84,14 @@ def num(v):
     except Exception:return None
 
 
+def planned_shutdown(d):
+    value=d.get('lifecycle',{}) if isinstance(d,dict) else {}
+    return isinstance(value,dict) and str(value.get('state') or '')=='planned_shutdown'
+
 def issues(d):
     host=d.get("hostname") or d.get("host") or d.get("addr","?");out=[]
     if not d.get("online"):
-        return [("critical","telemetry",f"{host} telemetry is offline")]
+        return [] if planned_shutdown(d) else [("critical","telemetry",f"{host} telemetry is offline")]
     temp=num(d.get("temp_c"));disk=num(d.get("disk_pct"))
     if temp is not None and temp>=TEMP_CRIT:out.append(("critical","temperature",f"temperature {temp:.1f}C"))
     elif temp is not None and temp>=TEMP_WARN:out.append(("warning","temperature",f"temperature {temp:.1f}C"))
@@ -125,10 +129,12 @@ def main():
                     "role":d.get("role","student"),
                     "online":online,
                     "last_seen":now if online else prev.get("last_seen",0),
+                    "lifecycle":d.get("lifecycle") if isinstance(d.get("lifecycle"),dict) else {},
                     "issues":curissues,
                 }
                 if s.get("initialized") and prev and prev.get("online")!=online:
                     if online:emit(s,f"online:{addr}","normal","LGHS Pi online",f"{host} ({addr}) telemetry is back online.",host,"Telemetry online")
+                    elif planned_shutdown(d):emit(s,f"shutdown:{addr}","normal","LGHS Pi shutdown",f"{host} ({addr}) reported an intentional shutdown.",host,"Planned shutdown")
                     else:emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) stopped reporting telemetry.",host,"Telemetry offline")
                 for key,(sev,msg) in curissues.items():
                     if key not in oldissues:
@@ -155,10 +161,12 @@ def main():
                     "role":prev.get("role","student"),
                     "online":False,
                     "last_seen":last_seen,
-                    "issues":{"telemetry":["critical",msg]},
+                    "lifecycle":prev.get("lifecycle") if isinstance(prev.get("lifecycle"),dict) else {},
+                    "issues":{} if planned_shutdown(prev) else {"telemetry":["critical",msg]},
                 }
                 if s.get("initialized") and prev.get("online"):
-                    emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) stopped reporting telemetry.",host,"Telemetry offline")
+                    if planned_shutdown(prev):emit(s,f"shutdown:{addr}","normal","LGHS Pi shutdown",f"{host} ({addr}) reported an intentional shutdown.",host,"Planned shutdown")
+                    else:emit(s,f"offline:{addr}","critical","LGHS CRITICAL",f"{host} ({addr}) stopped reporting telemetry.",host,"Telemetry offline")
 
             s["sudo_seen"]=list(seen)[-500:];s["devices"]=current
             for name,path in (("LGHS update",UPDATE_LOG),("Raspberry Pi OS update",OS_UPDATE_LOG)):

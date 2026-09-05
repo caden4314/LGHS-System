@@ -46,6 +46,11 @@ def normalize_commit(value):
     return commit
 
 
+def normalize_channel(value):
+    channel=str(value or '').strip()
+    if not channel or len(channel)>128 or '..' in channel or channel.startswith(('/', '-')) or channel.endswith('/') or any(not (ch.isalnum() or ch in '._/-') for ch in channel):raise ValueError('invalid update channel')
+    return channel
+
 def normalize_idempotency_key(value):
     key = str(value or '').strip()
     if not IDEMPOTENCY_RE.fullmatch(key):
@@ -254,6 +259,8 @@ def command_for(job):
         target = params.get('target_commit')
         if target:
             normalize_commit(target)
+        if params.get('target_channel'):
+            normalize_channel(params['target_channel'])
         return ['/usr/local/sbin/lghs-update']
     if kind == 'os-update':
         return ['/usr/local/sbin/lghs-os-update']
@@ -272,6 +279,9 @@ def run_job(job):
     env['LGHS_NETQUEUE_RUNNING'] = '1'
     if job.get('kind') == 'local-update' and job.get('params', {}).get('target_commit'):
         env['LGHS_TARGET_COMMIT'] = normalize_commit(job['params']['target_commit'])
+    if job.get('kind') == 'local-update' and job.get('params', {}).get('target_channel'):
+        env['LGHS_UPDATE_BRANCH'] = normalize_channel(job['params']['target_channel'])
+        env['LGHS_PERSIST_UPDATE_BRANCH'] = '1'
     if job.get('idempotency_key'):
         env['LGHS_IDEMPOTENCY_KEY'] = str(job['idempotency_key'])
     try:
@@ -442,6 +452,7 @@ def main():
     enqueue_parser.add_argument('target', nargs='?')
     enqueue_parser.add_argument('action', nargs='?')
     enqueue_parser.add_argument('--commit')
+    enqueue_parser.add_argument('--channel')
     enqueue_parser.add_argument('--reboot', action='store_true')
     enqueue_parser.add_argument('--idempotency-key')
 
@@ -465,19 +476,21 @@ def main():
     try:
         if args.kind == 'local-update':
             if args.target or args.action or args.reboot:
-                raise ValueError('local-update usage: lghs-netqueue enqueue local-update [--commit SHA] [--idempotency-key KEY]')
+                raise ValueError('local-update usage: lghs-netqueue enqueue local-update [--commit SHA] [--channel BRANCH] [--idempotency-key KEY]')
             params = {}
             if args.commit:
                 params['target_commit'] = normalize_commit(args.commit)
+            if args.channel:
+                params['target_channel'] = normalize_channel(args.channel)
             enqueue('local-update', params, args.idempotency_key)
             return 0
         if args.kind == 'os-update':
-            if args.target or args.action or args.commit:
+            if args.target or args.action or args.commit or args.channel:
                 raise ValueError('os-update usage: lghs-netqueue enqueue os-update [--reboot] [--idempotency-key KEY]')
             enqueue('os-update', {'reboot': bool(args.reboot)}, args.idempotency_key)
             return 0
         if args.kind == 'fleet':
-            if not args.target or not args.action or args.commit or args.reboot:
+            if not args.target or not args.action or args.commit or args.channel or args.reboot:
                 raise ValueError('fleet queue usage: lghs-netqueue enqueue fleet TARGET ACTION [--idempotency-key KEY]')
             if args.action not in ALLOWED_FLEET_ACTIONS:
                 raise ValueError('unsupported queued fleet action')

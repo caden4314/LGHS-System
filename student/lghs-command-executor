@@ -37,7 +37,7 @@ AUDIT = {
 SERVICES = (
     'NetworkManager.service', 'ssh.service', 'lghs-policy.service',
     'lghs-update.timer', 'lghs-reconcile.timer', 'lghs-netqueue.timer',
-    'lghs-agent.service', 'lghs-command-executor.service',
+    'lghs-agent.service', 'lghs-command-executor.service', 'lghs-lifecycle.service',
 )
 SUDO_FIELDS = (
     'id', 'device_id', 'requester', 'command', 'argv', 'cwd', 'requested_at',
@@ -98,6 +98,11 @@ def normalize_target_commit(value: Any) -> str:
     return commit
 
 
+def normalize_target_channel(value: Any) -> str:
+    channel=str(value or '').strip()
+    if not channel or len(channel)>128 or '..' in channel or channel.startswith(('/', '-')) or channel.endswith('/') or any(not (ch.isalnum() or ch in '._/-') for ch in channel):raise ValueError('invalid-target-channel')
+    return channel
+
 def action_command(action: str, payload: Any, command_id: str = '') -> list[str]:
     if payload is None:
         payload = {}
@@ -119,6 +124,8 @@ def action_command(action: str, payload: Any, command_id: str = '') -> list[str]
     command = list(ACTIONS[action])
     if action == 'lghs-update' and payload.get('target_commit'):
         command += ['--commit', normalize_target_commit(payload['target_commit'])]
+    if action == 'lghs-update' and payload.get('target_channel'):
+        command += ['--channel', normalize_target_channel(payload['target_channel'])]
     if command_id:
         # The controller command ID is the local side-effect idempotency key.
         command += ['--idempotency-key', command_id]

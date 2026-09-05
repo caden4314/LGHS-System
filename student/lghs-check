@@ -57,6 +57,7 @@ if systemctl is-enabled lghs-netqueue.timer >/dev/null 2>&1; then pass "offline 
 if [[ -x /etc/NetworkManager/dispatcher.d/90-lghs-netqueue ]]; then pass "network reconnect queue trigger installed"; else fail "network reconnect queue trigger installed"; fi
 if ! grep -Eq '^(After|Wants|Requires)=.*network-online\.target' /etc/systemd/system/lghs-update.service /etc/systemd/system/lghs-agent.service /etc/systemd/system/lghs-netqueue.service 2>/dev/null; then pass "LGHS services do not require network-online to start"; else fail "LGHS services do not require network-online to start"; fi
 if systemctl is-enabled lghs-update.timer >/dev/null 2>&1; then pass "LGHS update timer enabled"; else fail "LGHS update timer enabled"; fi
+if systemctl is-enabled lghs-lifecycle.service >/dev/null 2>&1 && systemctl is-active --quiet lghs-lifecycle.service; then pass "planned shutdown reporting"; else fail "planned shutdown reporting"; fi
 if systemctl is-enabled lghs-reconcile.timer >/dev/null 2>&1; then pass "self-heal timer enabled"; else fail "self-heal timer enabled"; fi
 if systemctl is-enabled lghs-policy.service >/dev/null 2>&1; then pass "policy service enabled"; else fail "policy service enabled"; fi
 if systemctl is-active NetworkManager >/dev/null 2>&1; then pass "NetworkManager active"; else fail "NetworkManager active"; fi

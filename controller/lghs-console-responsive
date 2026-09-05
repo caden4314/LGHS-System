@@ -90,7 +90,13 @@ def fmt_rate(value):
     return f"{n:.1f}TB/s"
 
 
+def planned_shutdown(d):
+    value=d.get('lifecycle',{}) if isinstance(d,dict) else {}
+    return isinstance(value,dict) and str(value.get('state') or '')=='planned_shutdown'
+
 def cache_state(d):
+    if planned_shutdown(d):
+        return "SHUTDOWN"
     age = d.get("cache_age")
     if age is None:
         return "OFFLINE"
@@ -264,6 +270,8 @@ def issues(devices, state):
     rows = []
     for d in devices:
         cstate = cache_state(d)
+        if cstate == "SHUTDOWN":
+            continue
         if cstate == "STALE":
             rows.append((d, "WARNING", "STALE", f"telemetry age {cache_age_text(d)}"))
         elif cstate == "OFFLINE":

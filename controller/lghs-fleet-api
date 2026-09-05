@@ -115,7 +115,11 @@ def reconcile_command_milestones(device,rows):
             except (TypeError,ValueError):pass
     DB.reconcile_reported_commands(device,rows)
     for cid in command_ids:sync_deployment_execution(cid)
+def lifecycle_state(payload):
+    raw=payload.get('lifecycle',{}) if isinstance(payload,dict) else {}
+    return str(raw.get('state') or '') if isinstance(raw,dict) else ''
 def health_state_for(payload):
+    if lifecycle_state(payload)=='planned_shutdown':return 'maintenance'
     report=payload.get('health_report',{}) if isinstance(payload,dict) else {};checks=report.get('checks',[]) if isinstance(report,dict) else []
     failed=[x for x in checks if isinstance(x,dict) and str(x.get('state') or '').lower()=='fail'] if isinstance(checks,list) else []
     if failed:return 'critical' if any(str(x.get('severity') or '').lower()=='critical' for x in failed) else 'warning'
@@ -166,6 +170,19 @@ def list_groups():
 def list_deployments():
     with DB.connect() as db:rows=db.execute('SELECT * FROM deployments ORDER BY created_at DESC').fetchall()
     return [deployment_view(r) for r in rows]
+def record_lifecycle(device,raw,now):
+    state=str(raw.get('state') or '').strip().lower()
+    if state!='planned_shutdown':raise ProtocolError('unsupported-lifecycle-state')
+    reason=str(raw.get('reason') or 'shutdown').strip().lower()[:64]
+    boot=str(raw.get('boot_id') or '').strip()[:128]
+    try:sent=float(raw.get('sent_at') or now)
+    except (TypeError,ValueError):raise ProtocolError('invalid-lifecycle-time') from None
+    latest=DB.latest_telemetry(device);payload=dict((latest or {}).get('payload') or {})
+    payload['lifecycle']={'state':state,'reason':reason,'boot_id':boot,'sent_at':sent,'received_at':now}
+    DB.upsert_device(device,last_seen=now)
+    DB.update_device_inventory(device,health_state='maintenance',now=now)
+    with DB.transaction() as db:db.execute('INSERT INTO audit_events(device_id,kind,severity,created_at,sequence,detail_json) VALUES(?,?,?,?,?,?)',(device,'lifecycle','info',now,None,json.dumps(payload['lifecycle'],separators=(',',':'))))
+    legacy_cache(device,payload);return payload['lifecycle']
 def target_from_request(raw):
     if isinstance(raw.get('target'),dict):return raw['target']
     keys=[key for key in ('device_id','device_ids','group_id','tag','all') if raw.get(key) not in (None,False,'',[])]
@@ -267,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ProtocolError,ValueError,TypeError) as exc:self.reply(400,{'ok':False,'error':str(exc)});return True
         return False
     def do_GET(self):
-        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':2,'fleet_operations':1,'exact_commit_deployments':True,'inventory_reporting':True,'desired_state_reconciliation':True,'frozen_target_rollouts':True,'deployment_recovery_controls':True,'maintenance_windows':True,'scheduled_reboots':True,'typed_reboot_command':True,'structured_health_gates':True,'deployment_wave_audit':True,'time':time.time()});return
+        if self.path=='/health':self.reply(200,{'ok':True,'protocol':PROTOCOL_VERSION,'database':'sqlite-wal','command_transport':'long-poll','audit_transport':'https','sudo_transport':'https-events','health_schema':2,'fleet_operations':1,'exact_commit_deployments':True,'inventory_reporting':True,'desired_state_reconciliation':True,'frozen_target_rollouts':True,'deployment_recovery_controls':True,'maintenance_windows':True,'scheduled_reboots':True,'typed_reboot_command':True,'structured_health_gates':True,'deployment_wave_audit':True,'planned_shutdown_reporting':True,'time':time.time()});return
         parsed=urllib.parse.urlparse(self.path)
         if parsed.path.startswith('/v1/admin/'):
             if not auth_admin(self):self.reply(401,{'ok':False,'error':'unauthorized'});return
@@ -293,6 +310,15 @@ class Handler(BaseHTTPRequestHandler):
             if not auth_admin(self):self.reply(401,{'ok':False,'error':'unauthorized'});return
             if not self.admin_post(parsed.path):self.reply(404,{'ok':False});return
             return
+        lifecycle_prefix='/v1/lifecycle/'
+        if parsed.path.startswith(lifecycle_prefix):
+            try:device=normalize_device_id(parsed.path[len(lifecycle_prefix):])
+            except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
+            if not auth_device(self,device):self.reply(401,{'ok':False,'error':'unauthorized'});return
+            try:raw=self.read_json();lifecycle=record_lifecycle(device,raw,time.time())
+            except ValueError as exc:self.reply(413,{'ok':False,'error':str(exc)});return
+            except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
+            self.reply(202,{'ok':True,'device_id':device,'lifecycle':lifecycle});return
         prefix='/v1/report/'
         if not parsed.path.startswith(prefix):self.reply(404,{'ok':False});return
         try:device=normalize_device_id(parsed.path[len(prefix):])

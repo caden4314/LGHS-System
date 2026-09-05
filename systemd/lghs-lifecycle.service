@@ -1,0 +1,29 @@
+[Unit]
+Description=LGHS Planned Shutdown Reporter
+After=network.target lghs-agent.service
+Wants=lghs-agent.service
+ConditionPathExists=/var/lib/lghs-agent/fleet-api-token
+ConditionPathExists=/var/lib/lghs-agent/fleet-api.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=lghs-agent
+Group=lghs-agent
+ExecStart=/usr/bin/true
+ExecStop=/usr/local/sbin/lghs-lifecycle-notify --system-stop
+TimeoutStopSec=12
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/etc/lghs /usr/local/sbin /var/lib/lghs-agent
+
+[Install]
+WantedBy=multi-user.target
