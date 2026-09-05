@@ -49,7 +49,9 @@ class BluetoothSourceInvariants(unittest.TestCase):
         src = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
         self.assertIn("/etc/lghs/bluetooth-bootstrap-enabled", src)
         self.assertIn("wifi-provisioned.json", src)
-        self.assertIn('["btmgmt", "-i", BT_INDEX, "find", "-b"]', src)
+        self.assertIn('btmgmt_command("find", "-b")', src)
+        self.assertIn('["script", "-q", "-e", "-c", shlex.join(base), "/dev/null"]', src)
+        self.assertIn('base = ["btmgmt", "-i", BT_INDEX, *args]', src)
         self.assertIn("select.select", src)
         self.assertNotIn("SCAN_INTERVAL", src)
 
@@ -91,8 +93,10 @@ class BluetoothSourceInvariants(unittest.TestCase):
             self.assertIn(marker, stock)
         self.assertIn("range(1, 15)", controller_setup)
         self.assertIn("stock-password-derived", controller_setup)
-        self.assertIn("Use at least 12 characters", controller_setup)
-        self.assertIn("Use at least 12 characters", stock)
+        self.assertIn("Password cannot be empty.", controller_setup)
+        self.assertIn("Password cannot be empty.", stock)
+        self.assertNotIn("Use at least 12 characters", controller_setup)
+        self.assertNotIn("Use at least 12 characters", stock)
         self.assertNotIn("lghs-bootstrap-enroll", stock)
         self.assertNotIn("Remove-Variable bt", stock)
         self.assertNotIn("$bt =", stock)
@@ -142,7 +146,7 @@ class BluetoothSourceInvariants(unittest.TestCase):
             "/etc/systemd/system",
             "/usr/local/bin",
             "/run",
-            "/etc/lghs/secrets",
+            "/etc/lghs",
             "/etc/ssh/authorized_keys",
         ):
             self.assertIn(path, write_line)
