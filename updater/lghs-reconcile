@@ -5,17 +5,8 @@ set -euo pipefail
 ROLE="$(cat /etc/lghs/role 2>/dev/null || echo unknown)"
 CHECKOUT="${LGHS_UPDATE_CHECKOUT:-/opt/lghs/repo}"
 STATE_DIR=/var/lib/lghs/update
+FULL_REINSTALL="${LGHS_RECONCILE_FULL:-0}"
 [[ "$ROLE" == "student" || "$ROLE" == "controller" ]] || exit 0
-
-# Stock-provisioned students have dynamic cs-## / cs-admin identities recorded
-# in /etc/lghs. Never run the raw legacy installer during reconciliation on
-# those devices: doing so can recreate lg_cs_cont/cs_admin and overwrite the
-# stock identity mapping. Updates install new files; reconcile only reapplies
-# the currently installed policy helpers.
-STOCK_STUDENT=0
-if [[ "$ROLE" == "student" && -s /etc/lghs/student-user && -s /etc/lghs/admin-user ]]; then
-    STOCK_STUDENT=1
-fi
 
 EXPECTED_COMMIT="$(cat "$STATE_DIR/current-commit" 2>/dev/null || cat /etc/lghs/source-commit 2>/dev/null || true)"
 CHECKOUT_COMMIT=""
@@ -23,12 +14,19 @@ if [[ -d "$CHECKOUT/.git" ]]; then
     CHECKOUT_COMMIT="$(git -c safe.directory="$CHECKOUT" -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
 fi
 
-if [[ "$STOCK_STUDENT" -eq 0 && -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && "$CHECKOUT_COMMIT" == "$EXPECTED_COMMIT" ]]; then
-    /bin/bash "$CHECKOUT/install.sh" "$ROLE"
-    exit 0
+# Periodic reconcile is intentionally lightweight. Re-running install.sh on
+# every timer tick used to restart Fleet/API/agent processes even when nothing
+# changed. Actual updates already run install.sh. A full reinstall remains
+# available explicitly for repair with LGHS_RECONCILE_FULL=1.
+if [[ "$FULL_REINSTALL" == "1" ]]; then
+    if [[ -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && "$CHECKOUT_COMMIT" == "$EXPECTED_COMMIT" ]]; then
+        /bin/bash "$CHECKOUT/install.sh" "$ROLE"
+        exit 0
+    fi
+    logger -t LGHS-RECONCILE "Full reconcile requested but checkout does not match installed commit"
 fi
 
-if [[ "$STOCK_STUDENT" -eq 0 && -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && -n "$CHECKOUT_COMMIT" && "$CHECKOUT_COMMIT" != "$EXPECTED_COMMIT" ]]; then
+if [[ -f "$CHECKOUT/install.sh" && -n "$EXPECTED_COMMIT" && -n "$CHECKOUT_COMMIT" && "$CHECKOUT_COMMIT" != "$EXPECTED_COMMIT" ]]; then
     logger -t LGHS-RECONCILE "Skipping stale checkout $CHECKOUT_COMMIT; installed commit is $EXPECTED_COMMIT"
 fi
 
@@ -39,3 +37,26 @@ if [[ "$ROLE" == "student" ]]; then
     [[ -x /usr/local/sbin/lghs-network-ui-apply ]] && /usr/local/sbin/lghs-network-ui-apply || true
 fi
 [[ -x /usr/local/sbin/lghs-access-enforce ]] && /usr/local/sbin/lghs-access-enforce || true
+
+start_if_enabled() {
+    local unit
+    for unit in "$@"; do
+        if systemctl is-enabled "$unit" >/dev/null 2>&1; then
+            systemctl start "$unit" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+if [[ "$ROLE" == "controller" ]]; then
+    start_if_enabled \
+        lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer \
+        lghs-audit-sync.timer lghs-fleet-notify.service \
+        lghs-fleet-api.service lghs-rollout-manager.service \
+        lghs-bt-provision.service avahi-daemon.service
+else
+    start_if_enabled \
+        lghs-update.timer lghs-reconcile.timer lghs-netqueue.timer \
+        lghs-policy.service lghs-command-executor.service \
+        lghs-agent.service lghs-discovery-advertise.service \
+        ssh.service NetworkManager.service avahi-daemon.service
+fi
