@@ -35,6 +35,13 @@ if id lghs-agent >/dev/null 2>&1 && [[ -e /usr/local/sbin/lghs-agent ]]; then
   chown root:lghs-agent /usr/local/sbin/lghs-agent
   chmod 0750 /usr/local/sbin/lghs-agent
 fi
+# lghs_remote is deliberately not a member of lghs-admin. Its SSH session is
+# forced through this one root-owned public entrypoint, which then uses a strict
+# command allowlist and command-specific sudo rules.
+if [[ "$ROLE" == "controller" && -e /usr/local/sbin/lghs-remote-shell ]]; then
+  chown root:root /usr/local/sbin/lghs-remote-shell
+  chmod 0755 /usr/local/sbin/lghs-remote-shell
+fi
 
 if [[ -e /usr/local/libexec/lghsctl-real ]]; then
   chown root:"$ADMIN_GROUP" /usr/local/libexec/lghsctl-real
