@@ -154,6 +154,19 @@ EOF
   chmod 0644 /etc/logrotate.d/lghs-fleet
   /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
   chmod 0640 /var/lib/lghs/db-migration-last.json
+
+  # Older Fleet Web preview installs used a PathExists watcher to mirror
+  # fleet-cache.json. The current gateway reads the local Fleet API directly,
+  # so that bridge is obsolete and can enter a systemd start-limit loop.
+  if [[ -e /etc/systemd/system/lghs-fleet-web-cache-sync.path || -e /etc/systemd/system/lghs-fleet-web-cache-sync.service ]]; then
+    systemctl disable --now lghs-fleet-web-cache-sync.path >/dev/null 2>&1 || true
+    systemctl stop lghs-fleet-web-cache-sync.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/lghs-fleet-web-cache-sync.path \
+          /etc/systemd/system/lghs-fleet-web-cache-sync.service \
+          /usr/local/sbin/lghs-fleet-web-cache-sync
+    systemctl daemon-reload
+    systemctl reset-failed lghs-fleet-web-cache-sync.path lghs-fleet-web-cache-sync.service >/dev/null 2>&1 || true
+  fi
 else
   rm -f /etc/systemd/system/bluetooth.service.d/50-lghs-sdp-compat.conf
   getent group lghs-agent >/dev/null 2>&1 || groupadd --system lghs-agent
