@@ -72,6 +72,9 @@ jobs:
           grep -Fq "canary failure" controller/lghs/rollout.py
           grep -Fq "failure threshold exceeded" controller/lghs/rollout.py
           grep -Fq "target_commit" controller/lghs/rollout.py
+          grep -Fq "lghs-update requires an exact target_commit or a channel-only migration" controller/lghs-fleet-command
+          grep -Fq "branch-following is disabled" updater/lghs-update
+          grep -Fq "target_commit\": controller_current_commit()" controller/lghs-console-tunnel
           grep -Fq "health_details" controller/lghs/rollout.py
           grep -Fq "structured health verified" controller/lghs/rollout.py
           grep -Fq "DEFAULT_REQUIRED_CHECKS" controller/lghs/health.py

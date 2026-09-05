@@ -15,6 +15,33 @@ from lghs.protocol import ALLOWED_COMMANDS, normalize_device_id
 REGISTRY = Path('/etc/lghs/fleet.json')
 DB = FleetDB()
 OPEN_STATES = {'queued', 'delivered', 'received', 'accepted', 'running'}
+HEX = set('0123456789abcdefABCDEF')
+
+
+def valid_commit(value):
+    text = str(value or '').strip()
+    return len(text) == 40 and all(ch in HEX for ch in text)
+
+
+def valid_channel(value):
+    text = str(value or '').strip()
+    return bool(text) and len(text) <= 128 and '..' not in text and not text.startswith(('/', '-')) and not text.endswith('/') and all(ch.isalnum() or ch in '._/-' for ch in text)
+
+
+def validate_action_payload(action, payload):
+    if action != 'lghs-update':
+        return
+    extra = set(payload) - {'target_commit', 'target_channel'}
+    if extra:
+        raise ValueError('unsupported lghs-update payload fields: ' + ','.join(sorted(extra)))
+    commit = payload.get('target_commit')
+    channel = payload.get('target_channel')
+    if not commit and not channel:
+        raise ValueError('lghs-update requires an exact target_commit or a channel-only migration')
+    if commit and not valid_commit(commit):
+        raise ValueError('target_commit must be an exact 40-character Git SHA')
+    if channel and not valid_channel(channel):
+        raise ValueError('invalid target_channel')
 
 
 def known_devices():
@@ -55,6 +82,7 @@ def enqueue(device, action, payload=None, deadline=None):
         raise SystemExit(f'Unknown fleet device: {d}')
     payload = payload or {}
     canonical_payload(payload)
+    validate_action_payload(action, payload)
     DB.initialize()
     existing = matching_open_command(d, action, payload)
     if existing:
@@ -94,7 +122,10 @@ def main():
             canonical_payload(payload)
         except Exception as exc:
             raise SystemExit(f'Invalid --payload-json: {exc}') from None
-        enqueue(args.device, args.action, payload, time.time() + max(1, args.timeout))
+        try:
+            enqueue(args.device, args.action, payload, time.time() + max(1, args.timeout))
+        except ValueError as exc:
+            raise SystemExit(f'Invalid command payload: {exc}') from None
         return
     if args.cmd == 'status':
         show(args.device)

@@ -141,6 +141,25 @@ class CommandPlaneTests(unittest.TestCase):
         updater=(ROOT/'updater'/'lghs-update').read_text(encoding='utf-8');self.assertIn('persist_update_branch',updater);self.assertIn('LGHS_PERSIST_UPDATE_BRANCH',updater)
         shell=(ROOT/'controller'/'lghs-remote-shell').read_text(encoding='utf-8');self.assertIn('update-exact',shell);self.assertIn('set-channel',shell)
 
+    def test_student_updates_require_controller_exact_sha(self):
+        writer=load_script('test_exact_authority_writer','controller/lghs-fleet-command')
+        with self.assertRaises(ValueError):writer.validate_action_payload('lghs-update',{})
+        with self.assertRaises(ValueError):writer.validate_action_payload('lghs-update',{'target_commit':'main'})
+        with self.assertRaises(ValueError):writer.validate_action_payload('lghs-update',{'target_commit':'a'*40,'extra':True})
+        writer.validate_action_payload('lghs-update',{'target_commit':'a'*40})
+        writer.validate_action_payload('lghs-update',{'target_channel':'main'})
+        updater=(ROOT/'updater'/'lghs-update').read_text(encoding='utf-8')
+        self.assertIn('LGHS_ALLOW_BRANCH_UPDATE',updater)
+        self.assertIn('no exact commit authorized; branch-following is disabled',updater)
+        self.assertIn('channel saved as $BRANCH; no software revision selected',updater)
+        self.assertLess(updater.index('Controller-managed updates'),updater.index('git ls-remote'))
+        ctl=(ROOT/'controller'/'lghsctl').read_text(encoding='utf-8')
+        tunnel=(ROOT/'controller'/'lghs-console-tunnel').read_text(encoding='utf-8')
+        day2=(ROOT/'controller'/'lghs-console-day2').read_text(encoding='utf-8')
+        self.assertIn("payload['target_commit']=controller_current_commit()",ctl)
+        self.assertIn('{"target_commit": controller_current_commit()}',tunnel)
+        self.assertIn('{"target_commit": controller_current_commit()}',day2)
+
     def test_status_uses_https_cache_as_runtime_liveness_authority(self):
         mod=load_script('test_lghsctl_status','controller/lghsctl');now=time.time();commit='a'*40
         base={'received_at':now,'version':'0.6.0','metrics':{'cpu_pct':1.0,'mem_pct':10.0,'disk_pct':20.0,'temp_c':40.0},'health':{'inventory':{'hostname':'CS-999','current_version':'0.6.0','current_commit':commit}},'health_report':{'health_version':2,'checks':[{'id':cid,'state':'pass','severity':'critical'} for cid in mod.STATUS_REQUIRED_CHECKS]}}
