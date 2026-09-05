@@ -337,8 +337,8 @@ class Handler(BaseHTTPRequestHandler):
             except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
             if not auth_device(self,device):self.reply(401,{'ok':False,'error':'unauthorized'});return
             try:raw=self.read_json();lifecycle=record_lifecycle(device,raw,time.time())
-            except ValueError as exc:self.reply(413,{'ok':False,'error':str(exc)});return
             except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
+            except ValueError as exc:self.reply(413,{'ok':False,'error':str(exc)});return
             self.reply(202,{'ok':True,'device_id':device,'lifecycle':lifecycle});return
         prefix='/v1/report/'
         if not parsed.path.startswith(prefix):self.reply(404,{'ok':False});return
