@@ -177,6 +177,9 @@ else
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-enforce" /usr/local/sbin/lghs-enforce
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-check" /usr/local/sbin/lghs-check
   install -o root -g root -m 0755 "$ROOT_DIR/student/lghs-agent" /usr/local/sbin/lghs-agent
+  if [[ -f "$ROOT_DIR/updater/patch-agent-status-guard.py" ]]; then
+    python3 "$ROOT_DIR/updater/patch-agent-status-guard.py" /usr/local/sbin/lghs-agent
+  fi
   install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
   install -o root -g root -m 0755 "$ROOT_DIR/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
   install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap

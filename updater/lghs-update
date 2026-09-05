@@ -218,10 +218,11 @@ cleanup_legacy_student_services() {
 apply_install() {
     write_status "installing" "Applying LGHS configuration" 55 "Running install.sh for $ROLE"
     /bin/bash ./install.sh "$ROLE"
-    if [[ -x ./updater/lghs-0.5-install ]]; then
-        write_status "installing" "Installing managed state/agent layer" 68 "Applying managed fleet architecture"
-        ./updater/lghs-0.5-install "$ROLE"
-    elif [[ "$ROLE" == "student" ]]; then
+    # install.sh is the canonical installer for the current architecture.
+    # Older revisions may not contain the managed layer; only those downgrade
+    # targets need the legacy cleanup path. Avoid a second installer pass here
+    # because it reloads the same files and restarts healthy services twice.
+    if [[ "$ROLE" == "student" && ! -x ./updater/lghs-0.5-install ]]; then
         write_status "installing" "Removing managed-only services" 68 "Restoring legacy telemetry for downgrade"
         cleanup_legacy_student_services
     fi
