@@ -1,0 +1,18 @@
+[Unit]
+Description=LGHS Controller SQLite Online Backup
+After=local-fs.target
+ConditionPathExists=/var/lib/lghs/fleet.db
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/lghs-controller-backup
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/backups/lghs
+NoNewPrivileges=yes

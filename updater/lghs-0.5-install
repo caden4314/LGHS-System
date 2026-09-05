@@ -42,6 +42,10 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
+  install -m 0755 "$ROOT/controller/lghs-controller-backup" /usr/local/sbin/lghs-controller-backup
+  install -m 0644 "$ROOT/systemd/lghs-controller-backup.service" /etc/systemd/system/lghs-controller-backup.service
+  install -m 0644 "$ROOT/systemd/lghs-controller-backup.timer" /etc/systemd/system/lghs-controller-backup.timer
+  install -d -m 0750 /var/backups/lghs /var/backups/lghs/daily /var/backups/lghs/weekly /var/backups/lghs/monthly
   install -m 0755 "$ROOT/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
   install -m 0755 "$ROOT/controller/lghs-fleet-rollout" /usr/local/sbin/lghs-fleet-rollout
   install -m 0755 "$ROOT/controller/lghs-fleet-maintenance" /usr/local/sbin/lghs-fleet-maintenance
@@ -52,7 +56,7 @@ if [[ "$ROLE" == controller ]]; then
   /usr/local/sbin/lghs-db-migrate >/var/lib/lghs/db-migration-last.json
   chmod 0640 /var/lib/lghs/db-migration-last.json
   systemctl daemon-reload
-  systemctl enable --now lghs-audit-sync.timer >/dev/null 2>&1 || true
+  systemctl enable --now lghs-audit-sync.timer lghs-controller-backup.timer >/dev/null 2>&1 || true
   systemctl enable --now lghs-rollout-manager.service >/dev/null 2>&1 || true
   systemctl enable lghs-bt-prepare.service lghs-bt-provision.service
   systemctl reset-failed lghs-bt-prepare.service lghs-bt-provision.service lghs-rollout-manager.service >/dev/null 2>&1 || true

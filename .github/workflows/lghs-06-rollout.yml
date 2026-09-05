@@ -33,6 +33,7 @@ jobs:
             student/lghs-agent \
             student/lghs-command-executor \
             tests/test_command_plane.py \
+            tests/test_controller_backup.py \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
@@ -50,6 +51,7 @@ jobs:
         run: |
           python3 -m unittest -v \
             tests/test_command_plane.py \
+            tests/test_controller_backup.py \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
@@ -120,6 +122,10 @@ jobs:
           grep -Fq "'structured_health_gates':True" controller/lghs-fleet-api
           grep -Fq "'deployment_wave_audit':True" controller/lghs-fleet-api
           grep -Fq "device_lifecycle" controller/lghs/database.py
+          grep -Fq "synchronous=FULL" controller/lghs/database.py
+          grep -Fq "source.backup(destination" controller/lghs-controller-backup
+          grep -Fq "RETENTION = {'daily': 7, 'weekly': 4, 'monthly': 3}" controller/lghs-controller-backup
+          grep -Fq "lghs-controller-backup.timer" install.sh
           grep -Fq "expected_reboot" controller/lghs/maintenance.py
           grep -Fq "lifecycle-boot-mismatch" controller/lghs-fleet-api
           grep -Fq "LGHS_FLEET_OFFLINE_SECONDS" controller/lghs-console-tunnel

@@ -91,6 +91,10 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-notify" /usr/local/sbin/lghs-fleet-notify
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-state" /usr/local/sbin/lghs-fleet-state
   install -m 0755 "$ROOT_DIR/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
+  install -m 0755 "$ROOT_DIR/controller/lghs-controller-backup" /usr/local/sbin/lghs-controller-backup
+  install -m 0644 "$ROOT_DIR/systemd/lghs-controller-backup.service" /etc/systemd/system/lghs-controller-backup.service
+  install -m 0644 "$ROOT_DIR/systemd/lghs-controller-backup.timer" /etc/systemd/system/lghs-controller-backup.timer
+  install -d -m 0750 /var/backups/lghs /var/backups/lghs/daily /var/backups/lghs/weekly /var/backups/lghs/monthly
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-rollout" /usr/local/sbin/lghs-fleet-rollout
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-maintenance" /usr/local/sbin/lghs-fleet-maintenance
   install -m 0755 "$ROOT_DIR/controller/lghs-rollout-manager" /usr/local/sbin/lghs-rollout-manager
@@ -278,7 +282,7 @@ if [[ "$ROLE" == "student" ]]; then
   systemctl restart lghs-policy.service lghs-command-executor.service lghs-agent.service
   systemctl try-restart ssh.service >/dev/null 2>&1 || true
 else
-  systemctl enable --now lghs-audit-sync.timer lghs-fleet-notify.service lghs-fleet-api.service lghs-rollout-manager.service lghs-bt-provision.service
+  systemctl enable --now lghs-audit-sync.timer lghs-controller-backup.timer lghs-fleet-notify.service lghs-fleet-api.service lghs-rollout-manager.service lghs-bt-provision.service
   systemctl reset-failed lghs-bt-provision.service lghs-rollout-manager.service >/dev/null 2>&1 || true
   systemctl try-restart lghs-fleet-notify.service
   systemctl try-restart lghs-fleet-api.service

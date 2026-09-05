@@ -17,8 +17,8 @@ class FleetDBTests(unittest.TestCase):
     def tearDown(self):self.tmp.cleanup()
     def test_wal_and_schema(self):
         with self.store.connect() as db:
-            self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0].lower(),'wal');self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],'4');tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for name in {'devices','device_tags','fleet_groups','group_members','telemetry_latest','commands','command_events','warnings','warning_events','deployments','deployment_executions','sudo_requests','audit_events','notifications','settings'}:self.assertIn(name,tables)
+            self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0].lower(),'wal');self.assertEqual(db.execute('PRAGMA synchronous').fetchone()[0],2);self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],'4');tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for name in {'devices','device_tags','fleet_groups','group_members','telemetry_latest','device_lifecycle','commands','command_events','warnings','warning_events','deployments','deployment_executions','sudo_requests','audit_events','notifications','settings'}:self.assertIn(name,tables)
     def test_v2_schema_upgrades_in_place(self):
         old=self.root/'old.db';db=sqlite3.connect(old)
         try:

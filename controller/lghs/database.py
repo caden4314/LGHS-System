@@ -51,7 +51,7 @@ class FleetDB:
     def connect(self)->sqlite3.Connection:
         self.path.parent.mkdir(parents=True,exist_ok=True)
         db=sqlite3.connect(self.path,timeout=15,isolation_level=None);db.row_factory=sqlite3.Row
-        db.execute('PRAGMA foreign_keys=ON');db.execute('PRAGMA journal_mode=WAL');db.execute('PRAGMA synchronous=NORMAL');db.execute('PRAGMA busy_timeout=15000')
+        db.execute('PRAGMA foreign_keys=ON');db.execute('PRAGMA journal_mode=WAL');db.execute('PRAGMA synchronous=FULL');db.execute('PRAGMA busy_timeout=15000')
         return db
     @staticmethod
     def _ensure_columns(db:sqlite3.Connection,table:str,columns:Mapping[str,str])->None:
