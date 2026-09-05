@@ -16,6 +16,9 @@ cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-sudo-admin *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-export *
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-audit-sync
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-cloudflare-install
+# Fleet control CLI. This is the supported root-owned entrypoint for device
+# inspection, policy enforcement, and other managed fleet operations.
+cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghsctl *
 # This helper only accepts registered device IDs and an internal allowlist of
 # HTTPS fleet actions; it does not execute arbitrary commands.
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-fleet-command *
@@ -31,6 +34,7 @@ cs_admin ALL=(root) NOPASSWD: /usr/bin/python3 /opt/lghs/repo/controller/lghs-im
 # NOT create a Fleet API token. Fleet is minted later by lghs-bt-provision only
 # after the device's Cloudflare SSH endpoint has been verified.
 cs_admin ALL=(root) NOPASSWD: /usr/bin/python3 /opt/lghs/repo/controller/lghs-bootstrap-enroll *
+cs_admin ALL=(root) NOPASSWD: /usr/bin/python3 /opt/lghs/repo/controller/lghs-stock-bootstrap-secret *
 # lghs-telemetry-configure itself validates that the supplied endpoint is HTTPS.
 cs_admin ALL=(root) NOPASSWD: /usr/local/sbin/lghs-telemetry-configure *
 cs_admin ALL=(root) NOPASSWD: /usr/sbin/reboot
