@@ -160,7 +160,8 @@ jobs:
           grep -q 'fleet-api-tokens.json' controller/lghs-bt-provision
           grep -q 'verify_proof(token, "student"' controller/lghs-bt-provision
           grep -q 'verify_proof(token, "controller"' student/lghs-bt-bootstrap
-          grep -q '\["btmgmt", "-i", BT_INDEX, "find", "-b"\]' student/lghs-bt-bootstrap
+          grep -q 'btmgmt_command("find", "-b")' student/lghs-bt-bootstrap
+          grep -q '\["script", "-q", "-e", "-c", shlex.join(base), "/dev/null"\]' student/lghs-bt-bootstrap
           grep -q 'local cmd=(/usr/bin/btmgmt -i "$BT_INDEX" "$@")' bluetooth/lghs-bt-prepare
           grep -q 'retry_btmgmt "NoInputNoOutput IO capability" io-cap 3' bluetooth/lghs-bt-prepare
           grep -q 'retry_btmgmt "pairable mode" pairable on' bluetooth/lghs-bt-prepare
