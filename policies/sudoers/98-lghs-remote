@@ -9,3 +9,4 @@ lghs_remote ALL=(root) NOPASSWD: /usr/local/sbin/lghs-release status
 lghs_remote ALL=(root) NOPASSWD: /usr/local/sbin/lghs-release keygen
 lghs_remote ALL=(root) NOPASSWD: /usr/local/sbin/lghs-release install-key *
 lghs_remote ALL=(root) NOPASSWD: /usr/local/sbin/lghs-classroom-ready *
+lghs_remote ALL=(root) NOPASSWD: /usr/local/sbin/lghs-controller-backup

@@ -34,6 +34,7 @@ def usage():
   status | versions | services | update-state | controller-runtime | release-status
   release-keygen | release-install-key DEVICE
   classroom-ready DEVICE
+  backup-controller
   info DEVICE
   health DEVICE
   restart-service DEVICE {agent|executor|policy|ssh|update-timer|reconcile-timer}
@@ -79,6 +80,8 @@ def main():
         return run(['/usr/local/sbin/lghs-release', 'install-key', argv[1].upper()])
     if action == 'classroom-ready' and len(argv) == 2 and valid_device(argv[1]):
         return run(['/usr/local/sbin/lghs-classroom-ready', argv[1].upper()])
+    if action == 'backup-controller' and len(argv) == 1:
+        return run(['/usr/local/sbin/lghs-controller-backup'])
     if action == 'update-controller' and len(argv) == 1:
         return run(['/usr/local/sbin/lghs-update'])
     if action == 'update-exact' and len(argv) in (3,4) and valid_device(argv[1]) and valid_commit(argv[2]) and (len(argv)==3 or valid_channel(argv[3])):

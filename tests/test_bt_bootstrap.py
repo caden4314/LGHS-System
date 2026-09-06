@@ -201,6 +201,9 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn("'NRestarts'", ctl)
         self.assertIn("'controller-runtime'", shell)
         self.assertNotIn("controller-runtime DEVICE", shell)
+        self.assertIn("backup-controller", shell)
+        sudoers = (ROOT / "policies" / "sudoers" / "98-lghs-remote").read_text(encoding="utf-8")
+        self.assertIn("/usr/local/sbin/lghs-controller-backup", sudoers)
 
     def test_stock_docs_match_password_derived_zero_touch_flow(self):
         stock = (ROOT / "bootstrap" / "STOCK-SETUP.md").read_text(encoding="utf-8")
