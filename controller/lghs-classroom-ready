@@ -75,9 +75,16 @@ def evaluate(device_id: str, *, commit: str | None = None, max_age: float = DEFA
 
     cloudflare_ok = transport.get('transport') == 'cloudflare' and bool(transport.get('ssh_host'))
     provision_order = transport.get('provision_order') if isinstance(transport.get('provision_order'), list) else []
+    migration_ok = (
+        str(transport.get('source') or '') == 'managed-migration-verified' and
+        provision_order[:3] == ['managed-migration', 'cloudflare', 'cloudflare-verified'] and
+        str(transport.get('migration_verifier') or '') == 'lghs-verify-migration-v1' and
+        float(transport.get('migration_verified_at') or 0) > 0
+    )
     bootstrap_ok = cloudflare_ok and bool(latest) and (
         provision_order[:3] == ['bluetooth', 'cloudflare', 'cloudflare-verified'] or
-        str(transport.get('source') or '').startswith(('bluetooth', 'stock'))
+        str(transport.get('source') or '').startswith(('bluetooth', 'stock')) or
+        migration_ok
     )
     fleet_ok = bool(latest) and age is not None and age <= max_age and passed(checks, 'transport.controller')
     identity_ok = (

@@ -33,6 +33,7 @@ jobs:
             controller/lghs-fleet-command \
             controller/lghs-release \
             controller/lghs-classroom-ready \
+            controller/lghs-verify-migration \
             controller/lghs-fleet-notify \
             controller/lghsctl \
             controller/lghs-audit-sync \
@@ -128,6 +129,7 @@ jobs:
           grep -q 'release-keygen' controller/lghs-remote-shell
           grep -q 'release-install-key' controller/lghs-remote-shell
           grep -q 'classroom-ready' controller/lghs-remote-shell
+          grep -q 'verify-migration' controller/lghs-remote-shell
           grep -q 'backup-controller' controller/lghs-remote-shell
           grep -q 'command-status' controller/lghs-remote-shell
           grep -q 'command-cancel' controller/lghs-remote-shell
@@ -136,6 +138,7 @@ jobs:
           grep -q '/usr/local/sbin/lghs-release keygen' policies/sudoers/98-lghs-remote
           grep -q '/usr/local/sbin/lghs-release install-key' policies/sudoers/98-lghs-remote
           grep -q '/usr/local/sbin/lghs-classroom-ready \*' policies/sudoers/98-lghs-remote
+          grep -q '/usr/local/sbin/lghs-verify-migration \*' policies/sudoers/98-lghs-remote
           grep -q 'def controller_runtime' controller/lghsctl
           grep -q "'InvocationID'" controller/lghsctl
           grep -q 'lghs-sudo-selftest' install.sh

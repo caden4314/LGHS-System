@@ -38,6 +38,7 @@ def usage():
   status | versions | services | update-state | controller-runtime | release-status
   release-keygen | release-install-key DEVICE
   classroom-ready DEVICE
+  verify-migration DEVICE
   backup-controller
   command-status DEVICE | command-cancel COMMAND_ID
   info DEVICE
@@ -85,6 +86,8 @@ def main():
         return run(['/usr/local/sbin/lghs-release', 'install-key', argv[1].upper()])
     if action == 'classroom-ready' and len(argv) == 2 and valid_device(argv[1]):
         return run(['/usr/local/sbin/lghs-classroom-ready', argv[1].upper()])
+    if action == 'verify-migration' and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghs-verify-migration', argv[1].upper()])
     if action == 'command-status' and len(argv) == 2 and valid_device(argv[1]):
         return run(['/usr/local/sbin/lghs-fleet-command', 'status', argv[1].upper()])
     if action == 'command-cancel' and len(argv) == 2 and valid_command_id(argv[1]):
