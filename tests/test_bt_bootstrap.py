@@ -113,6 +113,13 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn('"type": "fleet_enrollment"', controller)
         self.assertIn('enrollment.get("type") != "fleet_enrollment"', student)
         self.assertIn('["bluetooth", "cloudflare", "cloudflare-verified", "fleet"]', student)
+        first_report = controller.index("first_report = wait_first_fleet_report(device_id")
+        consume = controller.rindex("consume_bootstrap_token(device_id)")
+        self.assertLess(mint_call, first_report)
+        self.assertLess(first_report, consume)
+        self.assertIn("bootstrap credential retained", controller)
+        self.assertIn('"first-telemetry"', controller)
+        self.assertIn('entry["first_telemetry_at"]', controller)
 
     def test_controller_publishes_rfcomm_sdp_service(self):
         src = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")

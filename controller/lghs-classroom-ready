@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Evaluate whether an enrolled LGHS student Pi is classroom-ready."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, '/usr/local/lib/lghs-python')
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lghs.database import FleetDB
+from lghs.protocol import normalize_device_id
+
+DB = FleetDB()
+REGISTRY = Path('/etc/lghs/fleet.json')
+CONTROLLER_COMMIT = Path('/var/lib/lghs/update/current-commit')
+DEFAULT_MAX_AGE = 30.0
+
+
+def load_registry() -> dict[str, Any]:
+    try:
+        raw = json.loads(REGISTRY.read_text(encoding='utf-8'))
+        devices = raw.get('devices', {}) if isinstance(raw, dict) else {}
+        return devices if isinstance(devices, dict) else {}
+    except Exception:
+        return {}
+
+
+def expected_commit(value: str | None) -> str:
+    if value:
+        commit = str(value).strip().lower()
+    else:
+        try:
+            commit = CONTROLLER_COMMIT.read_text(encoding='utf-8').strip().lower()
+        except Exception:
+            commit = ''
+    if len(commit) != 40 or any(ch not in '0123456789abcdef' for ch in commit):
+        raise ValueError('expected commit must be an exact 40-character Git SHA')
+    return commit
+
+
+def check_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    report = payload.get('health_report', {}) if isinstance(payload, dict) else {}
+    checks = report.get('checks', []) if isinstance(report, dict) else []
+    return {str(row.get('id')): row for row in checks if isinstance(row, dict) and row.get('id')}
+
+
+def passed(checks: dict[str, dict[str, Any]], check_id: str) -> bool:
+    return str((checks.get(check_id) or {}).get('state') or '').lower() == 'pass'
+
+
+def observed(checks: dict[str, dict[str, Any]], check_id: str, default: Any = None) -> Any:
+    return (checks.get(check_id) or {}).get('observed', default)
+
+
+def evaluate(device_id: str, *, commit: str | None = None, max_age: float = DEFAULT_MAX_AGE, now: float | None = None) -> dict[str, Any]:
+    device = normalize_device_id(device_id)
+    target = expected_commit(commit)
+    ts = time.time() if now is None else float(now)
+    registry = load_registry()
+    transport = registry.get(device, {}) if isinstance(registry.get(device), dict) else {}
+    row = DB.get_device(device) or {}
+    latest = DB.latest_telemetry(device) or {}
+    payload = latest.get('payload', {}) if isinstance(latest.get('payload'), dict) else {}
+    health = payload.get('health', {}) if isinstance(payload.get('health'), dict) else {}
+    inventory = health.get('inventory', {}) if isinstance(health.get('inventory'), dict) else {}
+    checks = check_map(payload)
+    try:
+        age = max(0.0, ts - float(latest.get('received_at') or 0)) if latest else None
+    except (TypeError, ValueError):
+        age = None
+
+    cloudflare_ok = transport.get('transport') == 'cloudflare' and bool(transport.get('ssh_host'))
+    provision_order = transport.get('provision_order') if isinstance(transport.get('provision_order'), list) else []
+    bootstrap_ok = cloudflare_ok and bool(latest) and (
+        provision_order[:3] == ['bluetooth', 'cloudflare', 'cloudflare-verified'] or
+        str(transport.get('source') or '').startswith(('bluetooth', 'stock'))
+    )
+    fleet_ok = bool(latest) and age is not None and age <= max_age and passed(checks, 'transport.controller')
+    identity_ok = (
+        str(inventory.get('hostname') or row.get('hostname') or '').upper() == device and
+        str(inventory.get('role') or row.get('role') or '').lower() == 'student'
+    )
+    service_ids = ('service.NetworkManager', 'service.ssh', 'service.lghs-agent', 'service.lghs-command-executor')
+    services_ok = all(passed(checks, item) for item in service_ids)
+    policy_ok = passed(checks, 'service.lghs-policy')
+    sudo_ok = passed(checks, 'sudo.broker')
+    lifecycle_ok = passed(checks, 'service.lghs-lifecycle')
+    release_ok = passed(checks, 'release.signing-key')
+    failed_units_observed = observed(checks, 'system.failed-units', [])
+    failed_units = failed_units_observed if isinstance(failed_units_observed, list) else [str(failed_units_observed)] if failed_units_observed else []
+    failed_units_ok = passed(checks, 'system.failed-units') and not failed_units
+    current_commit = str(inventory.get('current_commit') or row.get('current_commit') or '').lower()
+    channel = str(inventory.get('update_channel') or '')
+    version_ok = current_commit == target and channel == 'main'
+
+    sections = {
+        'Bootstrap': bootstrap_ok,
+        'Cloudflare': cloudflare_ok,
+        'Fleet': fleet_ok,
+        'Identity': identity_ok,
+        'Services': services_ok,
+        'Policy': policy_ok,
+        'Sudo broker': sudo_ok,
+        'Lifecycle': lifecycle_ok,
+        'Release signing': release_ok,
+        'Version': version_ok,
+    }
+    ready = all(sections.values()) and failed_units_ok
+    return {
+        'device_id': device,
+        'ready': ready,
+        'sections': sections,
+        'failed_units': failed_units,
+        'telemetry_age_seconds': age,
+        'commit': current_commit,
+        'expected_commit': target,
+        'channel': channel or 'unknown',
+        'boot_id': str(latest.get('boot_id') or row.get('boot_id') or ''),
+        'received_at': latest.get('received_at'),
+    }
+
+
+def render(result: dict[str, Any]) -> str:
+    device = result['device_id']
+    lines = [f"{device} {'CLASSROOM READY' if result['ready'] else 'NOT READY'}"]
+    for label, ok in result['sections'].items():
+        dots = '.' * max(1, 18 - len(label))
+        lines.append(f'{label} {dots} {"PASS" if ok else "FAIL"}')
+    lines.append(f"Failed units ..... {len(result['failed_units'])}")
+    lines.append(f"Commit ........... {result['commit'][:12] if result['commit'] else 'unknown'}")
+    lines.append(f"Channel .......... {result['channel']}")
+    if result.get('telemetry_age_seconds') is not None:
+        lines.append(f"Telemetry age .... {result['telemetry_age_seconds']:.1f}s")
+    return '\n'.join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description='LGHS classroom-ready acceptance gate')
+    parser.add_argument('device')
+    parser.add_argument('--commit')
+    parser.add_argument('--max-age', type=float, default=DEFAULT_MAX_AGE)
+    parser.add_argument('--json', action='store_true')
+    args = parser.parse_args()
+    try:
+        result = evaluate(args.device, commit=args.commit, max_age=max(5.0, min(args.max_age, 300.0)))
+    except Exception as exc:
+        print(f'LGHS classroom acceptance failed: {exc}', file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else render(result))
+    return 0 if result['ready'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

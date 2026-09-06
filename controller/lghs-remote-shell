@@ -31,7 +31,9 @@ def valid_channel(value):
 def usage():
     print('''LGHS remote management commands:
   console
-  status | versions | services | update-state | controller-runtime
+  status | versions | services | update-state | controller-runtime | release-status
+  release-keygen | release-install-key DEVICE
+  classroom-ready DEVICE
   info DEVICE
   health DEVICE
   restart-service DEVICE {agent|executor|policy|ssh|update-timer|reconcile-timer}
@@ -69,6 +71,14 @@ def main():
         return run(['/usr/local/sbin/lghs-console'], replace=True)
     if action in ('status', 'versions', 'services', 'update-state', 'controller-runtime') and len(argv) == 1:
         return run(['/usr/local/sbin/lghsctl', action])
+    if action == 'release-status' and len(argv) == 1:
+        return run(['/usr/local/sbin/lghs-release', 'status'])
+    if action == 'release-keygen' and len(argv) == 1:
+        return run(['/usr/local/sbin/lghs-release', 'keygen'])
+    if action == 'release-install-key' and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghs-release', 'install-key', argv[1].upper()])
+    if action == 'classroom-ready' and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghs-classroom-ready', argv[1].upper()])
     if action == 'update-controller' and len(argv) == 1:
         return run(['/usr/local/sbin/lghs-update'])
     if action == 'update-exact' and len(argv) in (3,4) and valid_device(argv[1]) and valid_commit(argv[2]) and (len(argv)==3 or valid_channel(argv[3])):

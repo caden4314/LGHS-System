@@ -24,6 +24,7 @@ jobs:
             controller/lghs/release.py \
             controller/lghs-fleet-command \
             controller/lghs-release \
+            controller/lghs-classroom-ready \
             controller/lghs-fleet-rollout \
             controller/lghs-fleet-maintenance \
             controller/lghs-rollout-manager \
@@ -39,6 +40,8 @@ jobs:
             tests/test_command_plane.py \
             tests/test_controller_backup.py \
             tests/test_release_signing.py \
+            tests/test_classroom_ready.py \
+            tests/test_architecture_docs.py \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
@@ -58,6 +61,8 @@ jobs:
             tests/test_command_plane.py \
             tests/test_controller_backup.py \
             tests/test_release_signing.py \
+            tests/test_classroom_ready.py \
+            tests/test_architecture_docs.py \
             tests/test_fleet_rollout.py \
             tests/test_rollout_manager.py \
             tests/test_deployment_recovery.py \
@@ -136,10 +141,18 @@ jobs:
           grep -Fq "Ed25519PublicKey" student/lghs-release-verify
           grep -Fq "release_sequence" controller/lghs/release.py
           grep -Fq "Signed release required" updater/lghs-update
+          grep -Fq "release.signing-key" student/lghs-agent
           grep -Fq "LGHS_ALLOW_UNSIGNED_RELEASE" updater/lghs-update
           grep -Fq "LGHS_ALLOW_RELEASE_ROLLBACK" student/lghs-release-verify
           grep -Fq "release-key-install" controller/lghs/protocol.py
           grep -Fq "student/lghs-release-key-install" install.sh
+          grep -Fq "wait_first_fleet_report" controller/lghs-bt-provision
+          grep -Fq "first_telemetry_at" controller/lghs-bt-provision
+          grep -Fq "lghs-classroom-ready" install.sh
+          grep -Fq "release-keygen" controller/lghs-remote-shell
+          grep -Fq "CLASSROOM READY" controller/lghs-classroom-ready
+          grep -Fq "stock Raspberry Pi OS plus zero-touch LGHS provisioning" README.md
+          grep -Fq "not guaranteed atomic across sudden power loss" docs/ARCHITECTURE.md
           grep -Fq "expected_reboot" controller/lghs/maintenance.py
           grep -Fq "lifecycle-boot-mismatch" controller/lghs-fleet-api
           grep -Fq "LGHS_FLEET_OFFLINE_SECONDS" controller/lghs-console-tunnel

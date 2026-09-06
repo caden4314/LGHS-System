@@ -269,7 +269,8 @@ validate_controller() {
         /usr/local/lib/lghs-python/lghs/database.py \
         /usr/local/lib/lghs-python/lghs/protocol.py \
         /usr/local/lib/lghs-python/lghs/release.py \
-        /usr/local/sbin/lghs-release || return 1
+        /usr/local/sbin/lghs-release \
+        /usr/local/sbin/lghs-classroom-ready || return 1
     [[ -x /usr/local/sbin/lghs-release ]] || return 1
     systemctl is-active --quiet lghs-update.timer || return 1
     systemctl is-active --quiet lghs-reconcile.timer || return 1

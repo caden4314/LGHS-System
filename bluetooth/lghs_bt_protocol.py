@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """LGHS Bluetooth bootstrap protocol primitives.
 
-The Bluetooth link is treated as untrusted. Device-specific Fleet API tokens
-provide mutual authentication while ephemeral X25519 keys provide forward
-secrecy. Wi-Fi credentials are carried only inside AES-GCM ciphertext.
+The Bluetooth link is treated as untrusted. A short-lived, per-device bootstrap
+credential authenticates the initial transcript. Ephemeral X25519 + HKDF derive
+the session key, AES-GCM protects provisioning data, and HMAC proofs provide
+mutual application authentication. Fleet API credentials are minted only after
+LGCSCONT verifies the student's Cloudflare SSH endpoint.
 """
 import base64
 import hashlib

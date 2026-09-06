@@ -32,6 +32,7 @@ jobs:
             controller/lghs-fleet-api \
             controller/lghs-fleet-command \
             controller/lghs-release \
+            controller/lghs-classroom-ready \
             controller/lghs-fleet-notify \
             controller/lghsctl \
             controller/lghs-audit-sync \
@@ -58,6 +59,8 @@ jobs:
             tests/test_fleet_database.py \
             tests/test_controller_backup.py \
             tests/test_release_signing.py \
+            tests/test_classroom_ready.py \
+            tests/test_architecture_docs.py \
             tests/test_audit_ingest.py \
             tests/test_sudo_state.py \
             tests/test_fleet_api_integration.py \
@@ -70,6 +73,8 @@ jobs:
             tests/test_fleet_database.py \
             tests/test_controller_backup.py \
             tests/test_release_signing.py \
+            tests/test_classroom_ready.py \
+            tests/test_architecture_docs.py \
             tests/test_audit_ingest.py \
             tests/test_sudo_state.py \
             tests/test_fleet_api_integration.py \
@@ -120,6 +125,13 @@ jobs:
           grep -q 'no-port-forwarding' controller/lghs-remote-admin
           grep -q 'sudo-approve' controller/lghs-remote-shell
           grep -q 'controller-runtime' controller/lghs-remote-shell
+          grep -q 'release-keygen' controller/lghs-remote-shell
+          grep -q 'release-install-key' controller/lghs-remote-shell
+          grep -q 'classroom-ready' controller/lghs-remote-shell
+          grep -q '/usr/local/sbin/lghs-release status' policies/sudoers/98-lghs-remote
+          grep -q '/usr/local/sbin/lghs-release keygen' policies/sudoers/98-lghs-remote
+          grep -q '/usr/local/sbin/lghs-release install-key' policies/sudoers/98-lghs-remote
+          grep -q '/usr/local/sbin/lghs-classroom-ready \*' policies/sudoers/98-lghs-remote
           grep -q 'def controller_runtime' controller/lghsctl
           grep -q "'InvocationID'" controller/lghsctl
           grep -q 'lghs-sudo-selftest' install.sh
@@ -226,6 +238,7 @@ jobs:
           grep -q 'Ed25519PublicKey' student/lghs-release-verify
           grep -q 'LGHS_ALLOW_RELEASE_ROLLBACK' student/lghs-release-verify
           grep -q 'Signed release required' updater/lghs-update
+          grep -q 'release.signing-key' student/lghs-agent
           grep -q 'LGHS_ALLOW_UNSIGNED_RELEASE' updater/lghs-update
           grep -q 'release-key-install' controller/lghs/protocol.py
           grep -q 'student/lghs-release-key-install' install.sh

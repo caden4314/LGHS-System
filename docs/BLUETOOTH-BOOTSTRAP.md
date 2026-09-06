@@ -1,58 +1,60 @@
-# LGHS Bluetooth Zero-Touch Bootstrap v2
+# LGHS Bluetooth Zero-Touch Bootstrap
 
-LGHS 0.6 uses Bluetooth only for the first authenticated bootstrap of a freshly flashed Student Pi. Normal telemetry, commands, sudo state and audit traffic remain on the HTTPS fleet plane. The same authenticated/encrypted Bluetooth transaction now provisions both Wi-Fi and the device's Cloudflare SSH tunnel, so a fresh Student Pi does not require local SSH enrollment.
+LGHS uses Bluetooth only for the first authenticated provisioning transaction of a stock Student Pi. Normal telemetry, commands, sudo state, release delivery, and audit traffic use the HTTPS Fleet plane.
 
-## Lifecycle
+Bluetooth is treated as an untrusted carrier. The first session is authenticated with a short-lived, password-derived **per-device bootstrap credential**, not a Fleet API token.
 
-1. The controller keeps `lghs-bt-provision.service` available on RFCOMM channel 17 and advertises the alias `LGHS-PROVISION-<controller>`.
-2. A fresh student image participates only when `/etc/lghs/bluetooth-bootstrap-enabled` exists and `/var/lib/lghs/bootstrap/wifi-provisioned.json` does not.
-3. The student waits for controller Bluetooth discovery events.
-4. Both sides create ephemeral X25519 keys and fresh nonces.
-5. The student proves possession of its device-specific Fleet API token. The controller verifies that token against `/etc/lghs/fleet-api-tokens.json`.
-6. The controller proves possession of the same device-specific token back to the student.
-7. Both sides derive a per-session key with X25519 + HKDF-SHA256.
-8. The controller reads its active NetworkManager Wi-Fi profile.
-9. For a normal bootstrap, the controller also creates or reuses `LGHS-<DEVICE>`, configures `ssh-<device>.<zone> -> ssh://localhost:22`, creates/updates the Cloudflare DNS record, and obtains the per-tunnel token.
-10. Wi-Fi credentials and the Cloudflare tunnel token are sent only inside the authenticated AES-256-GCM provisioning payload.
-11. The student creates a root-owned NetworkManager connection, brings Wi-Fi online, and verifies the Fleet API `/health` endpoint over HTTPS.
-12. The student installs/starts `cloudflared` using the received token and waits for a registered tunnel connection.
-13. The student returns its ED25519 SSH host public key and allocated Cloudflare hostname over the authenticated Bluetooth session.
-14. The controller records the Cloudflare transport in `/etc/lghs/fleet.json` and pins the student's host key for the public hostname.
-15. The controller sends a final `ready` acknowledgement. Only then does the student write `wifi-provisioned.json`; the systemd condition prevents future unsolicited bootstrap attempts.
+## Enrollment order
+
+1. LGCSCONT advertises the provisioning RFCOMM service.
+2. A fresh student participates only while Bluetooth bootstrap is explicitly enabled and no completion marker exists.
+3. Student and controller create fresh nonces and ephemeral X25519 key pairs.
+4. The student proves possession of its per-device bootstrap credential with an HMAC transcript proof.
+5. LGCSCONT proves possession of the same bootstrap credential back to the student.
+6. Both sides derive the AES-GCM session key with X25519 + HKDF-SHA256.
+7. LGCSCONT sends the active Wi-Fi profile, controller SSH public key, and per-device Cloudflare tunnel bootstrap material inside authenticated ciphertext.
+8. The student installs Wi-Fi, controller SSH authorization, and its outbound Cloudflare tunnel.
+9. The student returns its Cloudflare hostname and Ed25519 SSH host key through the authenticated session.
+10. LGCSCONT pins that identity and verifies SSH through Cloudflare.
+11. Only after Cloudflare SSH verification does LGCSCONT mint a per-device Fleet API token.
+12. The Fleet token is delivered inside the existing authenticated/encrypted Bluetooth session.
+13. The student installs its Fleet identity and starts the agent, executor, policy, and timers.
+14. The student reports `fleet-ready`, but this is not yet the controller success boundary.
+15. LGCSCONT waits until `/var/lib/lghs/fleet.db` contains a fresh authenticated report for the expected device identity.
+16. LGCSCONT records the `first-telemetry` milestone and only then consumes the one-time bootstrap credential.
+17. Full classroom readiness is evaluated separately with `lghs-classroom-ready DEVICE`.
+
+A Fleet API token is never used to establish the first Bluetooth session.
 
 ## Security properties
 
-- SSID/PSK values and Cloudflare tunnel tokens are never placed in Bluetooth advertisements.
-- Wi-Fi and tunnel credentials are never sent in plaintext over RFCOMM.
-- A nearby Bluetooth device cannot request credentials or a tunnel without a valid per-device Fleet API token.
-- Fresh ephemeral X25519 keys give sessions forward secrecy even though authentication uses an existing device token.
-- Authentication proofs bind controller ID, device ID, both nonces and both ephemeral public keys, preventing transcript replay/substitution.
-- The Cloudflare tunnel token is captured in controller process memory only long enough to encrypt it into the authenticated bootstrap payload. It is not put in argv or the controller fleet registry.
-- The student's SSH host key is returned through the already authenticated Bluetooth channel, avoiding trust-on-first-use over an untrusted LAN.
-- Existing student Pis are **not** automatically opted into Bluetooth reprovisioning by a normal update.
-- A successful bootstrap is one-shot. Reprovisioning requires an explicit administrator action to remove the completion marker and enable bootstrap again.
-- The controller does not log Wi-Fi passwords, Fleet tokens, or Cloudflare tunnel tokens.
+- Bootstrap proofs bind controller ID, device ID, both nonces, and both ephemeral public keys.
+- Wi-Fi credentials and Cloudflare tunnel tokens are never placed in Bluetooth advertisements or sent as plaintext RFCOMM data.
+- Ephemeral X25519 keys provide session forward secrecy; HKDF derives the session key and AES-GCM provides confidentiality/integrity.
+- The Cloudflare tunnel token is held in controller memory only long enough to encrypt the authenticated provisioning payload.
+- The student's SSH host key is returned through the authenticated Bluetooth session, then pinned before controller SSH verification.
+- Fleet credentials are created only after controller-verified Cloudflare SSH succeeds.
+- The bootstrap credential is retained if the first authenticated Fleet report is not observed, allowing safe retry.
+- Existing enrolled students are not automatically opted into Bluetooth reprovisioning by a normal software update.
 
 ## Initial Wi-Fi support
 
-The bootstrap implementation supports:
+The bootstrap implementation supports open Wi-Fi, WPA-PSK, and WPA3-SAE. 802.1X/EAP profiles are intentionally rejected rather than moving certificate/private-key material through this bootstrap transaction.
 
-- open Wi-Fi
-- WPA-PSK
-- WPA3-SAE
+## Stock-device requirements
 
-802.1X/EAP profiles are intentionally rejected rather than copying certificate/private-key material over Bluetooth.
+The preferred path is [`../bootstrap/STOCK-SETUP.md`](../bootstrap/STOCK-SETUP.md). LGCSCONT must be armed with the stock bootstrap secret before the fresh students start enrollment. No Fleet token is copied to a fresh Pi in advance.
 
-## Image-builder / Imager requirements
+LGCSCONT also requires its normal Cloudflare account/zone configuration and controller Fleet SSH identity. The student creates its local identity and derives its bootstrap credential before Bluetooth begins.
 
-When a student image is built with `LGHS_IMAGE_BUILD=1`, the installer creates `/etc/lghs/bluetooth-bootstrap-enabled`. Before first boot, LGHS Imager must inject:
+## Completion and runtime separation
 
-- the device ID / hostname provisioning files,
-- a unique Fleet API token for that device,
-- the controller fleet SSH public key needed for later management.
+The controller registry records:
 
-LGCSCONT must already have the same device/token entry in `/etc/lghs/fleet-api-tokens.json`. The controller also needs its Cloudflare API token and account/zone configuration before a fresh student is powered on.
+```json
+["bluetooth","cloudflare","cloudflare-verified","fleet","first-telemetry"]
+```
 
-## Runtime separation
+After provisioning, Bluetooth bootstrap is one-shot and normal operation moves to HTTPS Fleet plus explicit Cloudflare SSH recovery. `lghs-classroom-ready DEVICE` is the final acceptance gate; Bluetooth success by itself is not classroom readiness.
 
-Bluetooth discovery is bootstrap-only. Once `/var/lib/lghs/bootstrap/wifi-provisioned.json` exists, the student bootstrap service no longer starts. Runtime management then uses the Fleet API over HTTPS and the per-device Cloudflare SSH hostname recorded by the controller.
+Custom-image tooling under `image-builder/` is optional/legacy and is not the production identity/bootstrap model.

@@ -192,6 +192,14 @@ def pi_inventory() -> dict[str, Any]:
     if current_commit and not COMMIT_RE.fullmatch(current_commit):
         current_commit = ''
 
+    update_channel = 'main'
+    try:
+        for line in Path('/etc/lghs/update.env').read_text(encoding='utf-8').splitlines():
+            if line.startswith('LGHS_UPDATE_BRANCH=') and line.split('=', 1)[1].strip():
+                update_channel = line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+
     out: dict[str, Any] = {
         'hostname': socket.gethostname().upper(),
         'role': read_text(Path('/etc/lghs/role')),
@@ -200,14 +208,32 @@ def pi_inventory() -> dict[str, Any]:
         'serial': serial,
         'current_commit': current_commit,
         'current_version': read_text(Path('/etc/lghs/version')),
+        'update_channel': update_channel,
     }
     return {key: value for key, value in out.items() if value not in ('', None)}
 
 
+def release_key_ready() -> bool:
+    key = read_text(Path('/etc/lghs/release-public-key'))
+    if not key or not os.access('/usr/local/sbin/lghs-release-verify', os.X_OK):
+        return False
+    try:
+        return len(base64.b64decode(key, validate=True)) == 32
+    except Exception:
+        return False
+
+
 def pi_health() -> dict[str, Any]:
+    sudo_paths = (
+        Path('/usr/local/bin/sudo'), Path('/usr/local/sbin/lghs-sudo-broker'),
+        Path('/usr/local/sbin/lghs-approved-exec'), Path('/usr/local/sbin/lghs-sudo-admin'),
+        Path('/usr/local/sbin/lghs-audit-export'),
+    )
     out: dict[str, Any] = {
         'reboot_required': Path('/run/reboot-required').exists(),
         'inventory': pi_inventory(),
+        'sudo_broker_ready': all(path.is_file() and os.access(path, os.X_OK) for path in sudo_paths),
+        'release_public_key_ready': release_key_ready(),
     }
     pending = reboot_status()
     if pending:

@@ -13,9 +13,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, "/usr/local/lib/lghs-bt")
+sys.path.insert(0, "/usr/local/lib/lghs-python")
 from lghs_bt_protocol import (PROTOCOL_VERSION, derive_key, encrypt_payload,
                               new_ephemeral, proof, recv_frame, send_frame,
                               transcript, verify_proof)
+from lghs.database import FleetDB
 
 CHANNEL = int(os.environ.get("LGHS_BT_RFCOMM_CHANNEL", "17"))
 BOOTSTRAP_TOKENS = Path(os.environ.get("LGHS_BOOTSTRAP_TOKENS", "/etc/lghs/bootstrap-tokens.json"))
@@ -33,6 +35,8 @@ CONTROLLER_PUB = Path("/etc/lghs/secrets/controller_ed25519.pub")
 KNOWN_HOSTS = Path("/var/lib/lghs/ssh_known_hosts")
 DEFAULT_FLEET_API_URL = os.environ.get("LGHS_FLEET_API_URL", "https://fleet-api.scenicrouteservers.com")
 CLOUDFLARED = shutil.which("cloudflared") or "/usr/local/bin/cloudflared"
+FLEET_DB = FleetDB()
+FIRST_REPORT_TIMEOUT = max(10.0, float(os.environ.get("LGHS_FIRST_FLEET_REPORT_TIMEOUT", "60")))
 
 
 def run(cmd, timeout=None, input_text=None):
@@ -126,6 +130,21 @@ def record_ssh_user(device_id, ssh_user):
     atomic_write(TRANSPORT_REGISTRY, data, mode=0o644)
 
 
+def mark_first_telemetry(device_id, received_at):
+    data = load_json(TRANSPORT_REGISTRY)
+    data.setdefault("version", 1)
+    devices = data.setdefault("devices", {})
+    if not isinstance(devices, dict):
+        raise RuntimeError("Invalid transport registry devices object")
+    entry = devices.setdefault(device_id, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        devices[device_id] = entry
+    entry["provision_order"] = ["bluetooth", "cloudflare", "cloudflare-verified", "fleet", "first-telemetry"]
+    entry["first_telemetry_at"] = float(received_at)
+    atomic_write(TRANSPORT_REGISTRY, data, mode=0o644)
+
+
 def controller_public_key():
     if CONTROLLER_PUB.exists():
         text = CONTROLLER_PUB.read_text(encoding="utf-8").strip()
@@ -216,6 +235,27 @@ def verify_cloudflare_ssh(device_id, ssh_host, ssh_user):
     raise RuntimeError("Cloudflare SSH verification failed; Fleet enrollment refused: " + last[-500:])
 
 
+def wait_first_fleet_report(device_id, not_before, timeout=None):
+    """Wait for a report that the authenticated Fleet API persisted after enrollment."""
+    deadline = time.monotonic() + (FIRST_REPORT_TIMEOUT if timeout is None else float(timeout))
+    last_received = 0.0
+    while time.monotonic() < deadline:
+        latest = FLEET_DB.latest_telemetry(device_id)
+        if isinstance(latest, dict):
+            try:
+                last_received = float(latest.get("received_at") or 0)
+            except (TypeError, ValueError):
+                last_received = 0.0
+            payload = latest.get("payload", {}) if isinstance(latest.get("payload"), dict) else {}
+            health = payload.get("health", {}) if isinstance(payload.get("health"), dict) else {}
+            inventory = health.get("inventory", {}) if isinstance(health.get("inventory"), dict) else {}
+            hostname = str(inventory.get("hostname") or "").upper()
+            if last_received >= float(not_before) and hostname == device_id:
+                return latest
+        time.sleep(0.5)
+    raise RuntimeError(f"first authenticated Fleet report not observed for {device_id}; bootstrap credential retained (last_received={last_received:.3f})")
+
+
 def ensure_sdp_record():
     browse = run(["sdptool", "browse", "local"], timeout=COMMAND_TIMEOUT)
     marker = f"Channel: {CHANNEL}"
@@ -296,9 +336,10 @@ def handle_client(conn, address):
     # Only now is a Fleet credential created. This enforces the required order:
     # Bluetooth authentication -> Cloudflare install -> controller SSH verify -> Fleet.
     fleet_token = mint_fleet_token(device_id)
+    enrollment_issued_at = time.time()
     fleet_payload = {
         "type": "fleet_enrollment", "fleet_token": fleet_token,
-        "fleet_api_url": DEFAULT_FLEET_API_URL, "issued_at": time.time(),
+        "fleet_api_url": DEFAULT_FLEET_API_URL, "issued_at": enrollment_issued_at,
     }
     encrypted_fleet = encrypt_payload(key, tx, fleet_payload)
     send_frame(conn, {"v": PROTOCOL_VERSION, "type": "fleet_enrollment", **encrypted_fleet})
@@ -306,8 +347,12 @@ def handle_client(conn, address):
     if fleet_result.get("type") != "result" or fleet_result.get("status") != "fleet-ready":
         raise RuntimeError("student did not confirm Fleet enrollment")
 
+    first_report = wait_first_fleet_report(device_id, enrollment_issued_at)
+    first_received = float(first_report.get('received_at') or 0)
+    mark_first_telemetry(device_id, first_received)
+    print(f"FIRST TELEMETRY {device_id}: authenticated report at {first_received:.3f}", flush=True)
     consume_bootstrap_token(device_id)
-    print(f"READY {device_id}: Bluetooth -> Cloudflare verified -> Fleet enrolled", flush=True)
+    print(f"READY {device_id}: Bluetooth -> Cloudflare verified -> Fleet enrolled -> first telemetry", flush=True)
 
 
 def client_thread(conn, address):
@@ -335,7 +380,7 @@ def main():
     server.bind((socket.BDADDR_ANY, CHANNEL)); server.listen(5)
     ensure_sdp_record()
     print(f"LGHS Bluetooth provisioning listening on RFCOMM channel {CHANNEL}", flush=True)
-    print("Enrollment order enforced: Bluetooth -> Cloudflare verify -> Fleet", flush=True)
+    print("Enrollment order enforced: Bluetooth -> Cloudflare verify -> Fleet -> first authenticated telemetry", flush=True)
     while True:
         conn, address = server.accept()
         threading.Thread(target=client_thread, args=(conn, address), daemon=True).start()
