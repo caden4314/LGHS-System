@@ -16,8 +16,10 @@ LGHS enforces this enrollment order:
 8. The Fleet token is delivered over the existing authenticated/encrypted Bluetooth session.
 9. Fleet services and LGHS policy enforcement start.
 10. LGCSCONT waits for the first authenticated Fleet report from the expected device.
-11. Only after that report is persisted does LGCSCONT consume the bootstrap credential and record the `first-telemetry` milestone.
-12. `lghs-classroom-ready CS-##` is the final classroom acceptance gate.
+11. LGCSCONT records `first-telemetry`, queues the controller's Ed25519 release verification public key through Fleet, and waits for fresh telemetry to prove the key is installed.
+12. LGCSCONT records the `release-signing` milestone.
+13. Only after those authenticated milestones does LGCSCONT consume the bootstrap credential.
+14. `lghs-classroom-ready CS-##` is the final classroom acceptance gate.
 
 A Fleet token is never used to establish the first Bluetooth session.
 
@@ -34,11 +36,14 @@ Repeat the naming rule for every device (`CS-02` / `cs-02`, and so on).
 
 ## Arm the controller once
 
-On LGCSCONT, arm the classroom device credentials before starting the Pis:
+On LGCSCONT, verify the production release-signing role once, then arm the classroom device credentials before starting the Pis:
 
 ```bash
+sudo /usr/local/sbin/lghs-release status
 sudo python3 /opt/lghs/repo/controller/lghs-stock-bootstrap-secret
 ```
+
+If release status reports `key_exists: false`, initialize it once with `sudo /usr/local/sbin/lghs-release keygen` before provisioning students. The signing private key remains controller-only.
 
 With no arguments this arms `CS-01` through `CS-14` for 30 days. Enter the provisioning password twice. The controller stores only a derived master and per-device derived credentials, never the plaintext password.
 
@@ -85,13 +90,14 @@ Successful controller output ends with messages similar to:
 ```text
 Cloudflare VERIFIED CS-01: cs-admin@ssh-cs-01.scenicrouteservers.com
 FIRST TELEMETRY CS-01: authenticated report at ...
-READY CS-01: Bluetooth -> Cloudflare verified -> Fleet enrolled -> first telemetry
+RELEASE SIGNING CS-01: verification key confirmed at ...
+READY CS-01: Bluetooth -> Cloudflare verified -> Fleet -> first telemetry -> release signing
 ```
 
 The final provision record must preserve this order:
 
 ```json
-["bluetooth","cloudflare","cloudflare-verified","fleet","first-telemetry"]
+["bluetooth","cloudflare","cloudflare-verified","fleet","first-telemetry","release-signing"]
 ```
 
 After `READY`, `lghs-bt-bootstrap.service` becoming inactive is expected; bootstrap is one-shot.
@@ -126,6 +132,7 @@ systemctl is-enabled lghs-update.timer
 - Initial Bluetooth authentication uses the password-derived, per-device one-time credential; it is not a Fleet token.
 - Session key exchange uses ephemeral X25519, HKDF, AES-GCM, and mutual HMAC transcript proofs.
 - Fleet enrollment is blocked until LGCSCONT proves Cloudflare SSH reachability using its controller key.
-- The student bootstrap token is removed only after LGCSCONT persists the first authenticated Fleet report.
+- The student bootstrap token is removed only after LGCSCONT persists the first authenticated Fleet report and fresh telemetry proves the release verification key is enrolled.
+- Fresh production students therefore enter signed-release enforcement without a separate manual key-install step.
 - Controller registry credentials expire after 30 days and are consumed on successful enrollment.
 - The stock Git identity filter preserves `cs-##` / `cs-admin` mappings for later updater runs while legacy source defaults are still being retired.

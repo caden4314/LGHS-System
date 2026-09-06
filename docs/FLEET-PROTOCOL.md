@@ -1,23 +1,23 @@
 # LGHS Fleet Protocol v1
 
-LGHS 0.5 formalizes the controller/student contract. Normal fleet operations use outbound HTTPS. Cloudflare SSH remains an explicit administration and recovery path, not the passive data plane.
+LGHS 0.6.0 uses an outbound HTTPS controller/student protocol for normal telemetry, commands, sudo state, audit transport, lifecycle evidence, and rollout health. Cloudflare SSH is an explicit administration/recovery path; it is not the passive liveness or command-delivery plane.
 
 ## Telemetry envelope
 
-Every 0.5 managed-agent report carries:
+A managed student report uses protocol version 1 and carries a boot-scoped monotonic sequence:
 
 ```json
 {
   "protocol": 1,
-  "agent_version": "0.5.0",
+  "agent_version": "0.6.0",
   "device_id": "CS-999",
-  "boot_id": "...",
+  "boot_id": "<uuid>",
   "sequence": 48291,
-  "sent_at": 1788068837.1,
+  "sent_at": 1788655000.0,
   "payload": {
     "metrics": {},
     "health": {},
-    "health_report": {"health_version": 1, "checks": []},
+    "health_report": {"health_version": 2, "checks": []},
     "command_states": [],
     "sudo_requests": [],
     "audit_batches": []
@@ -25,104 +25,109 @@ Every 0.5 managed-agent report carries:
 }
 ```
 
-`boot_id + sequence` is the ordering key. Sequence numbers must increase within one boot and may reset after `boot_id` changes.
+`boot_id + sequence` is the ordering key. Sequence numbers increase within one boot and may reset only when `boot_id` changes.
 
-## Controller response
+## Controller response and delivery
+
+The persistent agent uses:
+
+- `POST /v1/report/<device>` for telemetry and state.
+- `GET /v1/commands/<device>?wait=25` for bounded long-poll command delivery.
+
+The controller persists authenticated telemetry in SQLite before compatibility views are refreshed. Fresh SQLite telemetry is therefore the authority for runtime liveness, provisioning milestones, and classroom acceptance.
+
+## Command lifecycle and idempotency
+
+Commands move through explicit execution states:
+
+```text
+QUEUED -> DELIVERED -> RECEIVED -> ACCEPTED -> RUNNING
+                                      |          |
+                                      |          +-> SUCCEEDED
+                                      |          +-> FAILED
+                                      |          +-> TIMED_OUT
+                                      |          +-> REJECTED
+                                      +------------> CANCELED when cancellation is still guaranteed
+```
+
+The controller may redeliver queued/delivered/received work. A command ID is also the device-side idempotency key, so redelivery does not create a second local side effect. Uncertain prior execution is held for explicit recovery rather than blindly repeated.
+
+Human-readable stages such as `Fetching GitHub`, `Installing`, `Validating`, `Rolling back`, and `Reboot required` do not replace the execution state.
+
+## Privilege boundary
+
+```text
+HTTPS Fleet API
+      |
+      v
+lghs-agent (unprivileged)
+  telemetry / long-poll / command state / audit cursors
+      |
+      | typed JSON over root-owned Unix socket
+      v
+lghs-command-executor (root)
+  strict action allowlist / durable queue / typed helpers
+```
+
+The executor does not accept arbitrary shell text. Sensitive root operations are mapped to small validated actions such as exact-SHA update submission, release-key enrollment, typed reboot scheduling, and bounded status/audit reads.
+
+## Signed exact-SHA updates
+
+LGCSCONT is the revision authority. After the release verification public key is enrolled, a managed student exact-SHA update must include a canonical Ed25519-signed release manifest.
+
+The signed payload binds at least:
 
 ```json
 {
-  "protocol": 1,
-  "received_at": 1788068837.2,
-  "commands": [],
-  "audit_ack": {}
+  "schema": 1,
+  "release_sequence": 2,
+  "channel": "main",
+  "version": "0.6.0",
+  "commit": "<40-character-git-sha>",
+  "created_at": 1788655000,
+  "expires_at": 1789259800,
+  "minimum_updater": "0.6.0"
 }
 ```
 
-## Command transport
+The student verifies signature, exact commit, channel, expiration, minimum updater version, and rollback sequence **before** Git/install work. The accepted release sequence is persisted only after successful target validation. Local-root emergency overrides are intentionally not exposed through Fleet.
 
-The persistent agent uses two related HTTPS paths:
+## Structured health and liveness
 
-- `POST /v1/report/<device>` for telemetry, health, command state, sudo state and audit batches.
-- `GET /v1/commands/<device>?wait=25` for bounded long-poll command delivery.
+`health_report.health_version = 2` contains typed checks with IDs, severity, observed/expected values, and remediation hints. Critical checks gate rollout/readiness; advisory warnings remain visible without automatically blocking deployment.
 
-Long polling is capped below the Cloudflare request timeout and reconnects after completion/failure. Normal command latency therefore no longer depends on the regular telemetry interval.
+Important production checks include core services, root filesystem writability, disk space, clock synchronization, current undervoltage/throttling, controller transport freshness, sudo broker health, failed systemd units, and `release.signing-key`.
 
-The controller redelivers commands in `queued`, `delivered`, or `received` state until the device reaches `accepted`. Device-side local acceptance is idempotent by command ID.
-
-## Command lifecycle
-
-Execution state is independent from human-readable stage text.
+Operator liveness is grace-based rather than SSH-based:
 
 ```text
-QUEUED
-  -> DELIVERED
-  -> RECEIVED
-  -> ACCEPTED
-  -> RUNNING
-      -> SUCCEEDED
-      -> FAILED
-      -> TIMED_OUT
-      -> REJECTED
-      -> CANCELED
+fresh telemetry -> OK/CHECK -> STALE -> OFFLINE
+planned poweroff -> SHUTDOWN
+planned reboot   -> REBOOTING -> new boot ID -> OK/CHECK
 ```
 
-Examples of `stage` are `Fetching GitHub`, `Installing`, `Validating`, `Rolling back`, and `Reboot required`.
+Planned lifecycle state is persisted and suppresses ordinary critical telemetry-loss alerts while it is authoritative.
 
-## Student privilege boundary
+## Sudo and audit transport
 
-```text
-Internet / Fleet API
-        |
-        v
-lghs-agent (unprivileged lghs-agent user)
-  - telemetry
-  - long-poll
-  - event wakeups
-  - audit cursors
-  - command state
-        |
-        | JSON over root-owned Unix socket
-        v
-lghs-command-executor (root)
-  - strict action allowlist
-  - update queue submission
-  - sanitized service/hardware status
-  - bounded audit reads
-  - sanitized sudo-request snapshots
-```
+The root executor exposes sanitized sudo-request snapshots to the unprivileged agent. The controller stores request lifecycle in SQLite and approval/denial remains a typed administrator action.
 
-The executor never accepts shell text. Network commands map only to typed allowlisted operations.
+Routine audit collection is also outbound HTTPS. Audit batches carry bounded file/inode/offset metadata and text; the controller acknowledges the highest accepted cursor before the student advances it. SSH audit sync remains an explicit recovery/backfill path.
 
-## Sudo events
+## Controller state and durability
 
-The root executor reads the protected request directory and returns a sanitized request snapshot to the unprivileged agent. The agent polls this local typed operation every second and wakes telemetry immediately when the snapshot changes. The controller stores request lifecycle in the SQLite `sudo_requests` table while continuing to expose the snapshot to existing Fleet Control compatibility views.
+`/var/lib/lghs/fleet.db` is authoritative. SQLite runs with WAL, `synchronous=FULL`, foreign keys, and a bounded busy timeout. It contains device inventory, telemetry, commands/events, warnings, deployments/executions, lifecycle history, sudo state, audit events, notifications, and settings.
 
-## Audit transport
+Controller backups use SQLite's online backup API and `PRAGMA quick_check`; a live WAL database is never backed up with a plain file copy.
 
-Routine audit collection is outbound HTTPS rather than recurring controller SSH fan-out. The agent requests bounded chunks from the root executor and reports `{kind,inode,offset,next_offset,text}` batches. The controller persists them in `audit_events` and acknowledges the highest accepted offset. The endpoint only advances its cursor after acknowledgement.
+## Provisioning boundary
 
-`lghs-audit-sync` remains available as an explicit SSH recovery/backfill path.
+Bluetooth does not carry a preexisting Fleet token. The controller first verifies Cloudflare SSH identity, then mints Fleet credentials. After the first authenticated Fleet report, LGCSCONT enrolls the release verification public key through the typed Fleet path and waits for fresh `release.signing-key` health before consuming the one-time bootstrap credential.
 
-## Health and warnings
-
-The agent publishes a structured health schema plus Raspberry Pi metrics including CPU, memory, disk, inode usage, temperature, Wi-Fi signal, clock synchronization, reboot requirement, undervoltage and throttling flags. The controller projects failures into persistent warnings with `new`, `acknowledged`, and `resolved` lifecycle.
-
-## Controller state
-
-`/var/lib/lghs/fleet.db` is the 0.5 source of truth and runs SQLite in WAL mode. It contains devices, latest telemetry, commands, command events, warnings, warning events, deployments, deployment executions, sudo requests, audit events, notifications and settings.
-
-Legacy JSON files remain compatibility/export surfaces during migration. They are not authoritative writers.
+The final production acceptance authority is `lghs-classroom-ready DEVICE`, not Bluetooth completion or SSH reachability alone.
 
 ## Compatibility
 
-During staged 0.4 -> 0.5 migration the controller accepts legacy telemetry and normalizes legacy states:
+Protocol version 1 intentionally remains stable across the 0.5-to-0.6 evolution. The 0.6 implementation accepts historical normalized command states where necessary, but new production behavior is defined by structured health v2, exact-SHA controller authority, signed releases, durable lifecycle history, and SQLite-backed command state.
 
-- `pending` -> `queued`
-- `complete` -> `succeeded`
-- `reboot_required` -> `succeeded` with reboot detail retained separately
-
-The old telemetry service remains installed but disabled on a 0.5 student so rollback can restore the 0.4 path.
-
-## Live staging checkpoint
-
-The first staged 0.5 controller/student pair successfully reported protocol v1 telemetry into SQLite with a real boot ID and increasing sequence number. The live report also carried structured health, Raspberry Pi power/throttling state, Wi-Fi signal, and sudo-request history with no active warnings. This checkpoint intentionally documents the transport state before the first live long-poll command-latency test.
+Legacy JSON files may remain export/compatibility surfaces. They are not authoritative writers.

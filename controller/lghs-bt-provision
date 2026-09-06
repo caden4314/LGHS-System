@@ -37,6 +37,9 @@ DEFAULT_FLEET_API_URL = os.environ.get("LGHS_FLEET_API_URL", "https://fleet-api.
 CLOUDFLARED = shutil.which("cloudflared") or "/usr/local/bin/cloudflared"
 FLEET_DB = FleetDB()
 FIRST_REPORT_TIMEOUT = max(10.0, float(os.environ.get("LGHS_FIRST_FLEET_REPORT_TIMEOUT", "60")))
+RELEASE_ENROLL_TIMEOUT = max(15.0, float(os.environ.get("LGHS_RELEASE_ENROLL_TIMEOUT", "90")))
+RELEASE_TOOL = "/usr/local/sbin/lghs-release"
+RELEASE_SIGNING_KEY = Path("/etc/lghs/secrets/release-signing-key")
 
 
 def run(cmd, timeout=None, input_text=None):
@@ -256,6 +259,60 @@ def wait_first_fleet_report(device_id, not_before, timeout=None):
     raise RuntimeError(f"first authenticated Fleet report not observed for {device_id}; bootstrap credential retained (last_received={last_received:.3f})")
 
 
+def wait_release_signing(device_id, not_before, timeout=None):
+    """Wait until fresh authenticated telemetry proves the release public key is enrolled."""
+    deadline = time.monotonic() + (RELEASE_ENROLL_TIMEOUT if timeout is None else float(timeout))
+    last_state = "missing"
+    last_received = 0.0
+    while time.monotonic() < deadline:
+        latest = FLEET_DB.latest_telemetry(device_id)
+        if isinstance(latest, dict):
+            try:
+                last_received = float(latest.get("received_at") or 0)
+            except (TypeError, ValueError):
+                last_received = 0.0
+            payload = latest.get("payload", {}) if isinstance(latest.get("payload"), dict) else {}
+            report = payload.get("health_report", {}) if isinstance(payload.get("health_report"), dict) else {}
+            checks = report.get("checks", []) if isinstance(report.get("checks"), list) else []
+            signing = next((row for row in checks if isinstance(row, dict) and row.get("id") == "release.signing-key"), None)
+            if isinstance(signing, dict):
+                last_state = str(signing.get("state") or "missing")
+                observed = bool(signing.get("observed"))
+                if last_received >= float(not_before) and last_state == "pass" and observed:
+                    return latest
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"release verification key not confirmed for {device_id}; bootstrap credential retained "
+        f"(last_state={last_state}, last_received={last_received:.3f})"
+    )
+
+
+def enroll_release_verification_key(device_id):
+    if not RELEASE_SIGNING_KEY.is_file():
+        raise RuntimeError("controller release signing key is unavailable; bootstrap credential retained")
+    issued_at = time.time()
+    proc = run([RELEASE_TOOL, "install-key", device_id], timeout=COMMAND_TIMEOUT)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError("release public-key enrollment could not be queued: " + detail[-500:])
+    return wait_release_signing(device_id, issued_at)
+
+
+def mark_release_signing(device_id, received_at):
+    data = load_json(TRANSPORT_REGISTRY)
+    data.setdefault("version", 1)
+    devices = data.setdefault("devices", {})
+    if not isinstance(devices, dict):
+        raise RuntimeError("Invalid transport registry devices object")
+    entry = devices.setdefault(device_id, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        devices[device_id] = entry
+    entry["provision_order"] = ["bluetooth", "cloudflare", "cloudflare-verified", "fleet", "first-telemetry", "release-signing"]
+    entry["release_signing_at"] = float(received_at)
+    atomic_write(TRANSPORT_REGISTRY, data, mode=0o644)
+
+
 def ensure_sdp_record():
     browse = run(["sdptool", "browse", "local"], timeout=COMMAND_TIMEOUT)
     marker = f"Channel: {CHANNEL}"
@@ -351,8 +408,14 @@ def handle_client(conn, address):
     first_received = float(first_report.get('received_at') or 0)
     mark_first_telemetry(device_id, first_received)
     print(f"FIRST TELEMETRY {device_id}: authenticated report at {first_received:.3f}", flush=True)
+
+    release_report = enroll_release_verification_key(device_id)
+    release_received = float(release_report.get('received_at') or 0)
+    mark_release_signing(device_id, release_received)
+    print(f"RELEASE SIGNING {device_id}: verification key confirmed at {release_received:.3f}", flush=True)
+
     consume_bootstrap_token(device_id)
-    print(f"READY {device_id}: Bluetooth -> Cloudflare verified -> Fleet enrolled -> first telemetry", flush=True)
+    print(f"READY {device_id}: Bluetooth -> Cloudflare verified -> Fleet -> first telemetry -> release signing", flush=True)
 
 
 def client_thread(conn, address):

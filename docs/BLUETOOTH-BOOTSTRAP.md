@@ -21,8 +21,9 @@ Bluetooth is treated as an untrusted carrier. The first session is authenticated
 13. The student installs its Fleet identity and starts the agent, executor, policy, and timers.
 14. The student reports `fleet-ready`, but this is not yet the controller success boundary.
 15. LGCSCONT waits until `/var/lib/lghs/fleet.db` contains a fresh authenticated report for the expected device identity.
-16. LGCSCONT records the `first-telemetry` milestone and only then consumes the one-time bootstrap credential.
-17. Full classroom readiness is evaluated separately with `lghs-classroom-ready DEVICE`.
+16. LGCSCONT records the `first-telemetry` milestone, queues the controller's Ed25519 release verification public key through the typed Fleet command path, and waits for a fresh health report proving `release.signing-key` is installed.
+17. LGCSCONT records `release-signing` and only then consumes the one-time bootstrap credential.
+18. Full classroom readiness is evaluated with `lghs-classroom-ready DEVICE`.
 
 A Fleet API token is never used to establish the first Bluetooth session.
 
@@ -34,7 +35,8 @@ A Fleet API token is never used to establish the first Bluetooth session.
 - The Cloudflare tunnel token is held in controller memory only long enough to encrypt the authenticated provisioning payload.
 - The student's SSH host key is returned through the authenticated Bluetooth session, then pinned before controller SSH verification.
 - Fleet credentials are created only after controller-verified Cloudflare SSH succeeds.
-- The bootstrap credential is retained if the first authenticated Fleet report is not observed, allowing safe retry.
+- The bootstrap credential is retained if the first authenticated Fleet report or release-signing confirmation is not observed, allowing safe retry.
+- Release public-key enrollment happens only after authenticated Fleet is established; the signing private key never enters the Bluetooth transaction.
 - Existing enrolled students are not automatically opted into Bluetooth reprovisioning by a normal software update.
 
 ## Initial Wi-Fi support
@@ -52,7 +54,7 @@ LGCSCONT also requires its normal Cloudflare account/zone configuration and cont
 The controller registry records:
 
 ```json
-["bluetooth","cloudflare","cloudflare-verified","fleet","first-telemetry"]
+["bluetooth","cloudflare","cloudflare-verified","fleet","first-telemetry","release-signing"]
 ```
 
 After provisioning, Bluetooth bootstrap is one-shot and normal operation moves to HTTPS Fleet plus explicit Cloudflare SSH recovery. `lghs-classroom-ready DEVICE` is the final acceptance gate; Bluetooth success by itself is not classroom readiness.
