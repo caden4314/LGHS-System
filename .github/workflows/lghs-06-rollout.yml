@@ -25,6 +25,7 @@ jobs:
             controller/lghs-fleet-command \
             controller/lghs-release \
             controller/lghs-classroom-ready \
+            controller/lghs-verify-migration \
             controller/lghs-fleet-rollout \
             controller/lghs-fleet-maintenance \
             controller/lghs-rollout-manager \
@@ -149,7 +150,9 @@ jobs:
           grep -Fq "wait_first_fleet_report" controller/lghs-bt-provision
           grep -Fq "first_telemetry_at" controller/lghs-bt-provision
           grep -Fq "lghs-classroom-ready" install.sh
+          grep -Fq "lghs-verify-migration" install.sh
           grep -Fq "backup-controller" controller/lghs-remote-shell
+          grep -Fq "verify-migration" controller/lghs-remote-shell
           grep -Fq "command-status" controller/lghs-remote-shell
           grep -Fq "command-cancel" controller/lghs-remote-shell
           grep -Fq "release-keygen" controller/lghs-remote-shell

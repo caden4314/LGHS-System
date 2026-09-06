@@ -95,6 +95,34 @@ class ClassroomReadyTests(unittest.TestCase):
         self.assertFalse(result['sections']['Sudo broker'])
         self.assertEqual(result['failed_units'], ['bad.service'])
 
+    def legacy_registry(self):
+        raw = json.loads(self.mod.REGISTRY.read_text(encoding='utf-8'))
+        entry = raw['devices']['CS-08']
+        entry.pop('provision_order', None)
+        entry.pop('source', None)
+        self.mod.REGISTRY.write_text(json.dumps(raw), encoding='utf-8')
+
+    def test_verified_legacy_migration_records_provenance(self):
+        self.legacy_registry()
+        now = self.report()
+        before = self.mod.evaluate('CS-08', now=now + 1)
+        self.assertFalse(before['sections']['Bootstrap'])
+        migration = load_script('test_migration_tool', 'controller/lghs-verify-migration')
+        after = migration.verify_and_record('CS-08', now=now + 1, ready_module=self.mod)
+        self.assertTrue(after['ready'])
+        raw = json.loads(self.mod.REGISTRY.read_text(encoding='utf-8'))
+        entry = raw['devices']['CS-08']
+        self.assertEqual(entry['source'], 'managed-migration-verified')
+        self.assertEqual(entry['migration_verifier'], 'lghs-verify-migration-v1')
+        self.assertEqual(entry['provision_order'][:3], ['managed-migration', 'cloudflare', 'cloudflare-verified'])
+
+    def test_verified_legacy_migration_refuses_failed_runtime_gate(self):
+        self.legacy_registry()
+        now = self.report(self.payload(sudo=False))
+        migration = load_script('test_migration_refusal', 'controller/lghs-verify-migration')
+        with self.assertRaisesRegex(ValueError, 'Sudo broker'):
+            migration.verify_and_record('CS-08', now=now + 1, ready_module=self.mod)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Record verified migration provenance for an already-managed student Pi."""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import tempfile
+import time
+from pathlib import Path
+
+READY_TOOL = Path(__file__).with_name('lghs-classroom-ready')
+VERIFIER_ID = 'lghs-verify-migration-v1'
+
+
+def load_ready_tool():
+    loader = importlib.machinery.SourceFileLoader('lghs_classroom_ready_migration', str(READY_TOOL))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def atomic_write(path: Path, value: dict) -> None:
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o640
+    fd, tmp = tempfile.mkstemp(prefix=path.name + '.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def verify_and_record(device: str, *, now: float | None = None, ready_module=None) -> dict:
+    ready = ready_module or load_ready_tool()
+    before = ready.evaluate(device, now=now)
+    failed_sections = [name for name, ok in before['sections'].items() if name != 'Bootstrap' and not ok]
+    if failed_sections or before['failed_units']:
+        detail = ', '.join(failed_sections) or 'failed systemd units'
+        raise ValueError(f'migration verification refused: {detail}')
+    if before['sections']['Bootstrap']:
+        return before
+
+    registry = ready.load_registry()
+    entry = registry.get(before['device_id'])
+    if not isinstance(entry, dict):
+        raise ValueError('migration verification refused: device is absent from Fleet registry')
+    entry['source'] = 'managed-migration-verified'
+    entry['provision_order'] = ['managed-migration', 'cloudflare', 'cloudflare-verified', 'fleet', 'first-telemetry']
+    entry['migration_verified_at'] = time.time() if now is None else float(now)
+    entry['migration_verified_commit'] = before['commit']
+    entry['migration_verifier'] = VERIFIER_ID
+    raw = json.loads(ready.REGISTRY.read_text(encoding='utf-8'))
+    raw.setdefault('devices', {})[before['device_id']] = entry
+    atomic_write(ready.REGISTRY, raw)
+
+    after = ready.evaluate(before['device_id'], now=now)
+    if not after['ready']:
+        raise ValueError('migration provenance was recorded but classroom-ready verification still failed')
+    return after
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        raise SystemExit('Run as root')
+    if len(os.sys.argv) != 2:
+        raise SystemExit('Usage: lghs-verify-migration DEVICE')
+    device = os.sys.argv[1].strip().upper()
+    try:
+        result = verify_and_record(device)
+    except Exception as exc:
+        print(f'LGHS migration verification failed: {exc}', file=os.sys.stderr)
+        return 1
+    print(f"{result['device_id']} MIGRATION VERIFIED")
+    print(f"commit={result['commit']}")
+    print(f"channel={result['channel']}")
+    print('classroom_ready=true')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

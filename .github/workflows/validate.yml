@@ -24,6 +24,7 @@ jobs:
             controller/lghs/release.py \
             controller/lghs-release \
             controller/lghs-classroom-ready \
+            controller/lghs-verify-migration \
             controller/lghs-bt-provision \
             bluetooth/lghs_bt_protocol.py \
             student/lghs-agent \
