@@ -19,7 +19,7 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-ReadWritePaths=/var/lib/lghs /var/log/lghs-netqueue.log /run/lghs-command-executor
+ReadWritePaths=/var/lib/lghs /var/log/lghs-netqueue.log /run/lghs-command-executor /etc/lghs/release-public-key
 RuntimeDirectory=lghs-command-executor
 RuntimeDirectoryMode=0755
 

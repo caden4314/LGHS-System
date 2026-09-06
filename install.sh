@@ -196,6 +196,11 @@ else
   install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
   install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-release-verify" /usr/local/sbin/lghs-release-verify
   install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-release-key-install" /usr/local/sbin/lghs-release-key-install
+  if [[ ! -e /etc/lghs/release-public-key ]]; then
+    : > /etc/lghs/release-public-key
+    chown root:root /etc/lghs/release-public-key
+    chmod 0644 /etc/lghs/release-public-key
+  fi
   install -o root -g root -m 0755 "$ROOT_DIR/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
   install -o root -g root -m 0750 "$ROOT_DIR/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap
   install -o root -g "$ADMIN_GROUP" -m 0750 "$ROOT_DIR/student/lghs-network-ui-apply" /usr/local/sbin/lghs-network-ui-apply
