@@ -150,6 +150,8 @@ jobs:
           grep -Fq "first_telemetry_at" controller/lghs-bt-provision
           grep -Fq "lghs-classroom-ready" install.sh
           grep -Fq "backup-controller" controller/lghs-remote-shell
+          grep -Fq "command-status" controller/lghs-remote-shell
+          grep -Fq "command-cancel" controller/lghs-remote-shell
           grep -Fq "release-keygen" controller/lghs-remote-shell
           grep -Fq "CLASSROOM READY" controller/lghs-classroom-ready
           grep -Fq "stock Raspberry Pi OS plus zero-touch LGHS provisioning" README.md
