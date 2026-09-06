@@ -22,7 +22,9 @@ The older custom-image flow that installed a Fleet token before Bluetooth is obs
 6. LGCSCONT verifies SSH through the Cloudflare hostname using the controller key.
 7. Only after that proof does LGCSCONT mint and send the per-device Fleet token.
 8. Student starts Fleet agent, command executor, and policy services.
-9. Bootstrap credential is consumed and Bluetooth bootstrap becomes permanently inactive.
+9. LGCSCONT persists the first authenticated Fleet report for that device.
+10. Bootstrap credential is consumed and the `first-telemetry` milestone is recorded.
+11. `lghs-classroom-ready CS-##` must pass before classroom use.
 
 If Fleet starts before step 6 succeeds, the test fails.
 
@@ -67,16 +69,26 @@ Required final controller evidence:
 
 ```text
 Cloudflare VERIFIED CS-##: cs-admin@ssh-cs-##.scenicrouteservers.com
-READY CS-##: Bluetooth -> Cloudflare verified -> Fleet enrolled
+FIRST TELEMETRY CS-##: authenticated report at ...
+READY CS-##: Bluetooth -> Cloudflare verified -> Fleet enrolled -> first telemetry
 ```
 
 Then verify the student's provision record includes this exact order:
 
 ```json
-["bluetooth","cloudflare","cloudflare-verified","fleet"]
+["bluetooth","cloudflare","cloudflare-verified","fleet","first-telemetry"]
 ```
 
 `lghs-bt-bootstrap.service` being inactive after `READY` is expected.
+
+Run the controller acceptance gate:
+
+```text
+classroom-ready CS-##
+```
+
+The device must report `CLASSROOM READY` before classroom use.
+
 ## Student validation
 
 Run on the student or through Fleet:
@@ -143,9 +155,9 @@ Post-update validation is fail-closed: if `lghs-check` or a required service val
 
 Do not mass-deploy the next student set until all of these are true on the current runtime commit:
 
-- all three GitHub validation workflows are green
+- all four protected GitHub validation checks are green
 - LGCSCONT is healthy on the same validated runtime
-- at least one fresh stock student completed Bluetooth -> Cloudflare verification -> Fleet in the required order
+- at least one fresh stock student completed Bluetooth -> Cloudflare verification -> Fleet -> first authenticated telemetry in the required order
 - a second fresh stock student has clean canonical identities and passes `lghs-check`
 - Fleet command delivery has updated a student to the expected exact commit
 - Fleet sudo approval has executed the test command only after approval

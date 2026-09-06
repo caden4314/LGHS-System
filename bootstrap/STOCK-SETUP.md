@@ -14,7 +14,10 @@ LGHS enforces this enrollment order:
 6. LGCSCONT verifies SSH through that Cloudflare hostname using the controller key.
 7. Only after successful Cloudflare SSH verification does LGCSCONT mint a per-device Fleet API token.
 8. The Fleet token is delivered over the existing authenticated/encrypted Bluetooth session.
-9. Fleet services and LGHS policy enforcement start, and the bootstrap credential is consumed.
+9. Fleet services and LGHS policy enforcement start.
+10. LGCSCONT waits for the first authenticated Fleet report from the expected device.
+11. Only after that report is persisted does LGCSCONT consume the bootstrap credential and record the `first-telemetry` milestone.
+12. `lghs-classroom-ready CS-##` is the final classroom acceptance gate.
 
 A Fleet token is never used to establish the first Bluetooth session.
 
@@ -50,7 +53,7 @@ Re-arm only one device when needed:
 sudo python3 /opt/lghs/repo/controller/lghs-stock-bootstrap-secret --device CS-07
 ```
 
-A successful Fleet handoff consumes that device's controller registry credential.
+A successful Fleet handoff consumes that device's controller registry credential only after LGCSCONT observes its first authenticated Fleet report.
 
 ## Run on each freshly booted student Pi
 
@@ -81,16 +84,25 @@ Successful controller output ends with messages similar to:
 
 ```text
 Cloudflare VERIFIED CS-01: cs-admin@ssh-cs-01.scenicrouteservers.com
-READY CS-01: Bluetooth -> Cloudflare verified -> Fleet enrolled
+FIRST TELEMETRY CS-01: authenticated report at ...
+READY CS-01: Bluetooth -> Cloudflare verified -> Fleet enrolled -> first telemetry
 ```
 
 The final provision record must preserve this order:
 
 ```json
-["bluetooth","cloudflare","cloudflare-verified","fleet"]
+["bluetooth","cloudflare","cloudflare-verified","fleet","first-telemetry"]
 ```
 
 After `READY`, `lghs-bt-bootstrap.service` becoming inactive is expected; bootstrap is one-shot.
+
+On LGCSCONT, run the final acceptance gate:
+
+```bash
+sudo /usr/local/sbin/lghs-classroom-ready CS-01
+```
+
+Do not place the Pi into classroom service until it reports `CS-01 CLASSROOM READY`.
 
 ## Verify the student
 
@@ -114,6 +126,6 @@ systemctl is-enabled lghs-update.timer
 - Initial Bluetooth authentication uses the password-derived, per-device one-time credential; it is not a Fleet token.
 - Session key exchange uses ephemeral X25519, HKDF, AES-GCM, and mutual HMAC transcript proofs.
 - Fleet enrollment is blocked until LGCSCONT proves Cloudflare SSH reachability using its controller key.
-- The student bootstrap token is removed after successful Fleet handoff.
+- The student bootstrap token is removed only after LGCSCONT persists the first authenticated Fleet report.
 - Controller registry credentials expire after 30 days and are consumed on successful enrollment.
 - The stock Git identity filter preserves `cs-##` / `cs-admin` mappings for later updater runs while legacy source defaults are still being retired.

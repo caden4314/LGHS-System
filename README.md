@@ -1,60 +1,86 @@
 # LGHS System
 
-LGHS is a classroom Raspberry Pi management system for one Control Pi and a fleet of Student Raspberry Pi 5 systems.
+LGHS is a classroom management system for one Raspberry Pi controller (`LGCSCONT`) and managed Raspberry Pi 5 student devices (`CS-01`, `CS-02`, and so on).
 
-## Current deployment baseline
+The production deployment model is **stock Raspberry Pi OS plus zero-touch LGHS provisioning**. Custom `pi-gen` images remain optional/legacy tooling; they are not the primary fleet architecture.
 
-The current runtime release is **V0209**. The active Windows LGHS Imager supports Raspberry Pi 5 **4 GB and 8 GB** hardware profiles using the same Raspberry Pi OS arm64 base.
+For the full trust model and data/control flows, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Goals
+## Production invariants
 
-- One generic managed Student software stack for the fleet.
-- Automatic local-network discovery with encrypted SSH management.
-- Central management from the LGHS Control Pi.
-- Restricted student sudo with exact-command Fleet approval and Root-password local fallback.
-- Protected NetworkManager profiles and student network UI restrictions.
-- Versioned policy/software updates with validation, persistent offline retry, and rollback hooks.
-- Responsive Fleet console with Needs Attention, activity history, desktop notifications, and live aggregate network rates.
-- Visible first-boot setup progress with a clear ALL GOOD completion state.
-- Trusted Visual Studio Code desktop launcher using the installed Code icon and direct CS2-workspace launch.
-- No student passwords, Wi-Fi passwords, private keys, or tokens committed to Git.
+- Bluetooth is bootstrap-only and is treated as an untrusted transport.
+- Cloudflare outbound tunnels are the remote SSH path; the school LAN is not assumed to permit client-to-client management.
+- The HTTPS Fleet API is the normal runtime command and telemetry plane.
+- Student software updates are selected by LGCSCONT as an **exact Git SHA**; students do not autonomously follow branch HEAD.
+- Once the release public key is enrolled, exact-SHA student updates also require an Ed25519-signed release manifest.
+- The Fleet agent is unprivileged. Root operations go through small typed local executors.
+- Student sudo is brokered through Fleet approval with a local-root recovery path.
+- Controller state is SQLite in WAL mode with `synchronous=FULL` and verified online backups.
+- Planned shutdown/reboot lifecycle state overrides ordinary telemetry-loss alarms.
+- Existing SSH, Fleet, Cloudflare, and Bluetooth identities are separate trust roles from the release-signing key.
 
-## Layout
+## Provisioning
 
-- `controller/` — Control-Pi CLI, Fleet console, notifications, and audit collection.
-- `student/` — Student-Pi agent, policy enforcement, sudo broker, health checks, and dev setup.
+The stock-device transaction is:
+
+```text
+stock Raspberry Pi OS
+  -> password-derived per-device Bluetooth bootstrap credential
+  -> X25519 + HKDF + AES-GCM + HMAC provisioning session
+  -> Wi-Fi and Cloudflare tunnel installation
+  -> LGCSCONT verifies the student's Cloudflare SSH endpoint
+  -> LGCSCONT mints the Fleet credential
+  -> student installs/starts Fleet runtime
+  -> LGCSCONT observes the first authenticated Fleet report
+  -> bootstrap credential is consumed
+  -> CLASSROOM READY acceptance gate
+```
+
+A device is not considered ready merely because Bluetooth or Cloudflare setup completed. `lghs-classroom-ready DEVICE` requires fresh authenticated telemetry, expected identity, Cloudflare registration, core services, policy, sudo broker, lifecycle service, zero failed systemd units, the expected exact commit, and the `main` update channel.
+
+See [`bootstrap/STOCK-SETUP.md`](bootstrap/STOCK-SETUP.md) and [`docs/BLUETOOTH-BOOTSTRAP.md`](docs/BLUETOOTH-BOOTSTRAP.md) for provisioning procedures.
+
+## Updates and releases
+
+The production software path is:
+
+```text
+feature branch -> pull request -> required CI -> protected main
+  -> LGCSCONT selects exact SHA
+  -> signed release manifest (after key enrollment)
+  -> HTTPS Fleet command
+  -> durable student queue
+  -> signature/sequence/expiry verification
+  -> install + structured validation
+  -> success or rollback
+```
+
+Student `lghs-update.timer` remains enabled for reconciliation/timer compatibility, but an unpinned student run cannot select a new Git revision. Channel-only commands may persist metadata without resolving branch HEAD.
+
+The release-signing private key lives only on LGCSCONT at `/etc/lghs/secrets/release-signing-key`. Students receive only `/etc/lghs/release-public-key`. Key replacement is intentionally not a normal Fleet operation.
+
+Emergency local-root recovery can explicitly permit an unsigned release or a sequence rollback. Those overrides are not exposed by the Fleet executor.
+
+**Power-loss limitation:** LGHS software updates are validated and rollback-capable, but are not guaranteed atomic across sudden power loss during an update.
+
+## Runtime operations
+
+LGCSCONT keeps the authoritative device registry, Fleet command state, telemetry, lifecycle history, sudo state, rollout state, and warnings. The Fleet API and controller services read/write the SQLite database transactionally.
+
+Telemetry normally arrives every few seconds. Operator state uses a grace model rather than immediately declaring a device offline: fresh reports are normal, then `STALE`, then `OFFLINE`. A reported planned poweroff shows `SHUTDOWN`; a planned reboot shows `REBOOTING` until a new boot ID returns.
+
+Controller backups use SQLite's online backup API, `PRAGMA quick_check`, fsync, and atomic promotion. Retention is 7 daily, 4 weekly, and 3 monthly snapshots. The backup allowlist includes non-secret controller configuration and release sequence state, but never copies `/etc/lghs/secrets` or Fleet token stores.
+
+Remote administration uses the dedicated `lghs_remote` account with a forced allowlisted shell. See [`docs/REMOTE-ADMIN.md`](docs/REMOTE-ADMIN.md).
+
+## Repository layout
+
+- `controller/` — Fleet API, CLI/console, provisioning, release management, lifecycle, rollouts, backups, and acceptance.
+- `student/` — agent, typed executor, policy enforcement, sudo broker, health checks, lifecycle reporting, and bootstrap client.
+- `bluetooth/` — authenticated/encrypted Bluetooth protocol and preparation helpers.
+- `updater/` — exact-SHA software updates, OS updates, durable network queue, and reconciliation.
 - `policies/` — sudoers and PolicyKit policy templates.
-- `systemd/` — boot/update/reconcile/notification services and timers.
-- `updater/` — live update, OS update, self-heal, autologin, and offline network queue helpers.
-- `image-builder/` — optional Raspberry Pi OS/pi-gen custom-image integration.
-
-## Runtime model
-
-A stock-bootstrap deployment stages role/account/network information on the boot partition, uses cloud-init to establish early SSH recovery and the first-boot progress launcher, then hands local provisioning to `lghs-stage2-bootstrap.service`. Stage 2 installs the deployment Fleet identity and launches the online LGHS-System bootstrap. The desktop progress window follows the local/online setup phases and reports ALL GOOD when installation finishes. The full install writes `/var/lib/lghs/bootstrap-complete`; the one-time success notifier only reports success after that marker exists.
-
-On Raspberry Pi OS Trixie/labwc, LGHS prefers the native `wfpanelctl notify` / `wfpanelctl critical` path used by `wf-panel-pi`. `notify-send` remains a fallback for desktops that provide the standard freedesktop notification daemon.
-
-Live LGHS updates pull the configured branch over HTTPS/Git, reinstall managed files, validate the resulting Student or Control role, and roll back to the previous commit when validation fails. Reconcile periodically reapplies managed configuration after package or OS changes.
-
-## Fleet network security
-
-- Control-to-Student management and audit collection use SSH with the deployment Ed25519 key.
-- Fleet SSH clients require the pinned `known_hosts` entry after first enrollment and disable password fallback, agent forwarding, X11 forwarding, and tunnel/port forwarding.
-- Student `cs_admin` Fleet SSH is public-key-only.
-- Avahi/mDNS is used only for local discovery metadata and is not an encrypted transport.
-- Direct Ethernet itself is not link-layer encrypted; LGHS management crossing that link is still carried inside SSH.
-- NetworkManager connection profiles are root-owned mode `0600` and the student account is blocked from advanced connection editing/secret management.
-
-First-contact Student SSH host-key enrollment currently uses an Ed25519 `ssh-keyscan`/TOFU model. Pre-pinned host identities or an SSH host CA are future hardening options for environments where hostile local-network MITM is in scope.
-
-## Security
-
-Never commit:
-
-- classroom/student passwords
-- school Wi-Fi credentials
-- SSH private keys
-- GitHub tokens
-- roster spreadsheets containing credentials
-
-Keep deployment secrets under `/etc/lghs/secrets/` on the Control Pi with root-only permissions. Provisioning secrets placed temporarily on the FAT boot partition are deployment material, not encrypted at rest; they are removed after successful first-boot provisioning.
+- `systemd/` — controller/student services and timers.
+- `bootstrap/` — stock Raspberry Pi OS bootstrap path.
+- `image-builder/` — optional/legacy custom-image integration.
+- `docs/` — architecture, protocol, bootstrap, remote-administration, and hardware-validation documentation.

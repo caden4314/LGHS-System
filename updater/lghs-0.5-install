@@ -42,6 +42,7 @@ if [[ "$ROLE" == controller ]]; then
   install -m 0755 "$ROOT/controller/lghs-console-day5" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT/controller/lghs-fleet-api" /usr/local/sbin/lghs-fleet-api
   install -m 0755 "$ROOT/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
+  install -m 0755 "$ROOT/controller/lghs-classroom-ready" /usr/local/sbin/lghs-classroom-ready
   install -m 0750 "$ROOT/controller/lghs-release" /usr/local/sbin/lghs-release
   install -m 0755 "$ROOT/controller/lghs-db-migrate" /usr/local/sbin/lghs-db-migrate
   install -m 0755 "$ROOT/controller/lghs-controller-backup" /usr/local/sbin/lghs-controller-backup

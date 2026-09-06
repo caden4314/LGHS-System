@@ -329,6 +329,10 @@ def structured_health(status: dict[str, Any], sample: dict[str, Any]) -> dict[st
     checks.append(health_check('hardware.throttling-history', 'fail' if throttled_history else 'pass', 'warning', raw.get('throttled_raw', '0x0'), 'no historical throttling since boot', 'inspect:power-thermal-history'))
     checks.append(health_check('system.reboot-required', 'fail' if raw.get('reboot_required') else 'pass', 'warning', bool(raw.get('reboot_required')), False, 'schedule:reboot'))
     checks.append(health_check('system.failed-units', 'fail' if failed_units else 'pass', 'warning', failed_units, [], 'inspect:systemd-failures'))
+    sudo_ready = bool(raw.get('sudo_broker_ready'))
+    checks.append(health_check('sudo.broker', 'pass' if sudo_ready else 'fail', 'critical', sudo_ready, True, 'inspect:sudo-broker'))
+    release_ready = bool(raw.get('release_public_key_ready'))
+    checks.append(health_check('release.signing-key', 'pass' if release_ready else 'fail', 'critical', release_ready, True, 'inspect:release-signing-key'))
     checks.append(health_check('network.wifi-signal', 'pass' if not isinstance(signal, (int, float)) or signal >= -82 else 'fail', 'warning', signal, '>= -82 dBm', 'inspect:wifi'))
     checks.append(health_check('transport.controller', 'pass' if transport.get('fresh') else 'fail', 'critical', transport, f"success within {int(transport.get('max_age_seconds') or 30)} seconds", 'inspect:fleet-api-connectivity'))
     return {'health_version': 2, 'checks': checks}
