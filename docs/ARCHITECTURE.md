@@ -49,6 +49,7 @@ BT_AUTH
   -> CF_VERIFIED
   -> FLEET_ENROLLED
   -> FIRST_TELEMETRY
+  -> RELEASE_SIGNING
   -> ACCEPTANCE
   -> READY
 ```
@@ -61,8 +62,9 @@ BT_AUTH
 6. Only after that verification does LGCSCONT mint a per-device Fleet token.
 7. The student installs its Fleet identity, starts the agent/executor/policy services, and reports `fleet-ready`.
 8. LGCSCONT waits until the Fleet database contains a new authenticated report from the expected device identity.
-9. Only then is the one-time Bluetooth bootstrap credential consumed.
-10. `lghs-classroom-ready DEVICE` evaluates the full runtime before the device is considered classroom ready.
+9. LGCSCONT queues the controller's Ed25519 release verification public key through the typed Fleet command path and waits for fresh telemetry proving `release.signing-key` is installed.
+10. Only after first telemetry and release-signing evidence are persisted is the one-time Bluetooth bootstrap credential consumed.
+11. `lghs-classroom-ready DEVICE` evaluates the full runtime before the device is considered classroom ready.
 
 ## 4. Cloudflare and runtime transport
 
@@ -150,10 +152,11 @@ A production-ready student must pass all of these controller-evaluated sections:
 - NetworkManager, SSH, agent, executor, and policy runtime.
 - Sudo broker runtime.
 - Lifecycle reporter runtime.
+- Enrolled Ed25519 release verification key.
 - Zero failed systemd units.
 - Expected exact commit and `main` channel.
 
-This gate is designed to be reused as CS-04 through CS-14 are provisioned; devices that are not yet enrolled are not assumed to exist or pass.
+This gate is designed to be reused as CS-04 through CS-14 are provisioned; devices that are not yet enrolled are not assumed to exist or pass. Legacy managed devices may be admitted only through `lghs-verify-migration`, which records migration provenance after every non-bootstrap readiness gate already passes.
 
 ## 12. Optional/legacy image path
 

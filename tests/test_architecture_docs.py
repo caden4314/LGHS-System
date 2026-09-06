@@ -12,6 +12,7 @@ class ArchitectureDocsTests(unittest.TestCase):
         self.assertIn('exact Git SHA', readme)
         self.assertIn('Ed25519-signed release manifest', readme)
         self.assertIn('lghs-classroom-ready DEVICE', readme)
+        self.assertIn('docs/PRODUCTION-STATUS.md', readme)
         self.assertIn('not guaranteed atomic across sudden power loss', readme)
         self.assertNotIn('V0209', readme)
         self.assertNotIn('uses cloud-init to establish', readme)
@@ -30,6 +31,16 @@ class ArchitectureDocsTests(unittest.TestCase):
         self.assertLess(doc.index('FLEET_ENROLLED'), doc.index('FIRST_TELEMETRY'))
         self.assertIn('/etc/lghs/secrets/release-signing-key', doc)
         self.assertIn('/etc/lghs/release-public-key', doc)
+        self.assertIn('RELEASE_SIGNING', doc)
+
+    def test_production_status_describes_current_release_and_acceptance(self):
+        status = (ROOT / 'docs' / 'PRODUCTION-STATUS.md').read_text(encoding='utf-8')
+        self.assertIn('LGHS 0.6.0', status)
+        self.assertIn('CS-999', status)
+        self.assertIn('CLASSROOM READY', status)
+        self.assertIn('release verification public key confirmed', status)
+        self.assertIn('7 daily, 4 weekly, 3 monthly', status)
+        self.assertIn('not guaranteed atomic across sudden power loss', status)
 
     def test_bluetooth_module_comment_matches_bootstrap_identity_model(self):
         src = (ROOT / 'bluetooth' / 'lghs_bt_protocol.py').read_text(encoding='utf-8')

@@ -70,13 +70,14 @@ Required final controller evidence:
 ```text
 Cloudflare VERIFIED CS-##: cs-admin@ssh-cs-##.scenicrouteservers.com
 FIRST TELEMETRY CS-##: authenticated report at ...
-READY CS-##: Bluetooth -> Cloudflare verified -> Fleet enrolled -> first telemetry
+RELEASE SIGNING CS-##: verification key confirmed at ...
+READY CS-##: Bluetooth -> Cloudflare verified -> Fleet -> first telemetry -> release signing
 ```
 
 Then verify the student's provision record includes this exact order:
 
 ```json
-["bluetooth","cloudflare","cloudflare-verified","fleet","first-telemetry"]
+["bluetooth","cloudflare","cloudflare-verified","fleet","first-telemetry","release-signing"]
 ```
 
 `lghs-bt-bootstrap.service` being inactive after `READY` is expected.
@@ -107,6 +108,7 @@ Required result:
 - zero failed systemd units
 - only the canonical `cs-##` and `cs-admin` human identities remain
 - Cloudflare, agent, executor, and policy are active
+- release verification public key is valid
 - update timer is enabled
 - no persistent network queue work remains
 

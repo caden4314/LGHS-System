@@ -1,15 +1,29 @@
 # LGHS Raspberry Pi Image Builder
 
-The image builder produces one generic Raspberry Pi OS 64-bit Desktop image for Raspberry Pi 5 student systems.
+`image-builder/` is **optional/legacy tooling**. The supported production classroom path is stock Raspberry Pi OS followed by authenticated LGHS zero-touch provisioning and `CLASSROOM READY` acceptance.
 
-The image should contain only generic LGHS software and policy. Do **not** bake class passwords, school Wi-Fi credentials, GitHub tokens, roster data, or SSH private keys into the image.
+A custom image may still be useful for lab experiments, package preloading, or environments that intentionally want a reusable base image. It is not a fleet identity source, release authority, or substitute for controller-side enrollment.
 
-## Planned flow
+## Security requirements
 
-1. Build from Raspberry Pi OS 64-bit Desktop with `pi-gen`.
-2. Install `lghs-agent`, `lghs-enforce`, `lghs-check`, systemd units, Avahi, SSH, NetworkManager, PolicyKit, Python, Git and classroom development tools.
-3. First boot advertises `_lghs._tcp` on the local network.
-4. The control Pi discovers the new system and assigns its device ID/group.
-5. The control Pi provisions group credentials and approved Wi-Fi configuration over the management channel.
+A reusable image must contain only generic software and policy. Never bake any of the following into an image:
 
-The standalone `LGHS_RPi5_Image_Builder_v0.1.0` package is the current development builder. Its contents will be migrated here once the first physical Pi build is validated.
+- classroom/provisioning passwords;
+- school Wi-Fi credentials;
+- Fleet API tokens;
+- Cloudflare tunnel tokens;
+- controller or student SSH private keys;
+- release-signing private keys;
+- roster/device-specific enrollment state.
+
+Device identity, Cloudflare registration, Fleet credentials, and the Ed25519 release verification public key must still be established through the normal provisioning/control plane.
+
+## Production relationship
+
+If the builder is used, the resulting Pi must still complete the same production gates as a stock install:
+
+```text
+Cloudflare verified -> Fleet authenticated -> release signing enrolled -> CLASSROOM READY
+```
+
+The image builder is not pinned as the production update mechanism. Runtime software promotion remains protected PR/CI -> LGCSCONT exact SHA -> signed Fleet release.

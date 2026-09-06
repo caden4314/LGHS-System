@@ -1,10 +1,21 @@
 # LGHS System
 
+[![Validate LGHS](https://github.com/caden4314/LGHS-System/actions/workflows/validate.yml/badge.svg?branch=main)](https://github.com/caden4314/LGHS-System/actions/workflows/validate.yml)
+[![LGHS Validate](https://github.com/caden4314/LGHS-System/actions/workflows/lghs-validate.yml/badge.svg?branch=main)](https://github.com/caden4314/LGHS-System/actions/workflows/lghs-validate.yml)
+[![Rollout Validate](https://github.com/caden4314/LGHS-System/actions/workflows/lghs-06-rollout.yml/badge.svg?branch=main)](https://github.com/caden4314/LGHS-System/actions/workflows/lghs-06-rollout.yml)
+[![Zero Touch Validate](https://github.com/caden4314/LGHS-System/actions/workflows/zero-touch-image-validate.yml/badge.svg?branch=main)](https://github.com/caden4314/LGHS-System/actions/workflows/zero-touch-image-validate.yml)
+
 LGHS is a classroom management system for one Raspberry Pi controller (`LGCSCONT`) and managed Raspberry Pi 5 student devices (`CS-01`, `CS-02`, and so on).
 
 The production deployment model is **stock Raspberry Pi OS plus zero-touch LGHS provisioning**. Custom `pi-gen` images remain optional/legacy tooling; they are not the primary fleet architecture.
 
 For the full trust model and data/control flows, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Current production status
+
+The current production release is **LGHS 0.6.0**. `main` is protected and changes flow through pull requests plus four required validation checks. The managed production fleet is LGCSCONT plus CS-01, CS-02, CS-03, and CS-999; the enrolled students have passed the controller-side `CLASSROOM READY` gate with signed exact-SHA updates enabled. CS-04 through CS-14 remain future provisioning targets and are not assumed enrolled.
+
+See [`docs/PRODUCTION-STATUS.md`](docs/PRODUCTION-STATUS.md) for the live acceptance summary and supported operational checks.
 
 ## Production invariants
 
@@ -32,11 +43,13 @@ stock Raspberry Pi OS
   -> LGCSCONT mints the Fleet credential
   -> student installs/starts Fleet runtime
   -> LGCSCONT observes the first authenticated Fleet report
+  -> LGCSCONT enrolls the Ed25519 release verification public key
+  -> fresh Fleet health confirms release signing
   -> bootstrap credential is consumed
   -> CLASSROOM READY acceptance gate
 ```
 
-A device is not considered ready merely because Bluetooth or Cloudflare setup completed. `lghs-classroom-ready DEVICE` requires fresh authenticated telemetry, expected identity, Cloudflare registration, core services, policy, sudo broker, lifecycle service, zero failed systemd units, the expected exact commit, and the `main` update channel.
+A device is not considered ready merely because Bluetooth or Cloudflare setup completed. `lghs-classroom-ready DEVICE` requires fresh authenticated telemetry, expected identity, Cloudflare registration, core services, policy, sudo broker, lifecycle service, a valid enrolled release verification key, zero failed systemd units, the expected exact commit, and the `main` update channel.
 
 See [`bootstrap/STOCK-SETUP.md`](bootstrap/STOCK-SETUP.md) and [`docs/BLUETOOTH-BOOTSTRAP.md`](docs/BLUETOOTH-BOOTSTRAP.md) for provisioning procedures.
 
