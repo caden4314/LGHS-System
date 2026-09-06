@@ -129,6 +129,8 @@ jobs:
           grep -q 'release-install-key' controller/lghs-remote-shell
           grep -q 'classroom-ready' controller/lghs-remote-shell
           grep -q 'backup-controller' controller/lghs-remote-shell
+          grep -q 'command-status' controller/lghs-remote-shell
+          grep -q 'command-cancel' controller/lghs-remote-shell
           grep -q '/usr/local/sbin/lghs-controller-backup' policies/sudoers/98-lghs-remote
           grep -q '/usr/local/sbin/lghs-release status' policies/sudoers/98-lghs-remote
           grep -q '/usr/local/sbin/lghs-release keygen' policies/sudoers/98-lghs-remote

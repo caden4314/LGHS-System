@@ -24,6 +24,10 @@ def valid_request(value):
 def valid_commit(value):
     return len(value)==40 and all(ch in HEX for ch in value)
 
+def valid_command_id(value):
+    return len(value) == 32 and all(ch in HEX for ch in value)
+
+
 def valid_channel(value):
     return bool(value) and len(value)<=128 and '..' not in value and not value.startswith(('/', '-')) and not value.endswith('/') and all(ch.isalnum() or ch in '._/-' for ch in value)
 
@@ -35,6 +39,7 @@ def usage():
   release-keygen | release-install-key DEVICE
   classroom-ready DEVICE
   backup-controller
+  command-status DEVICE | command-cancel COMMAND_ID
   info DEVICE
   health DEVICE
   restart-service DEVICE {agent|executor|policy|ssh|update-timer|reconcile-timer}
@@ -80,6 +85,10 @@ def main():
         return run(['/usr/local/sbin/lghs-release', 'install-key', argv[1].upper()])
     if action == 'classroom-ready' and len(argv) == 2 and valid_device(argv[1]):
         return run(['/usr/local/sbin/lghs-classroom-ready', argv[1].upper()])
+    if action == 'command-status' and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghs-fleet-command', 'status', argv[1].upper()])
+    if action == 'command-cancel' and len(argv) == 2 and valid_command_id(argv[1]):
+        return run(['/usr/local/sbin/lghs-fleet-command', 'cancel', argv[1].lower()])
     if action == 'backup-controller' and len(argv) == 1:
         return run(['/usr/local/sbin/lghs-controller-backup'])
     if action == 'update-controller' and len(argv) == 1:

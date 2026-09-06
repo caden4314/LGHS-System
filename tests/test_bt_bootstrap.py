@@ -202,6 +202,8 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn("'controller-runtime'", shell)
         self.assertNotIn("controller-runtime DEVICE", shell)
         self.assertIn("backup-controller", shell)
+        self.assertIn("command-status", shell)
+        self.assertIn("command-cancel", shell)
         sudoers = (ROOT / "policies" / "sudoers" / "98-lghs-remote").read_text(encoding="utf-8")
         self.assertIn("/usr/local/sbin/lghs-controller-backup", sudoers)
 
