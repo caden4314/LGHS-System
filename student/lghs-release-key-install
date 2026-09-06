@@ -24,19 +24,18 @@ def validate(value: str) -> tuple[str, bytes]:
 
 def install(value: str) -> str:
     canonical, raw = validate(value)
-    if TARGET.exists():
+    if TARGET.exists() and TARGET.stat().st_size > 0:
         existing, _ = validate(TARGET.read_text(encoding='utf-8'))
         if existing != canonical:
             raise ValueError('release public key is already enrolled; rotation requires local root recovery')
         return hashlib.sha256(raw).hexdigest()
-    TARGET.parent.mkdir(parents=True, exist_ok=True)
-    tmp = TARGET.with_name('.' + TARGET.name + '.tmp')
-    with tmp.open('w', encoding='utf-8') as handle:
+    if not TARGET.exists():
+        raise ValueError('release public key slot is missing; reinstall LGHS before enrollment')
+    with TARGET.open('w', encoding='utf-8') as handle:
         handle.write(canonical + '\n')
         handle.flush()
         os.fsync(handle.fileno())
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, TARGET)
+    os.chmod(TARGET, 0o644)
     return hashlib.sha256(raw).hexdigest()
 
 

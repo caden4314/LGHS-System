@@ -86,6 +86,7 @@ class SignedReleaseTests(unittest.TestCase):
     def test_public_key_install_is_one_time_and_idempotent(self):
         installer = load('test_release_key_install', 'student/lghs-release-key-install')
         installer.TARGET = self.root / 'installed-public-key'
+        installer.TARGET.write_text('', encoding='utf-8')
         fingerprint = installer.install(self.public)
         self.assertEqual(installer.install(self.public), fingerprint)
         other = load('test_release_other', 'controller/lghs/release.py')
@@ -97,6 +98,17 @@ class SignedReleaseTests(unittest.TestCase):
         other_public = other.generate_key()
         with self.assertRaisesRegex(ValueError, 'already enrolled'):
             installer.install(other_public)
+
+        missing = self.root / 'missing-slot'
+        installer.TARGET = missing
+        with self.assertRaisesRegex(ValueError, 'slot is missing'):
+            installer.install(self.public)
+        unit = (ROOT / 'systemd' / 'lghs-command-executor.service').read_text(encoding='utf-8')
+        rw_line = next(line for line in unit.splitlines() if line.startswith('ReadWritePaths='))
+        self.assertIn('/etc/lghs/release-public-key', rw_line)
+        self.assertNotIn(' /etc/lghs ', rw_line + ' ')
+        install = (ROOT / 'install.sh').read_text(encoding='utf-8')
+        self.assertIn('[[ ! -e /etc/lghs/release-public-key ]]', install)
 
     def test_augment_update_payload_signs_only_after_key_exists(self):
         commit = 'e' * 40

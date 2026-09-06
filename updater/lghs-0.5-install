@@ -82,6 +82,11 @@ python3 "$ROOT/updater/patch-agent-status-guard.py" /usr/local/sbin/lghs-agent
 install -m 0750 "$ROOT/student/lghs-command-executor" /usr/local/sbin/lghs-command-executor
 install -m 0750 "$ROOT/student/lghs-release-verify" /usr/local/sbin/lghs-release-verify
 install -m 0750 "$ROOT/student/lghs-release-key-install" /usr/local/sbin/lghs-release-key-install
+if [[ ! -e /etc/lghs/release-public-key ]]; then
+  : > /etc/lghs/release-public-key
+  chown root:root /etc/lghs/release-public-key
+  chmod 0644 /etc/lghs/release-public-key
+fi
 install -m 0750 "$ROOT/student/lghs-service-recovery" /usr/local/sbin/lghs-service-recovery
 install -m 0755 "$ROOT/student/lghs-discovery-advertise" /usr/local/sbin/lghs-discovery-advertise
 install -m 0750 "$ROOT/student/lghs-bt-bootstrap" /usr/local/sbin/lghs-bt-bootstrap
