@@ -18,6 +18,6 @@ chmod 0700 "$TMP"
 if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
   bash "$TMP" </dev/tty
 else
-  sudo -v </dev/tty
+  sudo -v
   sudo bash "$TMP" </dev/tty
 fi
