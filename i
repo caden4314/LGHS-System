@@ -19,5 +19,5 @@ if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
   bash "$TMP" </dev/tty
 else
   sudo -v
-  sudo bash "$TMP" </dev/tty
+  sudo bash -c 'exec bash "$1" </dev/tty' _ "$TMP"
 fi
