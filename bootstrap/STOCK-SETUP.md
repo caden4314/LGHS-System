@@ -52,20 +52,29 @@ Check status without exposing credentials:
 ```bash
 sudo python3 /opt/lghs/repo/controller/lghs-stock-bootstrap-secret --status
 ```
+
 Re-arm only one device when needed:
 
 ```bash
 sudo python3 /opt/lghs/repo/controller/lghs-stock-bootstrap-secret --device CS-07
 ```
 
-A successful Fleet handoff consumes that device's controller registry credential only after LGCSCONT observes its first authenticated Fleet report.
+A successful Fleet handoff consumes that device's controller registry credential only after LGCSCONT observes its first authenticated Fleet report and release-key enrollment.
 
 ## Run on each freshly booted student Pi
 
-Log in locally as the matching `cs-##` account and run:
+Log in locally as the matching `cs-##` account and run the short installer command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/caden4314/LGHS-System/main/bootstrap/install-stock.sh -o /tmp/lghs-stock.sh && sudo bash /tmp/lghs-stock.sh
+curl -fsSL https://raw.githubusercontent.com/caden4314/LGHS-System/main/i | bash
+```
+
+The root-level `i` launcher contains no separate installation logic. It downloads the canonical `bootstrap/install-stock.sh`, asks `sudo` for elevation, runs it, and removes its temporary copy afterward.
+
+If you ever need to bypass the short launcher while troubleshooting, the canonical installer can still be run directly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/caden4314/LGHS-System/main/bootstrap/install-stock.sh | sudo bash
 ```
 
 Enter the same provisioning password that was armed on LGCSCONT. The same password is also set for `cs-admin` and Root on that Pi.
@@ -79,6 +88,7 @@ Controller:
 ```bash
 sudo journalctl -fu lghs-bt-provision.service
 ```
+
 Student:
 
 ```bash
@@ -118,6 +128,7 @@ systemctl --failed --no-pager
 getent passwd cs-01 cs-admin cs_admin lg_cs_cont
 cat /var/lib/lghs/bootstrap/wifi-provisioned.json
 ```
+
 Expected identities on `CS-01` are only `cs-01` and `cs-admin`; legacy `cs_admin` / `lg_cs_cont` identities must not remain.
 
 Verify managed services after enrollment:
