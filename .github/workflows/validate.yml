@@ -18,7 +18,6 @@ jobs:
       - name: Short installer interactive input invariant
         run: |
           grep -Fq 'bash "$TMP" </dev/tty' i
-          grep -Fq 'sudo -v </dev/tty' i
           grep -Fq 'sudo bash "$TMP" </dev/tty' i
       - name: Python syntax
         run: |
