@@ -11,8 +11,8 @@ curl -fsSL "$INSTALL_URL" -o "$TMP"
 chmod 0700 "$TMP"
 
 if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-  exec bash "$TMP"
+  bash "$TMP"
+else
+  sudo -v
+  sudo bash "$TMP"
 fi
-
-sudo -v
-exec sudo bash "$TMP"
