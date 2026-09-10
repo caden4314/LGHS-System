@@ -1,0 +1,1177 @@
+#!/usr/bin/env python3
+"""LGHS Fleet Control v0.6 simplified operator interaction layer.
+
+This layer changes only presentation/navigation. It reuses the validated
+cache-first Fleet, typed action, rollout, maintenance, sudo, and recovery
+implementations from the day-5 stack.
+"""
+from __future__ import annotations
+
+import curses
+import importlib.machinery
+import importlib.util
+import subprocess
+import time
+
+BASE = "/usr/local/libexec/lghs-console-day5-core"
+
+
+def load_base():
+    loader = importlib.machinery.SourceFileLoader("lghs_console_day5", BASE)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+day5 = load_base()
+day4 = day5.day4
+day3 = day5.day3
+day2 = day5.day2
+ui = day5.ui
+
+PRIMARY_NAV = [
+    ("Overview", "main"),
+    ("Fleet", "fleet"),
+    ("Work", "updates"),
+    ("Requests", "sudo"),
+    ("Events", "activity"),
+]
+
+_ROUTE_KEYS = {
+    "main": -20001,
+    "fleet": -20002,
+    "updates": -20003,
+    "sudo": -20004,
+    "activity": -20005,
+    "attention": -20006,
+    "telemetry": -20007,
+    "logs": -20008,
+    "controller": -20009,
+    "notices": -20010,
+}
+
+_original_global_action = ui.global_action
+_original_fleet_screen = ui.fleet_screen
+
+
+def clip(value, width):
+    return str(value)[:max(0, width)]
+
+
+def is_back(key):
+    return key in (27, curses.KEY_BACKSPACE, 127, 8, ord("b"), ord("B"))
+
+
+def modal_key(win, state):
+    key = win.getch()
+    if key != -1:
+        state["last_activity"] = time.monotonic()
+    return key
+
+
+def selected_device(state):
+    devices = state.get("devices", [])
+    index = int(state.get("selected", 0) or 0)
+    if 0 <= index < len(devices):
+        return devices[index]
+    return None
+
+
+def _route_key(route):
+    return _ROUTE_KEYS.get(route, -1)
+
+
+def _palette_commands(state):
+    commands = [
+        ("Overview", "home dashboard status", "route", "main"),
+        ("Fleet", "devices pis computers", "route", "fleet"),
+        ("Work", "deployments updates jobs maintenance", "route", "updates"),
+        ("Requests", "sudo approvals requests", "route", "sudo"),
+        ("Events", "events warnings activity", "route", "activity"),
+        ("Needs Attention", "problems warnings recovery", "route", "attention"),
+        ("Telemetry", "cpu ram disk temperature network", "route", "telemetry"),
+        ("Audit & logs", "logs history audit", "route", "logs"),
+        ("Controller status", "controller services health", "route", "controller"),
+        ("Notifications", "notices notifications", "route", "notices"),
+        ("Background jobs", "jobs progress running", "action", "jobs"),
+        ("Refresh fleet cache", "refresh reload", "action", "refresh"),
+        ("Clear filters", "clear search group filters", "action", "clear"),
+    ]
+    if selected_device(state):
+        commands.insert(
+            5,
+            (
+                "Actions for selected Pi",
+                "device quick actions update reboot logs ssh",
+                "action",
+                "device-actions",
+            ),
+        )
+    return commands
+
+
+def _matches(query, command):
+    if not query:
+        return True
+    hay = (command[0] + " " + command[1]).lower()
+    return all(term in hay for term in query.lower().split())
+
+
+def command_palette(stdscr, state):
+    query = ""
+    sel = 0
+    raw = getattr(stdscr, "_raw", stdscr)
+    while True:
+        commands = [row for row in _palette_commands(state) if _matches(query, row)]
+        sel = min(sel, max(0, len(commands) - 1))
+        win, ph, pw = ui.modal_window(stdscr, 19, 88, "COMMANDS", timeout=-1)
+        ui.safe(
+            win,
+            2,
+            3,
+            "> " + query + " " * max(1, pw - len(query) - 7),
+            curses.A_REVERSE,
+        )
+        ui.safe(win, 3, 3, "Type to filter. Enter runs. Esc closes.", curses.A_DIM)
+        visible = max(1, ph - 7)
+        for pos, command in enumerate(commands[:visible]):
+            marker = ">" if pos == sel else " "
+            ui.safe(
+                win,
+                5 + pos,
+                3,
+                clip(f"{marker} {command[0]:28} {command[1]}", pw - 6),
+                curses.A_REVERSE if pos == sel else 0,
+            )
+        if not commands:
+            ui.safe(win, 5, 3, "No matching commands.", curses.A_DIM)
+        device = selected_device(state)
+        device_text = ui.device_id(device) if device else "none"
+        ui.safe(
+            win,
+            ph - 2,
+            3,
+            clip(
+                f"Selected Pi: {device_text} | Up/Down choose | Backspace edit",
+                pw - 6,
+            ),
+            curses.A_DIM,
+        )
+        win.refresh()
+        key = modal_key(win, state)
+        if key == 27:
+            raw.touchwin()
+            raw.refresh()
+            return None
+        if key == curses.KEY_DOWN:
+            if commands:
+                sel = min(len(commands) - 1, sel + 1)
+            continue
+        if key == curses.KEY_UP:
+            if commands:
+                sel = max(0, sel - 1)
+            continue
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if query:
+                query = query[:-1]
+                sel = 0
+            continue
+        if key in (10, 13) and commands:
+            _, _, kind, value = commands[sel]
+            raw.touchwin()
+            raw.refresh()
+            if kind == "route":
+                return value
+            if value == "jobs":
+                ui.jobs_popup(stdscr, state)
+            elif value == "refresh":
+                ui.refresh_cache(state, True)
+                state["deployments_loaded"] = 0.0
+                ui.add_notice(
+                    state,
+                    "normal",
+                    "Fleet refreshed",
+                    "HTTPS cache and deployment data refreshed",
+                )
+            elif value == "clear":
+                state["search"] = ""
+                state["group_filter"] = "All"
+                state["event_filter"] = ""
+                state["deployment_filter"] = ""
+                ui.add_notice(
+                    state,
+                    "normal",
+                    "Filters cleared",
+                    "Fleet, event and deployment filters reset",
+                )
+            elif value == "device-actions":
+                device = selected_device(state)
+                if device:
+                    ui.quick_actions(stdscr, state, device)
+            return None
+        if 32 <= key <= 126:
+            query += chr(key)
+            sel = 0
+
+
+def read_key(win, state, allow_lock=True):
+    if (
+        allow_lock
+        and time.monotonic() - state["last_activity"] >= state["idle_seconds"]
+    ):
+        ui.lock_prompt(win, state)
+    key = win.getch()
+    if key != -1:
+        state["last_activity"] = time.monotonic()
+    if key == ord(":") and allow_lock:
+        route = command_palette(win, state)
+        return _route_key(route) if route else -1
+    return key
+
+
+def global_action(key):
+    if key == ord("?"):
+        return "help"
+    for route, route_key in _ROUTE_KEYS.items():
+        if key == route_key:
+            return route
+    return _original_global_action(key)
+
+
+def compact_header(stdscr, state, title, subtitle=""):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    devices = state.get("devices", [])
+    online = sum(ui.cache_state(d) == "ONLINE" for d in devices)
+    stale = sum(ui.cache_state(d) == "STALE" for d in devices)
+    attention = len(ui.issues(devices, state))
+    requests = len(ui.pending_requests(devices))
+    active = len(day2.command_rows(state, True)) + len(ui.active_jobs(state))
+    left = f" LGHS | {title} "
+    right = (
+        f" {ui.controller_status_short(state)} | {online}/{len(devices)} online | "
+        f"{stale} stale | ! {attention} | req {requests} | work {active} "
+    )
+    usable = max(1, w - 1)
+    if len(left) + len(right) + 1 <= usable:
+        top = left + (" " * (usable - len(left) - len(right))) + right
+    else:
+        top = (left + right)[:usable]
+    ui.safe(
+        stdscr,
+        0,
+        0,
+        top.ljust(usable),
+        curses.A_REVERSE | curses.A_BOLD,
+    )
+    if subtitle:
+        ui.safe(stdscr, 1, 1, clip(subtitle, usable - 2), curses.A_DIM)
+    if state.get("context") == "main":
+        nav = "  ".join(
+            f"{index + 1} {name}" for index, (name, _) in enumerate(PRIMARY_NAV)
+        )
+        ui.safe(stdscr, h - 2, 1, clip(nav, usable - 2), curses.A_BOLD)
+    else:
+        ui.safe(
+            stdscr,
+            h - 2,
+            1,
+            "Esc Back  Enter Open  / Filter  : Commands  ? Help  R Refresh",
+            curses.A_DIM,
+        )
+    ui.safe(
+        stdscr,
+        h - 1,
+        1,
+        "F2-F9 remain compatibility shortcuts; common actions are shown in context.",
+        curses.A_DIM,
+    )
+    ui.draw_toast(stdscr, state)
+
+
+def contextual_help(stdscr, state):
+    context = state.get("context", "main")
+    common = """Navigation
+Up/Down or j/k moves through rows.
+Enter opens the selected item.
+Esc goes back or cancels.
+Tab / Left / Right changes tabs where shown.
+
+/ filters the current list.
+: opens the command palette.
+? opens this help.
+R refreshes cached Fleet data.
+
+Primary sections
+1 Overview   2 Fleet   3 Work   4 Requests   5 Events
+
+Compatibility
+The old F2-F9 shortcuts still work, but they are no longer required.
+Passive screens use the controller HTTPS cache and do not SSH-poll Pis.
+"""
+    extras = {
+        "main": "\nOverview\nHealthy details stay quiet. Current problems and active work are shown first.",
+        "fleet": "\nFleet\nEnter opens the Pi directly. Space marks. A actions. U signed LGHS update. G changes group.",
+        "device": "\nPi detail\nTab changes Summary / Health / Update / Telemetry / Diagnostics. A actions, U update, L logs, S SSH.",
+        "updates": "\nWork\nDeployments, maintenance/reboots, direct updates and running jobs live here.",
+        "sudo": "\nRequests\nEnter reviews a sudo request. Approval/denial remains explicit.",
+        "activity": "\nEvents\nCurrent problems appear before notifications and ordinary activity. Enter opens recovery/details.",
+    }
+    ui.popup(
+        stdscr,
+        state,
+        f"Help - {context}",
+        common + extras.get(context, ""),
+    )
+
+
+def _active_work_lines(state, limit=5):
+    rows = []
+    for dep in day2.deployment_rows(state):
+        if str(dep.get("state") or "").lower() in {"queued", "running", "paused"}:
+            rows.append(
+                f"DEP  {str(dep.get('state','')).upper():8} "
+                f"{dep.get('name') or dep.get('deployment_id')}"
+            )
+    for device, command in day2.command_rows(state, True):
+        action = str(command.get("action") or "").replace("-", " ")
+        rows.append(
+            f"CMD  {ui.device_id(device):10} "
+            f"{str(command.get('state') or 'queued').upper():10} {action}"
+        )
+    for job in ui.active_jobs(state):
+        rows.append(f"JOB  #{job.get('id')} {job.get('title')}")
+    return rows[:limit]
+
+
+def _recent_activity_lines(state, limit=5):
+    out = []
+    for row in ui.activity_rows(state)[:limit]:
+        stamp = time.strftime(
+            "%H:%M:%S",
+            time.localtime(ui.number(row.get("ts"), 0)),
+        )
+        out.append(
+            f"{stamp}  {str(row.get('host','?'))[:12]:12} "
+            f"{str(row.get('event',''))[:18]:18} {row.get('detail','')}"
+        )
+    return out
+
+
+def _draw_panel(stdscr, y, x, h, w, title, lines, empty):
+    day2.box(stdscr, y, x, h, w, title)
+    if not lines:
+        ui.safe(stdscr, y + 2, x + 2, clip(empty, w - 4), curses.A_DIM)
+        return
+    for pos, line in enumerate(lines[:max(0, h - 3)]):
+        ui.safe(stdscr, y + 2 + pos, x + 2, clip(line, w - 4))
+
+
+def overview_screen(stdscr, state):
+    state["context"] = "main"
+    sel = int(state.get("primary_selected", 0) or 0)
+    while True:
+        ui.maintenance(stdscr, state)
+        devices = state.get("devices", [])
+        problems = ui.issues(devices, state)
+        requests = ui.pending_requests(devices)
+        work = _active_work_lines(state, 6)
+        recent = _recent_activity_lines(state, 6)
+        ui.header(
+            stdscr,
+            state,
+            "Overview",
+            f"{len(problems)} need attention | {len(requests)} request(s) | "
+            f"{len(work)} active work item(s) | healthy details are hidden",
+        )
+        h, w = stdscr.getmaxyx()
+        x = 2
+        for index, (name, _) in enumerate(PRIMARY_NAV):
+            token = f" {index + 1} {name} "
+            ui.safe(
+                stdscr,
+                3,
+                x,
+                token,
+                curses.A_REVERSE | curses.A_BOLD if index == sel else curses.A_BOLD,
+            )
+            x += len(token) + 1
+
+        if h >= 22 and w >= 88:
+            body_y = 5
+            body_h = h - 9
+            top_h = max(7, body_h // 2)
+            left_w = max(36, w // 2 - 1)
+            attention_lines = [
+                f"{'X' if sev == 'CRITICAL' else '!'} "
+                f"{ui.device_id(d):10} {kind:10} {detail}"
+                for d, sev, kind, detail in problems[:6]
+            ]
+            _draw_panel(
+                stdscr,
+                body_y,
+                1,
+                top_h,
+                left_w,
+                f"NEEDS ATTENTION {len(problems)}",
+                attention_lines,
+                "No current problems.",
+            )
+            _draw_panel(
+                stdscr,
+                body_y,
+                left_w + 2,
+                top_h,
+                w - left_w - 3,
+                f"ACTIVE WORK {len(work)}",
+                work,
+                "Fleet is idle.",
+            )
+            _draw_panel(
+                stdscr,
+                body_y + top_h + 1,
+                1,
+                body_h - top_h,
+                w - 2,
+                "RECENT EVENTS",
+                recent,
+                "No recent controller events.",
+            )
+        else:
+            row = 5
+            ui.safe(
+                stdscr,
+                row,
+                2,
+                f"Needs attention ({len(problems)})",
+                curses.A_BOLD,
+            )
+            row += 1
+            for d, sev, kind, detail in problems[:3]:
+                ui.safe(
+                    stdscr,
+                    row,
+                    4,
+                    clip(f"{sev} {ui.device_id(d)} {kind}: {detail}", w - 6),
+                )
+                row += 1
+            if not problems:
+                ui.safe(stdscr, row, 4, "No current problems.", curses.A_DIM)
+                row += 1
+            row += 1
+            ui.safe(
+                stdscr,
+                row,
+                2,
+                f"Active work ({len(work)})",
+                curses.A_BOLD,
+            )
+            row += 1
+            for line in work[:3]:
+                ui.safe(stdscr, row, 4, clip(line, w - 6))
+                row += 1
+            if not work:
+                ui.safe(stdscr, row, 4, "Fleet is idle.", curses.A_DIM)
+
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state)
+            continue
+        if action and action != "main":
+            state["primary_selected"] = sel
+            return action
+        if key in (ord("q"), ord("Q")):
+            return "quit"
+        if key in (ord("r"), ord("R")):
+            ui.refresh_cache(state, True)
+            state["deployments_loaded"] = 0.0
+            continue
+        if key == ord("/"):
+            query = ui.prompt_text(
+                stdscr,
+                state,
+                "FILTER FLEET",
+                "Device/group/version/state/stage/tag contains:",
+                state.get("search", ""),
+            )
+            if query is not None:
+                state["search"] = query
+                return "fleet"
+            continue
+        if key in (curses.KEY_RIGHT, curses.KEY_DOWN, ord("l"), ord("j")):
+            sel = min(len(PRIMARY_NAV) - 1, sel + 1)
+        elif key in (curses.KEY_LEFT, curses.KEY_UP, ord("h"), ord("k")):
+            sel = max(0, sel - 1)
+        elif ord("1") <= key <= ord("5"):
+            sel = key - ord("1")
+            state["primary_selected"] = sel
+            return PRIMARY_NAV[sel][1]
+        elif key in (10, 13):
+            state["primary_selected"] = sel
+            return PRIMARY_NAV[sel][1]
+
+
+def _version_text(device):
+    version = str(device.get("version") or "?")
+    commit = str(device.get("commit") or "")
+    return version + ("@" + commit[:7] if commit and commit != "unknown" else "")
+
+
+def fleet_screen(stdscr, state, telemetry=False):
+    if telemetry:
+        return _original_fleet_screen(stdscr, state, True)
+    state["context"] = "fleet"
+    sel = int(state.get("selected", 0) or 0)
+    while True:
+        ui.maintenance(stdscr, state)
+        all_devices = state.get("devices", [])
+        rows_data = ui.visible_devices(state, False)
+        sel = min(sel, max(0, len(rows_data) - 1))
+        h, w = stdscr.getmaxyx()
+        rows = max(1, h - 7)
+        start = max(0, sel - rows + 1) if sel >= rows else 0
+        filt = (
+            f"{len(rows_data)}/{len(all_devices)} shown | "
+            f"group {state.get('group_filter','All')} | "
+            f"filter {state.get('search') or 'none'} | "
+            f"marked {len(state.get('marked', set()))}"
+        )
+        ui.header(stdscr, state, "Fleet", filt)
+        if w >= 112:
+            heading = (
+                "M DEVICE       STATUS       GROUP        VERSION@COMMIT       "
+                "CPU   RAM   DISK  TEMP   LAST"
+            )
+        elif w >= 88:
+            heading = (
+                "M DEVICE       STATUS       GROUP        VERSION@COMMIT       "
+                "CPU   RAM   TEMP   LAST"
+            )
+        else:
+            heading = "M DEVICE       STATUS       VERSION@COMMIT       LAST"
+        ui.safe(
+            stdscr,
+            3,
+            1,
+            clip(heading, w - 2),
+            curses.A_BOLD | curses.A_UNDERLINE,
+        )
+        for pos, device in enumerate(rows_data[start:start + rows]):
+            idx = start + pos
+            mark = "*" if ui.device_id(device) in state.get("marked", set()) else " "
+            status = ui.health(device, state)
+            version = _version_text(device)
+            if w >= 112:
+                line = (
+                    f"{mark} {ui.device_id(device)[:12]:12} {status[:12]:12} "
+                    f"{str(device.get('group','Ungrouped'))[:12]:12} "
+                    f"{version[:20]:20} {str(device.get('cpu_pct','?'))+'%':5} "
+                    f"{str(device.get('mem_pct','?'))+'%':5} "
+                    f"{str(device.get('disk_pct','?'))+'%':5} "
+                    f"{str(device.get('temp_c','?'))+'C':6} "
+                    f"{ui.cache_age_text(device):7}"
+                )
+            elif w >= 88:
+                line = (
+                    f"{mark} {ui.device_id(device)[:12]:12} {status[:12]:12} "
+                    f"{str(device.get('group','Ungrouped'))[:12]:12} "
+                    f"{version[:20]:20} {str(device.get('cpu_pct','?'))+'%':5} "
+                    f"{str(device.get('mem_pct','?'))+'%':5} "
+                    f"{str(device.get('temp_c','?'))+'C':6} "
+                    f"{ui.cache_age_text(device):7}"
+                )
+            else:
+                line = (
+                    f"{mark} {ui.device_id(device)[:12]:12} {status[:12]:12} "
+                    f"{version[:20]:20} {ui.cache_age_text(device):7}"
+                )
+            ui.safe(
+                stdscr,
+                4 + pos,
+                1,
+                clip(line, w - 2),
+                curses.A_REVERSE if idx == sel else 0,
+            )
+        if not rows_data:
+            ui.safe(stdscr, 5, 3, "No Pis match the current filter.", curses.A_DIM)
+        ui.safe(
+            stdscr,
+            h - 2,
+            1,
+            "Enter Pi | Space mark | A actions | U update | / filter | G group | : commands | Esc back",
+            curses.A_DIM,
+        )
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state)
+            continue
+        if action:
+            state["selected"] = sel
+            return action
+        if ui.is_back(key):
+            state["selected"] = sel
+            return "main"
+        if key in (ord("r"), ord("R")):
+            ui.refresh_cache(state, True)
+            continue
+        if key == ord("/"):
+            query = ui.prompt_text(
+                stdscr,
+                state,
+                "FILTER FLEET",
+                "Device/group/version/state/stage/tag contains:",
+                state.get("search", ""),
+            )
+            if query is not None:
+                state["search"], sel = query, 0
+            continue
+        if key in (ord("g"), ord("G")):
+            ui.cycle_group(state)
+            sel = 0
+            continue
+        if key == ord(" ") and rows_data:
+            did = ui.device_id(rows_data[sel])
+            if did in state["marked"]:
+                state["marked"].discard(did)
+            else:
+                state["marked"].add(did)
+            continue
+        if key in (ord("a"), ord("A")) and rows_data:
+            ui.quick_actions(stdscr, state, rows_data[sel])
+            continue
+        if key in (ord("u"), ord("U")) and rows_data:
+            device = rows_data[sel]
+            if ui.confirm(
+                stdscr,
+                state,
+                f"Run signed LGHS update on {ui.device_id(device)}?",
+            ):
+                ui.start_job(
+                    state,
+                    f"LGHS update - {ui.device_id(device)}",
+                    [device],
+                    "sudo -n /usr/local/sbin/lghs-update",
+                )
+            continue
+        previous = sel
+        if key in (curses.KEY_DOWN, ord("j")) and rows_data:
+            sel = min(len(rows_data) - 1, sel + 1)
+        elif key in (curses.KEY_UP, ord("k")) and rows_data:
+            sel = max(0, sel - 1)
+        elif key in (10, 13) and rows_data:
+            device = rows_data[sel]
+            state["selected"] = next(
+                (
+                    i
+                    for i, row in enumerate(all_devices)
+                    if ui.device_id(row) == ui.device_id(device)
+                ),
+                0,
+            )
+            result = device_detail_screen(stdscr, state, device)
+            if result not in {"fleet", None}:
+                return result
+        if sel != previous and rows_data:
+            state["selected"] = next(
+                (
+                    i
+                    for i, row in enumerate(all_devices)
+                    if ui.device_id(row) == ui.device_id(rows_data[sel])
+                ),
+                0,
+            )
+
+
+def _health_checks(device):
+    report = device.get("health_report") if isinstance(device, dict) else {}
+    checks = report.get("checks", []) if isinstance(report, dict) else []
+    checks = [row for row in checks if isinstance(row, dict)]
+    return sorted(
+        checks,
+        key=lambda row: (
+            str(row.get("status")) == "pass",
+            str(row.get("severity")) != "critical",
+            str(row.get("id")),
+        ),
+    )
+
+
+def _summary_lines(device, state):
+    checks = _health_checks(device)
+    passed = sum(str(row.get("status")) == "pass" for row in checks)
+    failed = len(checks) - passed
+    op = ui.operation_for_device(device)
+    lines = [
+        f"State            {ui.health(device, state)}",
+        f"Group            {device.get('group','Ungrouped')}",
+        f"Version          {_version_text(device)}",
+        f"Last telemetry   {ui.cache_age_text(device)} ago",
+        f"Health checks    {passed} pass / {failed} fail",
+        "",
+        f"CPU {device.get('cpu_pct','?')}%   RAM {device.get('mem_pct','?')}%   "
+        f"Disk {device.get('disk_pct','?')}%   Temp {device.get('temp_c','?')}C",
+    ]
+    if ui.operation_label(op):
+        lines += ["", f"Active work      {ui.operation_label(op)}  {ui.progress_text(op)}"]
+    failures = [row for row in checks if str(row.get("status")) != "pass"]
+    if failures:
+        lines += ["", "Needs attention"]
+        for check in failures[:6]:
+            lines.append(
+                f"  {str(check.get('severity','')).upper():8} "
+                f"{check.get('id')}: {check.get('observed')}"
+            )
+    return lines
+
+
+def _health_lines(device):
+    checks = _health_checks(device)
+    if not checks:
+        return ["No structured health report is cached yet."]
+    lines = []
+    for check in checks:
+        ok = str(check.get("status")) == "pass"
+        mark = "PASS" if ok else "FAIL"
+        lines.append(
+            f"{mark:4} {str(check.get('severity','')).upper()[:8]:8} "
+            f"{str(check.get('id',''))[:31]:31} "
+            f"observed={str(check.get('observed',''))[:38]}"
+        )
+    return lines
+
+
+def _telemetry_lines(device):
+    wifi = device.get("wifi", {}) if isinstance(device.get("wifi"), dict) else {}
+    return [
+        f"CPU              {device.get('cpu_pct','?')}%",
+        f"RAM              {device.get('mem_pct','?')}%",
+        f"Disk             {device.get('disk_pct','?')}%",
+        f"Inodes           {device.get('inode_pct','?')}%",
+        f"Temperature      {device.get('temp_c','?')} C",
+        f"Wi-Fi signal     {wifi.get('signal_dbm', device.get('wifi_signal_dbm','?'))} dBm",
+        f"RX               {ui.fmt_bytes(device.get('rx_bytes'))}",
+        f"TX               {ui.fmt_bytes(device.get('tx_bytes'))}",
+        f"Telemetry age    {ui.cache_age_text(device)}",
+        f"Cache state      {ui.cache_state(device)}",
+    ]
+
+
+def _diagnostic_lines(device):
+    keys = [
+        ("Device ID", ui.device_id(device)),
+        ("Hostname", ui.hostname(device)),
+        ("Role", device.get("role", "?")),
+        ("Channel", device.get("channel", "?")),
+        ("Commit", device.get("commit", "?")),
+        ("Tags", ", ".join(map(str, device.get("tags") or [])) or "-"),
+        ("SSH", device.get("ssh", "?")),
+        ("Agent", device.get("agent", "?")),
+        ("Executor", device.get("executor", "?")),
+        ("Policy", device.get("policy", "?")),
+        ("NetworkManager", device.get("networkmanager", "?")),
+        ("Update timer", device.get("update_timer", "?")),
+        ("Reconcile timer", device.get("reconcile_timer", "?")),
+        ("Student sudo", device.get("student_sudo", "?")),
+    ]
+    return [f"{name:18} {value}" for name, value in keys]
+
+
+def device_detail_screen(stdscr, state, original):
+    state["context"] = "device"
+    did = ui.device_id(original)
+    tabs = ["Summary", "Health", "Update", "Telemetry", "Diagnostics"]
+    tab = int(state.get("device_tab", 0) or 0) % len(tabs)
+    while True:
+        ui.maintenance(stdscr, state)
+        device = next(
+            (
+                row
+                for row in state.get("devices", [])
+                if ui.device_id(row) == did
+            ),
+            original,
+        )
+        subtitle = (
+            f"{ui.health(device, state)} | {device.get('group','Ungrouped')} | "
+            f"{_version_text(device)} | seen {ui.cache_age_text(device)} ago"
+        )
+        ui.header(stdscr, state, did, subtitle)
+        h, w = stdscr.getmaxyx()
+        x = 2
+        for index, name in enumerate(tabs):
+            token = f" {name} "
+            ui.safe(
+                stdscr,
+                3,
+                x,
+                token,
+                curses.A_REVERSE | curses.A_BOLD if index == tab else curses.A_BOLD,
+            )
+            x += len(token) + 1
+        if tab == 0:
+            lines = _summary_lines(device, state)
+        elif tab == 1:
+            lines = _health_lines(device)
+        elif tab == 2:
+            lines = ui.update_progress_lines(device)
+        elif tab == 3:
+            lines = _telemetry_lines(device)
+        else:
+            lines = _diagnostic_lines(device)
+        visible = max(1, h - 8)
+        for pos, line in enumerate(lines[:visible]):
+            attr = curses.A_BOLD if (tab == 1 and str(line).startswith("FAIL")) else 0
+            ui.safe(stdscr, 5 + pos, 3, clip(line, w - 6), attr)
+        ui.safe(
+            stdscr,
+            h - 2,
+            1,
+            "Tab/Left/Right tabs | A actions | U update | L logs | S SSH | R refresh | Esc fleet",
+            curses.A_DIM,
+        )
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state)
+            continue
+        if action:
+            state["device_tab"] = tab
+            return action
+        if ui.is_back(key):
+            state["device_tab"] = tab
+            return "fleet"
+        if key in (9, curses.KEY_RIGHT, ord("l")):
+            tab = (tab + 1) % len(tabs)
+            continue
+        if key in (curses.KEY_LEFT, ord("h")):
+            tab = (tab - 1) % len(tabs)
+            continue
+        if key in (ord("r"), ord("R")):
+            ui.refresh_cache(state, True)
+            continue
+        if key in (ord("a"), ord("A")):
+            ui.quick_actions(stdscr, state, device)
+            continue
+        if key in (ord("u"), ord("U")):
+            if ui.confirm(stdscr, state, f"Run signed LGHS update on {did}?"):
+                ui.start_job(
+                    state,
+                    f"LGHS update - {did}",
+                    [device],
+                    "sudo -n /usr/local/sbin/lghs-update",
+                )
+            continue
+        if key == ord("L"):
+            ui.start_job(
+                state,
+                f"Live logs - {did}",
+                [device],
+                "sudo -n /usr/local/sbin/lghs-report logs all",
+            )
+            continue
+        if key in (ord("s"), ord("S")):
+            curses.endwin()
+            subprocess.call(ui.mod.ssh_args(device["addr"], batch=False))
+            raw = getattr(stdscr, "_raw", stdscr)
+            raw.refresh()
+            curses.curs_set(0)
+            state["last_activity"] = time.monotonic()
+            continue
+
+
+def _recent_command_lines(state, limit=12):
+    rows = []
+    for device, command in day2.command_rows(state, False)[:limit]:
+        rows.append(
+            f"{ui.device_id(device):12} "
+            f"{str(command.get('action','')).replace('-',' ')[:18]:18} "
+            f"{str(command.get('state','queued')).upper()[:12]:12} "
+            f"{str(command.get('stage') or command.get('message') or '')[:50]}"
+        )
+    return rows or ["No recent Fleet commands."]
+
+
+def work_screen(stdscr, state):
+    state["context"] = "updates"
+    options = [
+        "Deployments",
+        "Maintenance & reboots",
+        "Direct Pi updates",
+        "Background jobs",
+        "Recent commands",
+    ]
+    sel = 0
+    while True:
+        ui.maintenance(stdscr, state)
+        active = _active_work_lines(state, 5)
+        ui.header(
+            stdscr,
+            state,
+            "Work",
+            f"{len(active)} active item(s) | exact-SHA deployments remain the normal LGHS release path",
+        )
+        h, w = stdscr.getmaxyx()
+        for index, label in enumerate(options):
+            ui.safe(
+                stdscr,
+                3 + index,
+                3,
+                f"{index + 1}. {label}",
+                curses.A_REVERSE | curses.A_BOLD if index == sel else 0,
+            )
+        row = 10
+        if row < h - 3:
+            ui.safe(stdscr, row, 3, "ACTIVE NOW", curses.A_BOLD | curses.A_UNDERLINE)
+            row += 1
+            for line in active:
+                if row >= h - 3:
+                    break
+                ui.safe(stdscr, row, 5, clip(line, w - 7))
+                row += 1
+            if not active:
+                ui.safe(stdscr, row, 5, "No active work. Fleet is idle.", curses.A_DIM)
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state)
+            continue
+        if action:
+            return action
+        if ui.is_back(key):
+            return "main"
+        if key in (ord("r"), ord("R")):
+            ui.refresh_cache(state, True)
+            state["deployments_loaded"] = 0.0
+            continue
+        if key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(options) - 1, sel + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel - 1)
+        elif ord("1") <= key <= ord("5"):
+            sel = key - ord("1")
+            key = 10
+        if key not in (10, 13):
+            continue
+        if sel == 0:
+            result = day2.deployments_screen(stdscr, state)
+        elif sel == 1:
+            result = day3.maintenance_screen(stdscr, state)
+        elif sel == 2:
+            result = day2._original_updates_screen(stdscr, state)
+        elif sel == 3:
+            ui.jobs_popup(stdscr, state)
+            result = None
+        else:
+            ui.popup(
+                stdscr,
+                state,
+                "Recent commands",
+                "\n".join(_recent_command_lines(state)),
+            )
+            result = None
+        if result not in {None, "main", "updates", "deployments", "maintenance"}:
+            return result
+
+
+def event_rows(state):
+    rows = []
+    for device, severity, kind, detail in ui.issues(state.get("devices", []), state):
+        rows.append(
+            {
+                "current": True,
+                "ts": time.time(),
+                "level": severity,
+                "device": ui.device_id(device),
+                "event": kind,
+                "detail": detail,
+                "kind": "issue",
+                "device_obj": device,
+            }
+        )
+    for notice in reversed(state.get("notices", [])):
+        if not isinstance(notice, dict):
+            continue
+        rows.append(
+            {
+                "current": False,
+                "ts": ui.number(notice.get("ts"), 0),
+                "level": str(notice.get("level") or "normal").upper(),
+                "device": "",
+                "event": str(notice.get("title") or "Notification"),
+                "detail": str(notice.get("detail") or ""),
+                "kind": "notice",
+            }
+        )
+    for activity in ui.activity_rows(state):
+        rows.append(
+            {
+                "current": False,
+                "ts": ui.number(activity.get("ts"), 0),
+                "level": "INFO",
+                "device": str(activity.get("host") or ""),
+                "event": str(activity.get("event") or "Activity"),
+                "detail": str(activity.get("detail") or ""),
+                "kind": "activity",
+            }
+        )
+    rows.sort(key=lambda row: (not row["current"], -row["ts"]))
+    return rows
+
+
+def events_screen(stdscr, state):
+    state["context"] = "activity"
+    sel = 0
+    while True:
+        ui.maintenance(stdscr, state)
+        all_rows = event_rows(state)
+        query = str(state.get("event_filter") or "").lower().strip()
+        rows_data = all_rows
+        if query:
+            rows_data = [
+                row
+                for row in all_rows
+                if query
+                in " ".join(
+                    [
+                        row["level"],
+                        row["device"],
+                        row["event"],
+                        row["detail"],
+                        row["kind"],
+                    ]
+                ).lower()
+            ]
+        sel = min(sel, max(0, len(rows_data) - 1))
+        h, w = stdscr.getmaxyx()
+        visible = max(1, h - 7)
+        start = max(0, sel - visible + 1) if sel >= visible else 0
+        current = sum(bool(row["current"]) for row in all_rows)
+        ui.header(
+            stdscr,
+            state,
+            "Events",
+            f"{len(rows_data)}/{len(all_rows)} shown | {current} current issue(s) | filter {query or 'none'}",
+        )
+        ui.safe(
+            stdscr,
+            3,
+            1,
+            clip("TIME     LEVEL     DEVICE       EVENT                  DETAIL", w - 2),
+            curses.A_BOLD | curses.A_UNDERLINE,
+        )
+        for pos, row in enumerate(rows_data[start:start + visible]):
+            stamp = (
+                "NOW"
+                if row["current"]
+                else time.strftime("%H:%M:%S", time.localtime(row["ts"]))
+            )
+            line = (
+                f"{stamp:8} {row['level'][:8]:8} {row['device'][:12]:12} "
+                f"{row['event'][:22]:22} {row['detail']}"
+            )
+            attr = (
+                curses.A_REVERSE
+                if start + pos == sel
+                else (curses.A_BOLD if row["current"] else 0)
+            )
+            ui.safe(stdscr, 4 + pos, 1, clip(line, w - 2), attr)
+        if not rows_data:
+            ui.safe(
+                stdscr,
+                5,
+                3,
+                "No events match the current filter.",
+                curses.A_DIM,
+            )
+        ui.safe(
+            stdscr,
+            h - 2,
+            1,
+            "Enter details/recovery | / filter | C clear | L audit/logs | : commands | Esc back",
+            curses.A_DIM,
+        )
+        stdscr.refresh()
+        key = ui.read_key(stdscr, state)
+        action = ui.global_action(key)
+        if action == "help":
+            ui.contextual_help(stdscr, state)
+            continue
+        if action and action != "activity":
+            return action
+        if ui.is_back(key):
+            return "main"
+        if key == ord("/"):
+            value = ui.prompt_text(
+                stdscr,
+                state,
+                "FILTER EVENTS",
+                "Device/level/event/detail contains:",
+                state.get("event_filter", ""),
+            )
+            if value is not None:
+                state["event_filter"] = value
+                sel = 0
+            continue
+        if key in (ord("c"), ord("C")):
+            state["event_filter"] = ""
+            sel = 0
+            continue
+        if key in (ord("l"), ord("L")):
+            result = ui.logs_screen(stdscr, state)
+            if result not in {"main", "activity", None}:
+                return result
+            continue
+        if key in (ord("r"), ord("R")):
+            ui.refresh_cache(state, True)
+            state["activity_loaded"] = 0.0
+            continue
+        if key in (curses.KEY_DOWN, ord("j")) and rows_data:
+            sel = min(len(rows_data) - 1, sel + 1)
+        elif key in (curses.KEY_UP, ord("k")) and rows_data:
+            sel = max(0, sel - 1)
+        elif key in (10, 13) and rows_data:
+            row = rows_data[sel]
+            if row["kind"] == "issue":
+                ui.recovery_popup(
+                    stdscr,
+                    state,
+                    row["device_obj"],
+                    row["event"],
+                )
+            else:
+                ui.popup(
+                    stdscr,
+                    state,
+                    row["event"],
+                    f"Level: {row['level']}\nDevice: {row['device'] or '-'}\n"
+                    f"Time: {time.ctime(row['ts'])}\n\n{row['detail']}",
+                )
+
+
+# Patch only the interaction layer. Existing backend operations remain in place.
+ui.read_key = read_key
+ui.modal_key = modal_key
+ui.is_back = is_back
+ui.global_action = global_action
+ui.header = compact_header
+ui.contextual_help = contextual_help
+ui.main_menu = overview_screen
+ui.fleet_screen = fleet_screen
+ui.device_menu = device_detail_screen
+ui.updates_screen = work_screen
+ui.activity_screen = events_screen
+
+
+def main():
+    day5.main()
+
+
+if __name__ == "__main__":
+    main()
