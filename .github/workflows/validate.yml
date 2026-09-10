@@ -14,7 +14,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck python3-cryptography
       - name: Shellcheck
         run: |
-          shellcheck install.sh student/lghs-enforce student/lghs-check updater/lghs-update updater/lghs-0.5-install
+          shellcheck i install.sh student/lghs-enforce student/lghs-check updater/lghs-update updater/lghs-0.5-install
       - name: Python syntax
         run: |
           python3 -m py_compile \
