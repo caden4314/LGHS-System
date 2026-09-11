@@ -33,6 +33,7 @@ jobs:
             controller/lghs-console-day3 \
             controller/lghs-console-day4 \
             controller/lghs-console-day5 \
+            controller/lghs-console-day6 \
             updater/lghs-netqueue \
             student/lghs-agent \
             student/lghs-command-executor \
@@ -54,7 +55,8 @@ jobs:
             tests/test_maintenance.py \
             tests/test_reboot_cancel_semantics.py \
             tests/test_structured_health_gate.py \
-            tests/test_fleet_ui.py
+            tests/test_fleet_ui.py \
+            tests/test_fleet_ui_simplified.py
 
       - name: Command, rollout, recovery, maintenance, reboot, health, UI, and API tests
         run: |
@@ -75,7 +77,8 @@ jobs:
             tests/test_maintenance.py \
             tests/test_reboot_cancel_semantics.py \
             tests/test_structured_health_gate.py \
-            tests/test_fleet_ui.py
+            tests/test_fleet_ui.py \
+            tests/test_fleet_ui_simplified.py
 
       - name: Security and Fleet Control invariants
         run: |
@@ -182,6 +185,12 @@ jobs:
           grep -Fq "deployment_filter" controller/lghs-console-day5
           grep -Fq "state:paused device:CS-999" controller/lghs-console-day5
           grep -Fq "lghs-console-day4-core" controller/lghs-console-day5
+          grep -Fq 'PRIMARY_NAV' controller/lghs-console-day6
+          grep -Fq 'command_palette' controller/lghs-console-day6
+          grep -Fq 'device_detail_screen' controller/lghs-console-day6
+          grep -Fq 'ui.main_menu = overview_screen' controller/lghs-console-day6
+          grep -Fq 'ui.activity_screen = events_screen' controller/lghs-console-day6
+          grep -Fq 'lghs-console-day5-core' controller/lghs-console-day6
           grep -Fq "ReadWritePaths=/var/lib/lghs /run/lock" systemd/lghs-rollout-manager.service
           grep -Fq 'controller/lghs/sudo_state.py' install.sh
           grep -Fq 'controller/lghs/health.py' install.sh
@@ -192,7 +201,8 @@ jobs:
           grep -Eq 'controller/lghs-console-day2.*lghs-console-day2-core' install.sh
           grep -Eq 'controller/lghs-console-day3.*lghs-console-day3-core' install.sh
           grep -Eq 'controller/lghs-console-day4.*lghs-console-day4-core' install.sh
-          grep -Eq 'controller/lghs-console-day5.*lghs-console' install.sh
+          grep -Eq 'controller/lghs-console-day5.*lghs-console-day5-core' install.sh
+          grep -Eq 'controller/lghs-console-day6.*lghs-console$' install.sh
           grep -Fq 'controller/lghs/health.py' updater/lghs-0.5-install
           grep -Fq 'controller/lghs/fleet_ui.py' updater/lghs-0.5-install
           grep -Fq 'controller/lghs/recovery.py' updater/lghs-0.5-install
@@ -201,8 +211,9 @@ jobs:
           grep -Eq 'controller/lghs-console-day2.*lghs-console-day2-core' updater/lghs-0.5-install
           grep -Eq 'controller/lghs-console-day3.*lghs-console-day3-core' updater/lghs-0.5-install
           grep -Eq 'controller/lghs-console-day4.*lghs-console-day4-core' updater/lghs-0.5-install
-          grep -Eq 'controller/lghs-console-day5.*lghs-console' updater/lghs-0.5-install
-          if grep -nE 'shell=True|eval\(' controller/lghs/health.py controller/lghs/fleet_ui.py controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs/recovery.py controller/lghs/maintenance.py controller/lghs-fleet-command controller/lghs-fleet-rollout controller/lghs-fleet-maintenance controller/lghs-rollout-manager controller/lghs-console-day3 controller/lghs-console-day4 controller/lghs-console-day5 updater/lghs-netqueue student/lghs-agent student/lghs-command-executor; then
+          grep -Eq 'controller/lghs-console-day5.*lghs-console-day5-core' updater/lghs-0.5-install
+          grep -Eq 'controller/lghs-console-day6.*lghs-console$' updater/lghs-0.5-install
+          if grep -nE 'shell=True|eval\(' controller/lghs/health.py controller/lghs/fleet_ui.py controller/lghs/rollout.py controller/lghs/rollout_manager.py controller/lghs/recovery.py controller/lghs/maintenance.py controller/lghs-fleet-command controller/lghs-fleet-rollout controller/lghs-fleet-maintenance controller/lghs-rollout-manager controller/lghs-console-day3 controller/lghs-console-day4 controller/lghs-console-day5 controller/lghs-console-day6 updater/lghs-netqueue student/lghs-agent student/lghs-command-executor; then
             echo 'Fleet operations contains an arbitrary shell path.' >&2
             exit 1
           fi

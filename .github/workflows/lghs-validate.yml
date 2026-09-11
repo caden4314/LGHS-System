@@ -29,6 +29,10 @@ jobs:
             controller/lghs-console \
             controller/lghs-console-responsive \
             controller/lghs-console-day2 \
+            controller/lghs-console-day3 \
+            controller/lghs-console-day4 \
+            controller/lghs-console-day5 \
+            controller/lghs-console-day6 \
             controller/lghs-fleet-api \
             controller/lghs-fleet-command \
             controller/lghs-release \
@@ -65,7 +69,9 @@ jobs:
             tests/test_audit_ingest.py \
             tests/test_sudo_state.py \
             tests/test_fleet_api_integration.py \
-            tests/test_bt_bootstrap.py
+            tests/test_bt_bootstrap.py \
+            tests/test_fleet_ui.py \
+            tests/test_fleet_ui_simplified.py
 
       - name: Runtime-independent unit and integration tests
         run: |
@@ -293,7 +299,9 @@ jobs:
           fi
           grep -Eq '^0\.6\.0(-dev)?$' VERSION
           grep -q 'controller/lghs-console-responsive.*lghs-console-responsive-core' install.sh
-          grep -q 'controller/lghs-console-day2.*lghs-console' install.sh
+          grep -q 'controller/lghs-console-day2.*lghs-console-day2-core' install.sh
+          grep -q 'controller/lghs-console-day5.*lghs-console-day5-core' install.sh
+          grep -q 'controller/lghs-console-day6.*lghs-console' install.sh
           grep -q 'controller/lghs-fleet-command.*lghs-fleet-command' install.sh
           grep -q 'MEMORY_GB="$(read_value MEMORY_GB' student/lghs-firstboot-provision
           grep -q '"$MEMORY_GB" == "4" || "$MEMORY_GB" == "8"' student/lghs-firstboot-provision

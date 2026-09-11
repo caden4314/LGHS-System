@@ -87,7 +87,8 @@ if [[ "$ROLE" == "controller" ]]; then
   install -m 0755 "$ROOT_DIR/controller/lghs-console-day2" /usr/local/libexec/lghs-console-day2-core
   install -m 0755 "$ROOT_DIR/controller/lghs-console-day3" /usr/local/libexec/lghs-console-day3-core
   install -m 0755 "$ROOT_DIR/controller/lghs-console-day4" /usr/local/libexec/lghs-console-day4-core
-  install -m 0755 "$ROOT_DIR/controller/lghs-console-day5" /usr/local/sbin/lghs-console
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day5" /usr/local/libexec/lghs-console-day5-core
+  install -m 0755 "$ROOT_DIR/controller/lghs-console-day6" /usr/local/sbin/lghs-console
   install -m 0755 "$ROOT_DIR/controller/lghs-fleet-command" /usr/local/sbin/lghs-fleet-command
   install -m 0755 "$ROOT_DIR/controller/lghs-classroom-ready" /usr/local/sbin/lghs-classroom-ready
   install -m 0750 "$ROOT_DIR/controller/lghs-verify-migration" /usr/local/sbin/lghs-verify-migration
