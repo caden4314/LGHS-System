@@ -20,5 +20,5 @@ if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
   bash "$TMP" </dev/tty
 else
   [[ -x "$REAL_SUDO" ]] || { printf 'LGHS: system sudo is unavailable at %s.\n' "$REAL_SUDO" >&2; exit 1; }
-  "$REAL_SUDO" bash -c 'exec bash "$1" </dev/tty' _ "$TMP"
+  "$REAL_SUDO" bash -c "exec bash \"\$1\" </dev/tty" _ "$TMP"
 fi
