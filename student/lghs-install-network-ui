@@ -6,7 +6,7 @@ set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "Run as root" >&2; exit 1; }
 SRC=/usr/local/src/lghs-pplug-netman
-COMMIT=9064d7b4f9c3c841bfd195dae9e0bf8110412d0f
+COMMIT=35405c824e3409b49779428dfff01c1e25f735c8
 HARDENED=/usr/local/lib/lghs/libnetman.so.hardened
 VERSION_FILE=/usr/local/lib/lghs/libnetman.package-version
 BUILD_PKGS=(meson ninja-build libgtk-3-dev libgtkmm-3.0-dev lxpanel-pi-dev wf-panel-pi-dev libgtk-layer-shell-dev libglm-dev libsecret-1-dev libnm-dev libnma-dev)
@@ -20,6 +20,8 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends "${BUILD_PKGS[@]}"
 rm -rf "$SRC";git clone --quiet https://github.com/raspberrypi-ui/pplug-netman.git "$SRC";git -C "$SRC" checkout --quiet "$COMMIT"
+grep -Fq "PanelWidget *create" "$SRC/src/netman.cpp" || { echo "LGHS: pinned pplug-netman no longer matches current wf-panel-pi API" >&2; exit 1; }
+if grep -R -Fq "lxutils.h" "$SRC/src"; then echo "LGHS: pinned pplug-netman still requires legacy lxutils.h" >&2; exit 1; fi
 
 python3 - "$SRC/src/applet.c" <<'PY'
 from pathlib import Path
@@ -33,12 +35,36 @@ anchor='G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUG
 helper='''G_DEFINE_TYPE (NMApplet, nma, G_TYPE_APPLICATION)\n\n#ifdef LXPANEL_PLUGIN\nstatic gboolean lghs_restricted_student (void)\n{\n    struct passwd *pw = getpwuid (geteuid ());\n    FILE *f;\n    char name[128];\n    size_t n;\n    if (!pw || !pw->pw_name) return FALSE;\n    f = fopen ("/etc/lghs/student-user", "r");\n    if (!f) return strcmp (pw->pw_name, "lg_cs_cont") == 0;\n    if (!fgets (name, sizeof name, f)) { fclose (f); return FALSE; }\n    fclose (f);\n    n = strlen (name);\n    while (n > 0 && (name[n - 1] == '\\n' || name[n - 1] == '\\r')) name[--n] = '\\0';\n    return n > 0 && strcmp (pw->pw_name, name) == 0;\n}\n#endif\n\n#ifdef LXPANEL_PLUGIN'''
 if anchor not in s:raise SystemExit('LGHS patch failed: type anchor not found')
 s=s.replace(anchor,helper,1)
-pattern=re.compile(r"(?P<indent>\t)/\* 'Edit Connections\.\.\.' item \*/\n(?P<body>\tapplet->connections_menu_item = gtk_menu_item_new_with_mnemonic \(_\(\"Edit Connections…\"\)\);\n\tg_signal_connect \(applet->connections_menu_item,\n\s*\"activate\",\n\s*G_CALLBACK \(nma_edit_connections_cb\),\n\s*applet\);\n\tgtk_menu_shell_append \([^\n]+, applet->connections_menu_item\);)")
-def repl(m):
-    body='\n'.join('\t'+line for line in m.group('body').splitlines())
-    return "\t/* 'Edit Connections...' item - hidden for LGHS student */\n\tif (!lghs_restricted_student ())\n\t{\n"+body+"\n\t}\n\telse\n\t{\n\t\tapplet->connections_menu_item = NULL;\n\t}"
-s,count=pattern.subn(repl,s)
-if count!=2:raise SystemExit(f'LGHS patch failed: expected 2 Edit Connections blocks, patched {count}')
+lines=s.splitlines()
+out=[]
+patched=0
+i=0
+while i < len(lines):
+    line=lines[i]
+    if "/* 'Edit Connections...' item */" not in line:
+        out.append(line); i+=1; continue
+    block=[line]; i+=1
+    while i < len(lines):
+        block.append(lines[i])
+        if 'gtk_menu_shell_append' in lines[i] and 'connections_menu_item' in lines[i]:
+            i+=1; break
+        i+=1
+    if not any('connections_menu_item = gtk_menu_item_new_with_mnemonic' in row for row in block):
+        raise SystemExit('LGHS patch failed: Edit Connections block shape changed')
+    indent=line[:len(line)-len(line.lstrip())]
+    out.append(indent+"/* 'Edit Connections...' item - hidden for LGHS student */")
+    out.append(indent+'if (!lghs_restricted_student ())')
+    out.append(indent+'{')
+    out.extend(indent+'\t'+row[len(indent):] if row.startswith(indent) else indent+'\t'+row for row in block[1:])
+    out.append(indent+'}')
+    out.append(indent+'else')
+    out.append(indent+'{')
+    out.append(indent+'\tapplet->connections_menu_item = NULL;')
+    out.append(indent+'}')
+    patched+=1
+if patched != 2:
+    raise SystemExit(f'LGHS patch failed: expected 2 Edit Connections blocks, patched {patched}')
+s='\n'.join(out)+'\n'
 p.write_text(s,encoding='utf-8');print('LGHS: patched both Edit Connections menu entries.')
 PY
 
