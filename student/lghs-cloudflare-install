@@ -97,14 +97,28 @@ EOF
 systemctl daemon-reload
 systemctl enable --now lghs-cloudflared.service
 
-for _ in $(seq 1 15); do
-  if journalctl -u lghs-cloudflared.service --since '-30 seconds' --no-pager 2>/dev/null | grep -q 'Registered tunnel connection'; then
+REGISTER_TIMEOUT=120
+REGISTER_STARTED=$(date +%s)
+while :; do
+  if journalctl -u lghs-cloudflared.service --since "@${REGISTER_STARTED}" --no-pager 2>/dev/null | grep -q 'Registered tunnel connection'; then
     echo "LGHS Cloudflare tunnel connected."
     exit 0
+  fi
+
+  if ! systemctl is-active --quiet lghs-cloudflared.service; then
+    echo "cloudflared service is not active while waiting for tunnel registration" >&2
+    journalctl -u lghs-cloudflared.service -n 80 --no-pager >&2 || true
+    exit 1
+  fi
+
+  now=$(date +%s)
+  if (( now - REGISTER_STARTED >= REGISTER_TIMEOUT )); then
+    break
   fi
   sleep 1
 done
 
-systemctl status lghs-cloudflared.service --no-pager >&2 || true
-echo "cloudflared service started but no registered connection was observed yet" >&2
+echo "cloudflared stayed active but did not register a tunnel connection within ${REGISTER_TIMEOUT}s" >&2
+echo "Recent cloudflared diagnostics:" >&2
+journalctl -u lghs-cloudflared.service -n 80 --no-pager >&2 || true
 exit 1
