@@ -42,6 +42,18 @@ class ArchitectureDocsTests(unittest.TestCase):
         self.assertIn('7 daily, 4 weekly, 3 monthly', status)
         self.assertIn('not guaranteed atomic across sudden power loss', status)
 
+    def test_remote_admin_has_safe_provisioning_diagnostics(self):
+        ctl = (ROOT / 'controller' / 'lghsctl').read_text(encoding='utf-8')
+        remote = (ROOT / 'controller' / 'lghs-remote-shell').read_text(encoding='utf-8')
+        self.assertIn('def provision_status(target):', ctl)
+        self.assertIn("journalctl', '-u', 'lghs-bt-provision.service'", ctl)
+        self.assertIn('ssh_host_key_enrolled=', ctl)
+        self.assertIn('bootstrap_credential_active=', ctl)
+        self.assertIn('fleet_credential_minted=', ctl)
+        self.assertIn('fleet_cache_present=', ctl)
+        self.assertIn('provision-status DEVICE', remote)
+        self.assertIn("['/usr/local/sbin/lghsctl', 'provision-status', argv[1].upper()]", remote)
+
     def test_bluetooth_module_comment_matches_bootstrap_identity_model(self):
         src = (ROOT / 'bluetooth' / 'lghs_bt_protocol.py').read_text(encoding='utf-8')
         head = '\n'.join(src.splitlines()[:12])

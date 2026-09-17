@@ -43,6 +43,7 @@ def usage():
   command-status DEVICE | command-cancel COMMAND_ID
   info DEVICE
   health DEVICE
+  provision-status DEVICE
   restart-service DEVICE {agent|executor|policy|ssh|update-timer|reconcile-timer}
   update DEVICE | os-update DEVICE
   update-exact DEVICE SHA [CHANNEL]
@@ -88,6 +89,8 @@ def main():
         return run(['/usr/local/sbin/lghs-classroom-ready', argv[1].upper()])
     if action == 'verify-migration' and len(argv) == 2 and valid_device(argv[1]):
         return run(['/usr/local/sbin/lghs-verify-migration', argv[1].upper()])
+    if action == 'provision-status' and len(argv) == 2 and valid_device(argv[1]):
+        return run(['/usr/local/sbin/lghsctl', 'provision-status', argv[1].upper()])
     if action == 'command-status' and len(argv) == 2 and valid_device(argv[1]):
         return run(['/usr/local/sbin/lghs-fleet-command', 'status', argv[1].upper()])
     if action == 'command-cancel' and len(argv) == 2 and valid_command_id(argv[1]):
