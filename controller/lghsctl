@@ -448,6 +448,65 @@ def show_fleet_logs(kind, lines):
     return p.returncode
 
 
+
+def _registry_devices(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+    devices = data.get('devices', {}) if isinstance(data, dict) else {}
+    return devices if isinstance(devices, dict) else {}
+
+
+def provision_status(target):
+    device = str(target).upper()
+    registry = load_registry()
+    meta = registry.get(device, {}) if isinstance(registry, dict) else {}
+    cache = load_cache().get(device, {})
+    bootstrap = _registry_devices('/etc/lghs/bootstrap-tokens.json').get(device)
+    fleet_token = _registry_devices('/etc/lghs/fleet-api-tokens.json').get(device)
+
+    print(f'device={device}')
+    print(f'transport_registered={"yes" if isinstance(meta, dict) and bool(meta) else "no"}')
+    if isinstance(meta, dict) and meta:
+        for key in ('transport', 'ssh_host', 'ssh_user'):
+            value = meta.get(key)
+            if value:
+                print(f'{key}={value}')
+        order = meta.get('provision_order')
+        if isinstance(order, list):
+            print('provision_order=' + ' -> '.join(str(x) for x in order))
+        for key in ('first_telemetry_at', 'release_signing_at'):
+            if meta.get(key) is not None:
+                print(f'{key}={meta.get(key)}')
+
+    host = str(meta.get('ssh_host') or '') if isinstance(meta, dict) else ''
+    host_key = bool(host) and run(['ssh-keygen', '-F', host, '-f', KNOWN_HOSTS]).returncode == 0
+    print(f'ssh_host_key_enrolled={"yes" if host_key else "no"}')
+    print(f'bootstrap_credential_active={"yes" if isinstance(bootstrap, dict) else "no"}')
+    if isinstance(bootstrap, dict) and bootstrap.get('expires_at') is not None:
+        print(f'bootstrap_expires_at={bootstrap.get("expires_at")}')
+    print(f'fleet_credential_minted={"yes" if isinstance(fleet_token, dict) else "no"}')
+    print(f'fleet_cache_present={"yes" if isinstance(cache, dict) and bool(cache) else "no"}')
+
+    journal = run(['journalctl', '-u', 'lghs-bt-provision.service', '--since', '-2 hours', '--no-pager', '-o', 'short-iso'])
+    lines = journal.stdout.splitlines() if journal.returncode == 0 else []
+    matches = [idx for idx, line in enumerate(lines) if device in line.upper()]
+    if matches:
+        start = max(0, matches[-1] - 6)
+        end = min(len(lines), matches[-1] + 30)
+        selected = lines[start:end]
+    else:
+        selected = lines[-35:]
+    print('-- recent_bluetooth_journal --')
+    if selected:
+        for line in selected:
+            print(line)
+    else:
+        print('(no recent lghs-bt-provision journal lines)')
+    print('-- end_recent_bluetooth_journal --')
+    return 0
+
 def controller_runtime():
     try:
         role = Path('/etc/lghs/role').read_text(encoding='utf-8').strip()
@@ -507,6 +566,7 @@ def main():
     p = sub.add_parser("enroll"); p.add_argument("target", nargs="?"); p.add_argument("--all", action="store_true")
     p = sub.add_parser("info"); p.add_argument("target")
     p = sub.add_parser("health"); p.add_argument("target")
+    p = sub.add_parser("provision-status"); p.add_argument("target")
     p = sub.add_parser("restart-service"); p.add_argument("target"); p.add_argument("service", choices=["agent","executor","policy","ssh","update-timer","reconcile-timer"])
     p = sub.add_parser("logs"); p.add_argument("target"); p.add_argument("group", nargs="?", default="all", choices=["all","update","agent","policy"])
     p = sub.add_parser("fleet-logs"); p.add_argument("kind", choices=["sudo","audit","update","os-update"]); p.add_argument("--lines", type=int, default=100)
@@ -532,6 +592,7 @@ def main():
     if args.cmd == "enroll": return enroll_all(targets_all() if args.all or not args.target else [args.target])
     if args.cmd == "info": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-report summary")
     if args.cmd == "health": return fleet_health(args.target)
+    if args.cmd == "provision-status": return provision_status(args.target)
     if args.cmd == "restart-service": return ssh_cmd(args.target, f"sudo -n /usr/local/sbin/lghs-service-recovery {args.service}")
     if args.cmd == "logs": return ssh_cmd(args.target, f"sudo -n /usr/local/sbin/lghs-report logs {args.group}")
     if args.cmd == "sudo-list": return ssh_cmd(args.target, "sudo -n /usr/local/sbin/lghs-sudo-admin list --json")
