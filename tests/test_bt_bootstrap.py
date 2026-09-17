@@ -171,6 +171,11 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertIn("6d517efc10dfce17440177bd7011909166eab44bae0f6998182183df717c7dba", src)
         self.assertNotIn("releases/latest/download", src)
         self.assertIn("--token-file /etc/cloudflared/token", src)
+        self.assertIn("REGISTER_TIMEOUT=120", src)
+        self.assertIn("systemctl is-active --quiet lghs-cloudflared.service", src)
+        self.assertIn("Recent cloudflared diagnostics:", src)
+        self.assertIn("journalctl -u lghs-cloudflared.service -n 80 --no-pager", src)
+        self.assertNotIn("seq 1 15", src)
 
     def test_legacy_cleanup_survives_stock_identity_filter(self):
         src = (ROOT / "student" / "lghs-legacy-identity-cleanup").read_text(encoding="utf-8")
