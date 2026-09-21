@@ -235,8 +235,16 @@ install -m 0755 "$APPLY/student/lghs-cloudflare-install" /usr/local/sbin/lghs-cl
 install -m 0644 "$APPLY/systemd/lghs-bt-prepare.service" /etc/systemd/system/lghs-bt-prepare.service
 install -m 0644 "$APPLY/systemd/lghs-bt-bootstrap.service" /etc/systemd/system/lghs-bt-bootstrap.service
 systemctl daemon-reload
-systemctl enable --now lghs-bt-prepare.service
-systemctl enable --now lghs-bt-bootstrap.service
+
+# The stock installer is intentionally repairable/idempotent. A rerun after a
+# partial Bluetooth/Cloudflare attempt must replace the provisioning runtime
+# from the newly fetched source and then restart it, even when systemd already
+# considers the units enabled. This lets the same public install command repair
+# an interrupted zero-touch enrollment without deleting valid tunnel state.
+systemctl enable lghs-bt-prepare.service lghs-bt-bootstrap.service
+systemctl reset-failed lghs-bt-prepare.service lghs-bt-bootstrap.service >/dev/null 2>&1 || true
+systemctl restart lghs-bt-prepare.service
+systemctl restart lghs-bt-bootstrap.service
 
 printf '%s\n' "$COMMIT" > /etc/lghs/source-commit
 printf '%s\n' "$COMMIT" > /var/lib/lghs/update/current-commit
