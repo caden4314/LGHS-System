@@ -336,6 +336,7 @@ def handle_client(conn, address):
     send_frame(conn, {"v": PROTOCOL_VERSION, "type": "controller_hello", "controller_id": cid,
                       "server_nonce": server_nonce, "server_pub": server_pub})
 
+    print(f"BT-STAGE peer={address[0]} device=? stage=waiting-student-hello", flush=True)
     hello = recv_frame(conn)
     if hello.get("v") != PROTOCOL_VERSION or hello.get("type") != "student_hello":
         raise ValueError("invalid student hello")
@@ -347,6 +348,7 @@ def handle_client(conn, address):
     if not device_id or len(device_id) > 64:
         raise ValueError("invalid device id")
 
+    print(f"BT-STAGE peer={address[0]} device={device_id} stage=student-hello-received", flush=True)
     token = bootstrap_token_for(device_id)
     if not token:
         raise PermissionError("device has no active one-time Bluetooth bootstrap credential")
@@ -354,6 +356,7 @@ def handle_client(conn, address):
     if not verify_proof(token, "student", tx, supplied):
         raise PermissionError("student bootstrap authentication failed")
 
+    print(f"BT-STAGE peer={address[0]} device={device_id} stage=student-authenticated", flush=True)
     key = derive_key(server_private, client_pub, token, tx)
     wifi = active_wifi_profile()
     payload = {
@@ -362,13 +365,16 @@ def handle_client(conn, address):
     }
     cloudflare = None
     if not dry_run:
+        print(f"BT-STAGE peer={address[0]} device={device_id} stage=cloudflare-prepare", flush=True)
         cloudflare = cloudflare_prepare(device_id)
         payload["cloudflare"] = {"ssh_host": cloudflare["ssh_host"], "tunnel_token": cloudflare["tunnel_token"]}
 
+    print(f"BT-STAGE peer={address[0]} device={device_id} stage=sending-provision-payload", flush=True)
     encrypted = encrypt_payload(key, tx, payload)
     send_frame(conn, {"v": PROTOCOL_VERSION, "type": "provision",
                       "controller_proof": proof(token, "controller", tx), **encrypted})
 
+    print(f"BT-STAGE peer={address[0]} device={device_id} stage=waiting-cloudflare-ready", flush=True)
     result = recv_frame(conn)
     if result.get("type") != "result":
         raise ValueError("student did not return provisioning result")
@@ -385,13 +391,16 @@ def handle_client(conn, address):
     if cloudflare is None or ssh_host != cloudflare.get("ssh_host"):
         raise RuntimeError("student Cloudflare hostname does not match controller allocation")
 
+    print(f"BT-STAGE peer={address[0]} device={device_id} stage=cloudflare-ready", flush=True)
     finalized = cloudflare_finalize(device_id, host_key)
     record_ssh_user(device_id, ssh_user)
+    print(f"BT-STAGE peer={address[0]} device={device_id} stage=verifying-cloudflare-ssh", flush=True)
     verify_cloudflare_ssh(device_id, finalized.get("ssh_host") or ssh_host, ssh_user)
     print(f"Cloudflare VERIFIED {device_id}: {ssh_user}@{ssh_host}", flush=True)
 
     # Only now is a Fleet credential created. This enforces the required order:
     # Bluetooth authentication -> Cloudflare install -> controller SSH verify -> Fleet.
+    print(f"BT-STAGE peer={address[0]} device={device_id} stage=minting-fleet-credential", flush=True)
     fleet_token = mint_fleet_token(device_id)
     enrollment_issued_at = time.time()
     fleet_payload = {
@@ -400,10 +409,12 @@ def handle_client(conn, address):
     }
     encrypted_fleet = encrypt_payload(key, tx, fleet_payload)
     send_frame(conn, {"v": PROTOCOL_VERSION, "type": "fleet_enrollment", **encrypted_fleet})
+    print(f"BT-STAGE peer={address[0]} device={device_id} stage=waiting-fleet-ready", flush=True)
     fleet_result = recv_frame(conn)
     if fleet_result.get("type") != "result" or fleet_result.get("status") != "fleet-ready":
         raise RuntimeError("student did not confirm Fleet enrollment")
 
+    print(f"BT-STAGE peer={address[0]} device={device_id} stage=waiting-first-telemetry", flush=True)
     first_report = wait_first_fleet_report(device_id, enrollment_issued_at)
     first_received = float(first_report.get('received_at') or 0)
     mark_first_telemetry(device_id, first_received)
