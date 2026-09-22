@@ -102,6 +102,13 @@ class BluetoothSourceInvariants(unittest.TestCase):
         self.assertNotIn("$bt =", stock)
         self.assertIn("No per-device token copy or Windows command is required.", stock)
 
+    def test_stock_bootstrap_rerun_restarts_provisioning_runtime(self):
+        stock = (ROOT / "bootstrap" / "install-stock.sh").read_text(encoding="utf-8")
+        self.assertIn("systemctl reset-failed lghs-bt-prepare.service lghs-bt-bootstrap.service", stock)
+        self.assertIn("systemctl restart lghs-bt-prepare.service", stock)
+        self.assertIn("systemctl restart lghs-bt-bootstrap.service", stock)
+        self.assertNotIn("systemctl enable --now lghs-bt-bootstrap.service", stock)
+
     def test_cloudflare_is_verified_before_fleet_token_is_minted(self):
         controller = (ROOT / "controller" / "lghs-bt-provision").read_text(encoding="utf-8")
         student = (ROOT / "student" / "lghs-bt-bootstrap").read_text(encoding="utf-8")
