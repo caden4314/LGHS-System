@@ -27,6 +27,7 @@ ALIAS_PREFIX = "LGHS-PROVISION-"
 ENABLED = Path("/etc/lghs/bluetooth-bootstrap-enabled")
 STATE_DIR = Path("/var/lib/lghs/bootstrap")
 PROVISIONED = STATE_DIR / "wifi-provisioned.json"
+PENDING = STATE_DIR / "pending-cloudflare.json"
 BOOTSTRAP_TOKEN = Path("/etc/lghs/secrets/bootstrap-token")
 FLEET_TOKEN_ROOT = Path("/etc/lghs/secrets/fleet-api-token")
 FLEET_CONF_ROOT = Path("/etc/lghs/fleet-api.conf")
@@ -365,15 +366,43 @@ def exchange(address, dry_run=False):
             print("Wi-Fi, Cloudflare, and Fleet were NOT modified.")
             return True
 
-        connection = apply_wifi(wifi)
-        ssh_user = install_controller_key(payload.get("controller_pubkey"))
-        ssh_host = install_cloudflare(payload.get("cloudflare"))
+        pending = {}
+        try:
+            pending = json.loads(PENDING.read_text(encoding="utf-8")) if PENDING.exists() else {}
+        except Exception:
+            pending = {}
+        expected_host = str((payload.get("cloudflare") or {}).get("ssh_host") or "")
+        if (isinstance(pending, dict) and pending.get("device_id") == did and
+                pending.get("controller_id") == cid and pending.get("ssh_host") == expected_host and
+                pending.get("ssh_host_key") and pending.get("ssh_user")):
+            connection = str(pending.get("connection") or "existing")
+            ssh_user = str(pending["ssh_user"])
+            ssh_host = str(pending["ssh_host"])
+            host_key = str(pending["ssh_host_key"])
+            print(f"Resuming Cloudflare-ready checkpoint for {did}.", flush=True)
+        else:
+            connection = apply_wifi(wifi)
+            ssh_user = install_controller_key(payload.get("controller_pubkey"))
+            ssh_host = install_cloudflare(payload.get("cloudflare"))
+            host_key = ssh_host_key()
+
+        # Persist the completed Cloudflare/SSH checkpoint before replying. If
+        # RFCOMM drops after cloudflared comes online, the next authenticated
+        # Bluetooth session can resume instead of reinstalling the tunnel.
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(STATE_DIR, 0o700)
+        pending = {"device_id": did, "controller_id": cid, "connection": connection,
+                   "ssh_host": ssh_host, "ssh_host_key": host_key, "ssh_user": ssh_user,
+                   "cloudflare_ready_at": time.time(), "protocol": PROTOCOL_VERSION}
+        tmp_pending = PENDING.with_suffix(".tmp")
+        tmp_pending.write_text(json.dumps(pending, separators=(",", ":")) + "\n", encoding="utf-8")
+        os.chmod(tmp_pending, 0o600); os.replace(tmp_pending, PENDING)
 
         # Controller verification is the hard gate. Fleet credentials are not
         # accepted or installed until the controller proves Cloudflare SSH.
         send_frame(sock, {
             "v": PROTOCOL_VERSION, "type": "result", "status": "cloudflare-ready",
-            "ssh_host": ssh_host, "ssh_host_key": ssh_host_key(), "ssh_user": ssh_user,
+            "ssh_host": ssh_host, "ssh_host_key": host_key, "ssh_user": ssh_user,
         })
 
         enrollment = recv_frame(sock)
@@ -394,6 +423,7 @@ def exchange(address, dry_run=False):
         tmp = PROVISIONED.with_suffix(".tmp")
         tmp.write_text(json.dumps(marker, separators=(",", ":")) + "\n", encoding="utf-8")
         os.chmod(tmp, 0o600); os.replace(tmp, PROVISIONED)
+        PENDING.unlink(missing_ok=True)
         ENABLED.unlink(missing_ok=True)
         return True
     finally:
