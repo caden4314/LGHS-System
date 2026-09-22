@@ -40,7 +40,7 @@ def api(token, method, path, body=None):
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(API + path, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=12) as r:
             payload = json.load(r)
     except urllib.error.HTTPError as e:
         try:
