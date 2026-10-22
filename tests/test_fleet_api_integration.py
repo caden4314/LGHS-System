@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import importlib.machinery
 import importlib.util
+import importlib
+from unittest import mock
 import json
 import tempfile
 import threading
@@ -30,6 +32,21 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.mod = load_api()
+        release = importlib.import_module('lghs.release')
+        for name, path in {
+            'KEY_FILE': root / 'secrets/key', 'STATE_ROOT': root / 'release',
+            'SEQUENCE_FILE': root / 'release/sequence',
+            'CURRENT_FILE': root / 'release/current.json',
+            'LOCK_FILE': root / 'release/lock',
+            'VERSION_FILE': root / 'version',
+            'UPDATE_ENV': root / 'update.env',
+        }.items():
+            patcher = mock.patch.object(release, name, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        (root / 'version').write_text('0.6.0\n')
+        (root / 'update.env').write_text('LGHS_UPDATE_BRANCH=main\n')
+        release.generate_key()
         self.mod.DB = FleetDB(root / 'fleet.db')
         self.mod.DB.initialize()
         self.mod.TOKENS = root / 'tokens.json'
@@ -257,13 +274,21 @@ class FleetAPIIntegrationTests(unittest.TestCase):
         cid = deployment['command_ids'][0]
         command = self.mod.DB.get_command(cid)
         self.assertEqual(json.loads(command['payload_json'])['target_commit'], target)
-        self.assertEqual(json.loads(command['payload_json'])['deployment_id'], 'dep-http')
+        self.assertNotIn('deployment_id', json.loads(command['payload_json']))
         self.assertEqual(self.mod.DB.get_device('CS-999')['desired_commit'], target)
 
         status, pending = self.request('/v1/admin/devices/CS-999', token='admin-secret')
         self.assertEqual(status, 200)
         self.assertEqual(pending['device']['sync_state'], 'update_pending')
         self.assertEqual(pending['device']['desired_version'], '0.6.0-dev')
+        # An offline Pi should show a wake-up wait, not a permanently running update.
+        with self.mod.DB.transaction() as db:
+            db.execute('UPDATE devices SET last_seen=? WHERE device_id=?',
+                       (time.time()-300, 'CS-999'))
+        status, sleeping = self.request('/v1/admin/devices/CS-999', token='admin-secret')
+        self.assertEqual(status, 200)
+        self.assertEqual(sleeping['device']['sync_state'], 'waiting_for_device')
+
 
         status, delivered = self.report(2, current_commit=current)
         self.assertEqual([row['id'] for row in delivered['commands']], [cid])

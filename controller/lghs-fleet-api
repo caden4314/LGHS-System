@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 sys.path.insert(0,'/usr/local/lib/lghs-python');sys.path.insert(0,str(Path(__file__).resolve().parent))
 from lghs.audit import evaluate_report,record_batches
+from lghs.command_delivery import prepare_delivery
 from lghs.database import FleetDB
 from lghs.maintenance import cancel_reboot_schedule,clear_device_policy,clear_group_policy,create_reboot_schedule,get_reboot_schedule,list_policies,list_reboot_schedules,maintenance_state,reconcile_reboot_schedule,set_device_policy,set_group_policy
 from lghs.protocol import PROTOCOL_VERSION,ProtocolError,TelemetryEnvelope,response,normalize_device_id
@@ -160,8 +161,9 @@ def device_view(row):
     latest=latest_device_deployment(device);current=str(x.get('current_commit') or '');desired=str(x.get('desired_commit') or '')
     if desired and current==desired:sync_state='in_sync'
     elif latest and latest.get('execution_state')=='succeeded':sync_state='verification_pending'
-    elif latest and latest.get('execution_state') in ACTIVE_DEPLOYMENT:sync_state='updating'
     elif latest and latest.get('execution_state') in TERMINAL and latest.get('execution_state')!='succeeded':sync_state='update_failed'
+    elif desired and (not x.get('last_seen') or time.time()-float(x['last_seen'])>90):sync_state='waiting_for_device'
+    elif latest and latest.get('execution_state') in ACTIVE_DEPLOYMENT:sync_state='updating'
     elif desired:sync_state='update_pending'
     else:sync_state='no_desired_state'
     x['sync_state']=sync_state;x['desired_version']=latest.get('target_version') if latest and latest.get('target_commit')==desired else None;x['latest_deployment']=latest;x['maintenance']=maintenance_state(DB,device)
@@ -324,6 +326,9 @@ class Handler(BaseHTTPRequestHandler):
             commands=DB.commands_for_delivery(device)
             if commands or time.monotonic()>=deadline:break
             time.sleep(.25)
+        try: commands=prepare_delivery(commands)
+        except (RuntimeError,ValueError):
+            self.reply(503,{'ok':False,'error':'release-signing-unavailable'});return
         sync_delivered(commands);export_legacy_commands();self.reply(200,response(commands))
     def do_POST(self):
         parsed=urllib.parse.urlparse(self.path)
@@ -358,7 +363,8 @@ class Handler(BaseHTTPRequestHandler):
                 claimed=str(raw.get('device_id') or raw.get('hostname') or device).upper()
                 if claimed!=device:raise ProtocolError('device-mismatch')
                 payload=dict(raw);command_states=payload.get('command_states',[]);DB.record_telemetry(device,payload,received_at=now,sent_at=payload.get('sent_at'),agent_version=report_agent_version,protocol=0);record_snapshot(DB,device,payload.get('sudo_requests',[]))
-            record_report_inventory(device,payload,report_agent_version);reconcile_command_milestones(device,command_states);DB.evaluate_health(device,payload);evaluate_report(DB,device,payload);commands=DB.commands_for_delivery(device);sync_delivered(commands);export_legacy_commands();legacy_cache(device,payload)
+            record_report_inventory(device,payload,report_agent_version);reconcile_command_milestones(device,command_states);DB.evaluate_health(device,payload);evaluate_report(DB,device,payload);commands=prepare_delivery(DB.commands_for_delivery(device));sync_delivered(commands);export_legacy_commands();legacy_cache(device,payload)
+        except RuntimeError:self.reply(503,{'ok':False,'error':'release-signing-unavailable'});return
         except ValueError as exc:self.reply(409,{'ok':False,'error':str(exc)});return
         except ProtocolError as exc:self.reply(400,{'ok':False,'error':str(exc)});return
         result=response(commands,received_at=now);result['audit_ack']=audit_ack;self.reply(202,result)

@@ -117,8 +117,10 @@ class FleetRolloutTests(unittest.TestCase):
         command = self.store.get_command(canary['command_id'])
         payload = json.loads(command['payload_json'])
         self.assertEqual(payload['target_commit'], self.target)
-        self.assertEqual(payload['deployment_id'], 'dep-phased')
-        self.assertEqual(payload['phase'], 0)
+        self.assertEqual(payload['target_channel'], 'main')
+        self.assertNotIn('deployment_id', payload)
+        self.assertNotIn('phase', payload)
+        self.assertEqual(command['deadline_at'], 1000 + 180 * 86400)
 
     def test_canary_failure_auto_pauses(self):
         freeze_deployment(
