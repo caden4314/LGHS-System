@@ -17,6 +17,8 @@ The current production release is **LGHS 0.6.0**. `main` is protected and change
 
 See [`docs/PRODUCTION-STATUS.md`](docs/PRODUCTION-STATUS.md) for the live acceptance summary and supported operational checks.
 
+For Caden Commander gateway enrollment and offline power-on update readiness, see [`docs/COMMANDER-CS-FLEET.md`](docs/COMMANDER-CS-FLEET.md).
+
 ## Production invariants
 
 - Bluetooth is bootstrap-only and is treated as an untrusted transport.

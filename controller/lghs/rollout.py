@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from .health import device_health_gate, normalize_health_gate
 from .protocol import TERMINAL_COMMAND_STATES, normalize_device_id
+from .release import controller_channel
 
 FAILURE_STATES = frozenset(TERMINAL_COMMAND_STATES - {'succeeded'})
 OPEN_STATES = frozenset({'queued', 'delivered', 'received', 'accepted', 'running'})
@@ -245,11 +246,16 @@ def dispatch_phase(store: Any, deployment_id: str, phase: int, *, deadline_at: f
         if row.get('command_id'):
             continue
         device = str(row['device_id'])
+        # The student's typed executor permits only update parameters. The
+        # deployment/phase relationship is already recorded in the execution DB;
+        # sending those as payload fields makes the executor reject the update.
+        # Allow sleeping classroom devices to return within the rollout window;
+        # release signatures are freshly issued at HTTPS delivery time.
         command_id = store.create_command(
             device,
             'lghs-update',
-            payload={'target_commit': deployment['target_commit'], 'deployment_id': deployment_id, 'phase': phase},
-            deadline_at=deadline_at,
+            payload={'target_commit': deployment['target_commit'], 'target_channel': controller_channel()},
+            deadline_at=deadline_at if deadline_at is not None else ts + 180 * 86400,
             now=ts,
             dedupe=False,
         )
