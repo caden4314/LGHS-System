@@ -49,6 +49,10 @@ ARCH=arm64
 DEPLOYMENT=stock-bootstrap
 EOF
 chmod 0644 /etc/lghs/device.conf
+# Public identity is intentionally separate from protected LGHS configuration.
+printf '%s\n' "$DEVICE" > /etc/lghs-device-id
+chown root:root /etc/lghs-device-id
+chmod 0644 /etc/lghs-device-id
 
 if ! id "$ADMIN_USER" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$ADMIN_USER"
