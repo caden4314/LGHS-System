@@ -14,7 +14,8 @@ log(){ printf '[LGHS stock] %s\n' "$*"; }
 die(){ echo "LGHS stock bootstrap: $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "Run with sudo"
 
-DEVICE="$(hostname -s | tr '[:lower:]' '[:upper:]')"
+DEVICE="$(sed -n 's/^DEVICE_ID=//p' /etc/lghs/device.conf 2>/dev/null | head -n1)"
+[[ -n "$DEVICE" ]] || DEVICE="$(hostname -s | tr '[:lower:]' '[:upper:]')"
 [[ "$DEVICE" =~ ^CS-[0-9]{1,3}$ ]] || die "Hostname must be CS-## (current: $DEVICE)"
 EXPECTED_STUDENT="$(printf '%s' "$DEVICE" | tr '[:upper:]' '[:lower:]')"
 STUDENT_USER="${LGHS_STUDENT_USER:-${SUDO_USER:-}}"
@@ -42,7 +43,7 @@ chmod 0644 /etc/lghs/role /etc/lghs/student-user /etc/lghs/admin-user
 cat > /etc/lghs/device.conf <<EOF
 DEVICE_ID=$DEVICE
 ROLE=student
-HOSTNAME=$DEVICE
+HOSTNAME=$(hostname -s)
 BOARD=Raspberry Pi 5
 ARCH=arm64
 DEPLOYMENT=stock-bootstrap
