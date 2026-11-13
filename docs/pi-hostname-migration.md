@@ -25,6 +25,12 @@ Give each Raspberry Pi a descriptive **static hostname** while preserving its or
 
 Underscores are suitable in the pretty hostname, but not in DNS-compliant Linux static hostnames. Use `cs3-hr2-01` for network hostname and `CS3_HR2_01` for human-readable hostname.
 
+### Permission-safe stable identity
+
+The Linux hostname and the **authenticated Fleet device ID** must never be conflated. Unprivileged `lghs-agent` cannot necessarily traverse `/etc/lghs` (CS-999 uses mode `750` on the directory). A readable `/etc/lghs-device-id` file containing only `CS-XX`, owned by root and mode `0644`, solves this without exposing other LGHS configuration. `install.sh`, firstboot provisioning, and stock bootstrap create or refresh this public identity file. The compatibility agent reads it first and only falls back to `device.conf` or the original hostname on older images. Verify `sudo -u lghs-agent test -r /etc/lghs-device-id` **before changing the hostname**. For old installations, install the public ID from the verified existing `DEVICE_ID` rather than deriving it from a newly changed hostname.
+
+On CS-999, a temporary rename initially produced HTTP 401 because the agent could not read its ID through the protected directory. After adding the public ID file, the Fleet Controller received fresh authenticated telemetry with `hostname=CS-999` and `system_hostname=cs0-hr0-999`; CS-999 was then rolled back to its original hostname as planned.
+
 ### Deployment order
 
 1. Deploy the compatible LGHS code first. The agent, legacy telemetry, command executor, lifecycle notifier, shell report, bootstrap, and Bluetooth enrollment verification must resolve identity from `/etc/lghs/device.conf` (`DEVICE_ID=CS-XX`), not from `socket.gethostname()`.
