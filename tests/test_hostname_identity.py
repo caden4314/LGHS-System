@@ -36,6 +36,20 @@ class StableIdentityTests(unittest.TestCase):
                     mod = load_script(path)
                     self.assertEqual(mod.stable_device_id(), 'CS-03')
 
+    def test_public_id_works_when_protected_config_is_unreadable(self):
+        real_read_text = Path.read_text
+        def read_text(path, *args, **kwargs):
+            if str(path) == '/etc/lghs-device-id':
+                return 'CS-999\\n'
+            if str(path) == '/etc/lghs/device.conf':
+                raise PermissionError('protected LGHS directory')
+            return real_read_text(path, *args, **kwargs)
+        with mock.patch.object(Path, 'read_text', read_text), mock.patch.object(socket, 'gethostname', return_value='cs0-hr0-999'):
+            for path in MODULES:
+                with self.subTest(path=path):
+                    mod = load_script(path)
+                    self.assertEqual(mod.stable_device_id(), 'CS-999')
+
     def test_agents_fallback_when_device_conf_absent(self):
         real_read_text = Path.read_text
         def read_text(path, *args, **kwargs):
