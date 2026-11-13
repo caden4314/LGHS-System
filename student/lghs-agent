@@ -72,8 +72,26 @@ def token() -> str:
     return TOKEN.read_text(encoding='utf-8').strip()
 
 
-def device() -> str:
+def stable_device_id() -> str:
+    """Keep the enrolled Fleet identity stable when the Linux hostname changes."""
+    try:
+        value = Path('/etc/lghs-device-id').read_text(encoding='utf-8').strip().upper()
+        if value.startswith('CS-') and value[3:].isdigit():
+            return value
+    except (OSError, UnicodeError):
+        pass
+    try:
+        for line in Path('/etc/lghs/device.conf').read_text(encoding='utf-8').splitlines():
+            if line.startswith('DEVICE_ID='):
+                value = line.partition('=')[2].strip().upper()
+                if value.startswith('CS-') and value[3:].isdigit():
+                    return value
+    except (OSError, UnicodeError):
+        pass
     return socket.gethostname().upper()
+
+def device() -> str:
+    return stable_device_id()
 
 
 def boot_id() -> str:

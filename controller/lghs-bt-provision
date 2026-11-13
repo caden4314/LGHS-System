@@ -226,7 +226,7 @@ def verify_cloudflare_ssh(device_id, ssh_host, ssh_user):
         "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=yes",
         "-o", "BatchMode=yes", "-o", "ConnectTimeout=12",
         "-o", f"ProxyCommand={CLOUDFLARED} access ssh --hostname %h",
-        f"{ssh_user}@{ssh_host}", "hostname",
+        f"{ssh_user}@{ssh_host}", "sh -c 'sed -n \"s/^DEVICE_ID=//p\" /etc/lghs/device.conf 2>/dev/null || hostname'",
     ]
     last = ""
     for _ in range(8):

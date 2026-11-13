@@ -147,11 +147,29 @@ def pending_sudo_requests():
     return requests
 
 
+def stable_device_id() -> str:
+    """Keep the enrolled Fleet identity stable when the Linux hostname changes."""
+    try:
+        value = Path('/etc/lghs-device-id').read_text(encoding='utf-8').strip().upper()
+        if value.startswith('CS-') and value[3:].isdigit():
+            return value
+    except (OSError, UnicodeError):
+        pass
+    try:
+        for line in Path('/etc/lghs/device.conf').read_text(encoding='utf-8').splitlines():
+            if line.startswith('DEVICE_ID='):
+                value = line.partition('=')[2].strip().upper()
+                if value.startswith('CS-') and value[3:].isdigit():
+                    return value
+    except (OSError, UnicodeError):
+        pass
+    return socket.gethostname().upper()
+
 def snapshot():
-    device = socket.gethostname().upper()
+    device = stable_device_id()
     p = run(["/usr/local/sbin/lghs-report", "summary"])
     data = parse_kv(p.stdout) if p.returncode == 0 else {}
-    data["device_id"] = str(data.get("hostname") or device).upper()
+    data["device_id"] = device
     data["sent_at"] = time.time()
     requests = pending_sudo_requests()
     data["sudo_requests"] = requests
