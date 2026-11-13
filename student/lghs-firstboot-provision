@@ -69,6 +69,10 @@ MEMORY_GB=$MEMORY_GB
 ARCH=arm64
 EOF
 chmod 0644 /etc/lghs/device.conf;printf '%s\n' "$ROLE">/etc/lghs/role
+# Agent-readable permanent Fleet identity, with no secret material.
+printf '%s\n' "$DEVICE_ID" > /etc/lghs-device-id
+chown root:root /etc/lghs-device-id
+chmod 0644 /etc/lghs-device-id
 
 # The Windows Imager creates one deployment-specific Ed25519 fleet key. Public
 # images contain no reusable fleet secret. Student cards receive only the
