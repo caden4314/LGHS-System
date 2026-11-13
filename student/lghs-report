@@ -10,7 +10,8 @@ channel="$(sed -n 's/^LGHS_UPDATE_BRANCH=//p' /etc/lghs/update.env 2>/dev/null |
 [[ -n "$channel" ]] || channel=main
 if [[ "$commit" != "unknown" && -n "$commit" ]]; then build="${version}+${commit:0:8}"; else build="$version"; fi
 real_host="$(hostname)"
-host="$(sed -n 's/^DEVICE_ID=//p' /etc/lghs/device.conf 2>/dev/null | head -n1)"
+host="$(cat /etc/lghs-device-id 2>/dev/null | tr -d '[:space:]')"
+[[ -n "$host" ]] || host="$(sed -n 's/^DEVICE_ID=//p' /etc/lghs/device.conf 2>/dev/null | head -n1)"
 [[ -n "$host" ]] || host="$real_host"
 os_pretty="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")"
 student_user="$(cat /etc/lghs/student-user 2>/dev/null || echo lg_cs_cont)"
