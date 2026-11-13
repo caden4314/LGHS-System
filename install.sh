@@ -14,6 +14,16 @@ install -d -m 0700 /etc/lghs/secrets /var/lib/lghs/netqueue /var/lib/lghs/netque
 install -d -m 0755 /usr/local/lib/lghs-bt
 printf '%s\n' "$ROLE" > /etc/lghs/role
 printf '%s\n' "$(cat "$ROOT_DIR/VERSION")" > /etc/lghs/version
+# Publish only the immutable enrolled ID; /etc/lghs itself is deliberately restricted.
+# This also backfills existing student installs during a normal upgrade.
+if [[ "$ROLE" == "student" && -f /etc/lghs/device.conf ]]; then
+  ENROLLED_DEVICE_ID="$(sed -n 's/^DEVICE_ID=//p' /etc/lghs/device.conf | head -n1)"
+  if [[ "$ENROLLED_DEVICE_ID" =~ ^CS-[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$ENROLLED_DEVICE_ID" > /etc/lghs-device-id
+    chown root:root /etc/lghs-device-id
+    chmod 0644 /etc/lghs-device-id
+  fi
+fi
 
 SOURCE_COMMIT="unknown"
 if [[ -f "$ROOT_DIR/.lghs-source-commit" ]]; then SOURCE_COMMIT="$(tr -d '[:space:]' < "$ROOT_DIR/.lghs-source-commit")";
