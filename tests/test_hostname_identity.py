@@ -40,7 +40,7 @@ class StableIdentityTests(unittest.TestCase):
         real_read_text = Path.read_text
         def read_text(path, *args, **kwargs):
             if str(path) == '/etc/lghs-device-id':
-                return 'CS-999\\n'
+                return 'CS-999\n'
             if str(path) == '/etc/lghs/device.conf':
                 raise PermissionError('protected LGHS directory')
             return real_read_text(path, *args, **kwargs)
