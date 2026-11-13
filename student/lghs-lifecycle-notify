@@ -27,6 +27,18 @@ def parse_conf() -> dict[str, str]:
     return out
 
 
+def stable_device_id() -> str:
+    """Keep the enrolled Fleet identity stable when the Linux hostname changes."""
+    try:
+        for line in Path('/etc/lghs/device.conf').read_text(encoding='utf-8').splitlines():
+            if line.startswith('DEVICE_ID='):
+                value = line.partition('=')[2].strip().upper()
+                if value.startswith('CS-') and value[3:].isdigit():
+                    return value
+    except (OSError, UnicodeError):
+        pass
+    return socket.gethostname().upper()
+
 def system_state() -> str:
     try:
         proc = subprocess.run(
@@ -68,7 +80,7 @@ def post_lifecycle(force: bool = False) -> int:
     if not base.startswith('https://'):
         print('LGHS lifecycle: invalid Fleet URL', file=sys.stderr)
         return 0
-    device = socket.gethostname().upper()
+    device = stable_device_id()
     body = {
         'state': 'planned_shutdown',
         'reason': shutdown_kind(),
